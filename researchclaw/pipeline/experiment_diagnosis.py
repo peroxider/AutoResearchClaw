@@ -596,8 +596,13 @@ def _check_near_random_accuracy(diag: ExperimentDiagnosis, summary: dict) -> Non
 
 
 def _check_identical_conditions(diag: ExperimentDiagnosis, summary: dict) -> None:
-    """Detect ablation conditions producing identical results."""
-    warnings = summary.get("ablation_warnings", [])
+    """Diagnose component-removal defects only from execution checks.
+
+    Similar or identical measured outcomes can be scientifically valid.
+    """
+    warnings = [check.get("detail", "Component removal failed")
+                for check in summary.get("ablation_execution_checks", [])
+                if isinstance(check, dict) and check.get("status") == "failed"]
     if warnings:
         affected = []
         for w in warnings:
@@ -608,8 +613,8 @@ def _check_identical_conditions(diag: ExperimentDiagnosis, summary: dict) -> Non
             type=DeficiencyType.IDENTICAL_CONDITIONS,
             severity="major",
             description=(
-                f"{len(warnings)} ablation pair(s) produce identical outputs. "
-                "The differentiating parameter is likely not wired into the code."
+                f"{len(warnings)} component-removal execution check(s) failed. "
+                + "; ".join(warnings)
             ),
             affected_conditions=sorted(set(affected)),
             suggested_fix=(

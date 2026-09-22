@@ -4,7 +4,8 @@ Extracts all numeric values from a generated LaTeX paper, compares them
 against the ``VerifiedRegistry``, and rejects the paper if unverified
 numbers appear in strict sections (Results, Experiments, Tables).
 
-This is the **hard, deterministic** defense against fabrication.
+This legacy scan is a diagnostic, not a complete semantic proof. Formal
+acceptance additionally requires typed EvidenceStore claims and bound reviews.
 """
 
 from __future__ import annotations
@@ -214,6 +215,22 @@ def verify_paper(
 
             result.total_numbers_checked += 1
 
+            # Check explicit method attribution before constants or global
+            # whitelists can excuse a swapped result. Ambiguous prose still
+            # requires typed claims in final acceptance.
+            attributed = (_attributed_condition(line, m.start(), m.end(), registry)
+                          if in_table or _is_strict_section(section_lower, strict_sections)
+                          else None)
+            if attributed is not None and not _condition_matches(
+                value, attributed, registry, tolerance
+            ):
+                result.unverified_numbers.append(UnverifiedNumber(
+                    value=value, line_number=line_num, context=line.strip()[:120],
+                    section=section or "(preamble)", in_table=in_table,
+                ))
+                result.strict_violations += 1
+                continue
+
             # Always-allowed numbers
             if value in _ALWAYS_ALLOWED:
                 result.total_numbers_verified += 1
@@ -287,6 +304,42 @@ def verify_paper_file(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _attributed_condition(line: str, start: int, end: int, registry: VerifiedRegistry) -> str | None:
+    # Restrict the heuristic to a clause or a table row. A comparative change
+    # is a derived claim, not an absolute metric attributed to one method.
+    if re.search(r"\b(?:improv|differ|gain|higher|lower|increase|decrease)", line, re.I):
+        return None
+    boundaries = list(re.finditer(r"[,;]|\b(?:while|whereas)\b", line, re.I))
+    left = max((m.end() for m in boundaries if m.end() <= start), default=0)
+    right = min((m.start() for m in boundaries if m.start() >= end), default=len(line))
+    candidates = []
+    for name in registry.conditions:
+        for match in re.finditer(r"(?<!\w)" + re.escape(name) + r"(?!\w)", line,
+                                 re.I if len(name) > 2 else 0):
+            if match.start() < left or match.end() > right:
+                continue
+            if start < match.end() and end > match.start():
+                return None  # digits in method names
+            distance = min(abs(start - match.end()), abs(match.start() - end))
+            candidates.append((distance, name))
+    candidates.sort()
+    if candidates and (len(candidates) == 1 or candidates[0][0] < candidates[1][0]):
+        return candidates[0][1]
+    return None
+
+
+def _condition_matches(value: float, name: str, registry: VerifiedRegistry, tolerance: float) -> bool:
+    condition = registry.conditions[name]
+    scoped = VerifiedRegistry()
+    for number in [condition.mean, condition.std, condition.aggregate_metric,
+                   *condition.per_seed_values.values()]:
+        if number is not None:
+            scoped.add_value(number, name)
+    if value == condition.n_seeds:
+        return True
+    return scoped.is_verified(value, tolerance)
 
 
 def _parse_sections(tex_text: str) -> list[tuple[int, str]]:
