@@ -1,0 +1,76 @@
+# P1 本地模板导入与出版约束
+
+结构化 ManuscriptIR 现在可以使用本地 LaTeX 模板目录或 ZIP。未指定模板时使用通用 journal 稿件；模板文件、解析后的版式及用户声明的规则一起冻结并加入稿件依赖。模板变更需要重新生成和复核受影响稿件。
+
+## 配置与包结构
+
+```yaml
+export:
+  template_path: "./my-journal-template"
+  authors: "Author A and Author B"
+```
+
+路径相对于配置的 project root 解析。`template_path` 为空时使用通用稿件；它是结构化路径的选择项，旧探索性路径的 `target_conference` 注册表行为保留。
+
+最小包包含 `main.tex`。如果只有一个含 `documentclass` 的 TeX 文件，也可自动找到入口。可选 `template.json`：
+
+```json
+{
+  "schema_version": 1,
+  "name": "my-journal",
+  "entrypoint": "main.tex",
+  "engine": "pdflatex",
+  "anonymous": true,
+  "columns": 2,
+  "max_pages": 16,
+  "max_main_pages": 10,
+  "appendix_roles": ["theory", "results"],
+  "highlights_required": true
+}
+```
+
+引擎支持 `pdflatex` 和 `xelatex`；需要相应可执行文件已安装。单/双栏可由明确的文档类选项推断，样式包内部决定栏数时应显式声明。页数约束为正整数或 null；匿名和 highlights 字段必须为布尔值。正文页数指附录前的物理 PDF 页，包含出现在该区域的参考文献，不自动推断某个期刊对字数、参考文献和附录的特殊豁免。
+
+这些规则来自用户模板包的声明，不把默认值当成已经查证的期刊政策。支持的附录角色是 methods、theory、experiments、results、related_work、discussion；abstract、introduction、conclusion 保留在正文。
+
+## LaTeX 入口的两种方式
+
+标准入口包含一个 `documentclass`、`title`、`author`、`begin{document}`、`maketitle` 和 `end{document}`。导入器保留前导设置和书目风格，替换示例标题/作者，丢弃示例论文正文，再插入经过核验的稿件。不能把样例论文的研究结论带入新研究。
+
+特殊标题区或定制期刊结构可显式提供以下五个标记，每个恰好一次：
+
+```tex
+\documentclass{article}
+{{ARC_PACKAGES}}
+\title{ {{ARC_TITLE}} }
+\author{ {{ARC_AUTHORS}} }
+\begin{document}
+\maketitle
+{{ARC_CONTENT}}
+{{ARC_BIBLIOGRAPHY}}
+\end{document}
+```
+
+正文与书目必须位于文档环境内且顺序明确；包声明必须位于前导区。已有 `bibliographystyle` 会被提取并由书目标记统一输出。BibLaTeX/Biber 模板当前明确报不支持，不静默替换为 BibTeX。复杂会议模板若没有标准标题宏，需要使用标记入口；当前不声称能自动转换任意宏语言。
+
+## 版本与资源
+
+原始包以内容摘要命名，保存在 `publication_templates/<version>/`；清单为 `publication_template.json`。新版本不覆盖旧模板快照。导出时复制所需的本地样式/类/图片等资源，并检查它们与冻结源一致。修改冻结文件或导出后的 `.sty` 都会导致验收失败。
+
+导入不联网、不执行模板。目录/ZIP 有 100 项、20 MB 的边界，拒绝符号链接、越界路径、大小写冲突、Windows 设备名及生成稿件文件名冲突。模板入口只接受 UTF-8；资源文件名使用可移植的字母、数字、下划线、点和连字符。当前不支持所有字体/外部构建工具文件类型。TeX 编译显式传递 `-no-shell-escape`，这不是完整操作系统隔离的替代品；任意模板宏和外部系统包仍需要受控执行与完整文档检查。
+
+## 论文内容与限制的联动
+
+模板规则进入每个小节任务的上下文。附录角色重新排序后，Markdown、TeX 和每个数值跨度从共同源重新生成。双栏模板采用跨栏表格/图，避免在双栏中直接使用 longtable。数学算子只在尚未定义时声明，保留样式包提供的定义。
+
+只有 `highlights_required=true` 才生成 `highlights.md`，内容来自已经校验的贡献记录，保留零提升/未决状态和适用范围。辅助文件摘要加入导出绑定，篡改 highlights 会失败。取消要求时只移除仍与旧清单摘要一致的系统生成 highlights，不删除无法确认归属的文件。
+
+匿名模式替换作者参数，拒绝入口中残留的已识别身份字段。编译后另检查 PDF author 元数据。正文中的自引、机构、数据集路径或样式宏间接泄漏身份仍属于完整内容审查，不能由作者字段为空推断已完全匿名。模板原始快照仍保存在私有审计目录；新增的 [submission.zip 筛选与匿名审核门禁](HIGH_QUALITY_PAPER_P1_SUBMISSION_CN.md) 避免一并投稿这些快照，完整内容匿名审核仍为独立要求。
+
+`template_constraints.json` 来自实际 PDF：总页数直接读取，附录前页数根据可提取且唯一的 `Appendix` 起始标题定位。标题缺失、重复或无法定位时为未知/失败，不能靠 `.aux` 页码计数器猜测。最终验收再次读取 PDF 并比较约束报告，拒绝过期报告和超限文件。
+
+## 验证边界
+
+测试使用真实生成的多页 PDF 检查物理页数、附录定位、重复标题及作者元数据；另覆盖导入、版本失效、特殊入口、双栏资源、数值跨度、highlights 和编译命令。它们验证解析和门禁，不等于真实期刊样式的版面验收。
+
+第十轮已用临时 MiKTeX Portable 运行 pdflatex/xelatex × 单/双栏真实整稿工程样例，并用 Poppler 渲染全部页面检查。通用 DiagramSpec 与矢量后备已接入；图像模型评审路线、生产论文的完整 PDF 内容/视觉审查、专业图表和期刊特有格式要求仍是持续目标的一部分。测试样稿及 fixture 评审不等于科学有效性证明。
