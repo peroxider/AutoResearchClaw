@@ -256,7 +256,7 @@ AutoResearchClaw can use **any ACP-compatible coding agent** as its LLM backend 
 llm:
   provider: "acp"
   acp:
-    agent: "claude"   # Any ACP-compatible agent CLI command
+    agent: "codex"    # Default; any ACP-compatible agent CLI command is allowed
     cwd: "."          # Working directory for the agent
   # No base_url or api_key needed — the agent handles its own auth.
 ```
@@ -601,15 +601,15 @@ runtime:
 
 # === LLM ===
 llm:
-  provider: "openai-compatible"    # See the provider presets below
-  base_url: "https://..."          # API endpoint (required for openai-compatible)
-  api_key_env: "OPENAI_API_KEY"    # Env var for API key (required for openai-compatible)
-  api_key: ""                      # Or hardcode key here
-  primary_model: "gpt-4o"          # Primary model
-  fallback_models: ["gpt-4o-mini"] # Fallback chain
+  provider: "acp"                  # Default: persistent Codex CLI session via acpx
+  base_url: ""                     # Not used by ACP
+  api_key_env: ""                  # Codex CLI handles authentication
+  api_key: ""
+  primary_model: ""                # Uses the Codex CLI's configured model
+  fallback_models: []
   s2_api_key: ""                   # Semantic Scholar API key (optional, higher rate limits)
   acp:                             # Only used when provider: "acp"
-    agent: "claude"                # ACP agent CLI command (claude, codex, gemini, etc.)
+    agent: "codex"                 # ACP agent CLI command (codex, claude, gemini, etc.)
     cwd: "."                       # Working directory for the agent
 
 # === Literature search ===
@@ -646,13 +646,18 @@ experiment:
     gpu_ids: []                    # Available GPU IDs
     remote_workdir: "/tmp/researchclaw_experiments"
   opencode:                          # OpenCode Beast Mode (auto-installed via `researchclaw setup`)
-    enabled: true                    # Master switch (default: true)
+    enabled: false                   # Disabled on the default ACP/Codex path
     auto: true                       # Auto-trigger without confirmation (default: true)
     complexity_threshold: 0.2        # 0.0-1.0 — higher = only trigger on complex experiments
     model: ""                        # Override model (empty = use llm.primary_model)
     timeout_sec: 600                 # Max seconds for OpenCode generation
     max_retries: 1                   # Retry count on failure
     workspace_cleanup: true          # Remove temp workspace after collection
+  cli_agent:                         # Stages 10 & 13 code generation/refinement
+    provider: "codex"               # Direct `codex exec` backend (default)
+    binary_path: ""                 # Auto-detect from PATH
+    model: ""                       # Uses the Codex CLI's configured model
+    timeout_sec: 600
   code_agent:                        # CodeAgent v2 — multi-phase code generation
     enabled: true                    # Use CodeAgent instead of legacy single-prompt codegen
     architecture_planning: true      # Generate deep implementation blueprint before coding
