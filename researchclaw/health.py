@@ -723,7 +723,7 @@ def run_doctor(config_path: str | Path) -> DoctorReport:
     sandbox_python_path = ""
     experiment_mode = ""
     provider = ""
-    acp_agent_command = "claude"
+    acp_agent_command = "codex"
 
     try:
         config = RCConfig.load(path, check_paths=False)

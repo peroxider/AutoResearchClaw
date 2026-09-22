@@ -37,7 +37,7 @@ _TOOL_RE = re.compile(r"^\[tool\]")
 class ACPConfig:
     """Configuration for ACP agent connection."""
 
-    agent: str = "claude"
+    agent: str = "codex"
     cwd: str = "."
     acpx_command: str = ""  # auto-detect if empty
     session_name: str = "researchclaw"

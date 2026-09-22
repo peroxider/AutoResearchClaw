@@ -144,6 +144,10 @@ class ResearchConfig:
     daily_paper_count: int = 0
     quality_threshold: float = 7.0
     graceful_degradation: bool = True
+    # Requested quality is distinct from the status actually earned by a run.
+    target_status: str = "exploratory"
+    brief_path: str = ""  # Structured ResearchBrief YAML/JSON, optional for legacy runs.
+    manuscript_max_calls: int = 160  # Per structured-writing stage, including review/repair.
 
 
 @dataclass(frozen=True)
@@ -184,7 +188,7 @@ class OpenClawBridgeConfig:
 class AcpConfig:
     """ACP (Agent Client Protocol) settings."""
 
-    agent: str = "claude"
+    agent: str = "codex"
     cwd: str = "."
     acpx_command: str = ""
     session_name: str = "researchclaw"
@@ -194,7 +198,7 @@ class AcpConfig:
 
 @dataclass(frozen=True)
 class LlmConfig:
-    provider: str
+    provider: str = "acp"
     base_url: str = ""
     wire_api: str = "chat_completions"
     api_key_env: str = ""
@@ -243,6 +247,11 @@ class LiteratureSearchConfig:
     openalex_api_key_env: str = "OPENALEX_API_KEY"
     s2_api_key: str = ""
     s2_api_key_env: str = "S2_API_KEY"
+    evidence_mode: str = "auto"  # auto (formal/structured/full-text runs), on, off
+    evidence_max_papers: int = 12
+    evidence_max_calls: int = 32
+    evidence_max_chars: int = 12000
+    citation_support_max_calls: int = 128
 
 
 @dataclass(frozen=True)
@@ -485,7 +494,7 @@ class OpenCodeConfig:
     Requires: npm i -g opencode-ai@latest
     """
 
-    enabled: bool = True
+    enabled: bool = False
     auto: bool = True  # Auto-trigger without user confirmation
     complexity_threshold: float = 0.2  # 0.0-1.0
     model: str = ""  # Empty = use llm.primary_model
@@ -610,15 +619,15 @@ class ExperimentRepairConfig:
 class CliAgentConfig:
     """CLI-based code generation backend for Stages 10 & 13.
 
-    provider: "llm"          — use existing LLM chat API (default, backward-compatible)
+    provider: "llm"          — use the existing LLM backend
               "claude_code"  — Claude Code CLI (``claude -p``)
-              "codex"        — OpenAI Codex CLI (``codex exec``)
+              "codex"        — OpenAI Codex CLI (``codex exec``, default)
 
     Auth for claude_code: ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL env vars.
     Auth for codex:       OPENAI_API_KEY env var.
     """
 
-    provider: str = "llm"
+    provider: str = "codex"
     binary_path: str = ""  # auto-detected via PATH if empty
     model: str = ""  # model override for the CLI agent
     max_budget_usd: float = 5.0
@@ -634,6 +643,7 @@ class ExperimentConfig:
     max_refine_duration_sec: int = 0  # 0 = auto (3× time_budget_sec)
     metric_key: str = "primary_metric"
     metric_direction: str = "minimize"
+    comparison_baseline: str = ""  # Explicit method ID; never inferred by sorting.
     keep_threshold: float = 0.0
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     docker: DockerSandboxConfig = field(default_factory=DockerSandboxConfig)
@@ -714,6 +724,8 @@ class ExportConfig:
     target_conference: str = "neurips_2025"
     authors: str = "Anonymous"
     bib_file: str = "references"
+    max_citations: int | None = None  # Only impose a cap when the venue requires it.
+    template_path: str = ""  # Structured manuscripts: local template directory/ZIP; empty means generic journal.
 
 
 @dataclass(frozen=True)
@@ -1011,7 +1023,11 @@ class RCConfig:
                 domains=tuple(research.get("domains") or ()),
                 daily_paper_count=int(research.get("daily_paper_count", 0)),
                 quality_threshold=_safe_float(research.get("quality_threshold"), 7.0),
+                manuscript_max_calls=max(1, _safe_int(research.get("manuscript_max_calls"), 160)),
                 graceful_degradation=bool(research.get("graceful_degradation", True)),
+                target_status=research.get("target_status") or "exploratory",
+                brief_path=(str(((project_root or Path.cwd()) / Path(research["brief_path"]).expanduser()).resolve())
+                            if research.get("brief_path") else ""),
             ),
             runtime=RuntimeConfig(
                 timezone=runtime["timezone"],
@@ -1055,6 +1071,9 @@ class RCConfig:
                 target_conference=export.get("target_conference", "neurips_2025"),
                 authors=export.get("authors", "Anonymous"),
                 bib_file=export.get("bib_file", "references"),
+                max_citations=export.get("max_citations"),
+                template_path=(str(((project_root or Path.cwd()) / Path(export["template_path"]).expanduser()).resolve())
+                               if export.get("template_path") else ""),
             ),
             prompts=PromptsConfig(
                 custom_file=prompts.get("custom_file", ""),
@@ -1159,7 +1178,7 @@ def validate_config(
     errors: list[str] = []
     warnings: list[str] = []
 
-    llm_provider = _get_by_path(data, "llm.provider")
+    llm_provider = _get_by_path(data, "llm.provider") or "acp"
     for key in REQUIRED_FIELDS:
         # ACP and Ollama don't need api_key_env (local/keyless providers)
         if llm_provider in ("acp", "ollama") and key == "llm.api_key_env":
@@ -1302,6 +1321,33 @@ def validate_config(
     # (REJECT) can still pass via degraded mode, which is the path that
     # produced paper_2's sanitized-but-still-fabricated deliverable. Floor
     # at 3.0 so a low-quality run fails loudly.
+    target_status = _get_by_path(data, "research.target_status")
+    brief_path = _get_by_path(data, "research.brief_path")
+    if brief_path is not None and not isinstance(brief_path, str):
+        errors.append("research.brief_path must be a path string")
+    elif brief_path and check_paths:
+        path = ((project_root or Path.cwd()) / Path(brief_path).expanduser()).resolve()
+        if not path.is_file():
+            errors.append("research.brief_path does not point to a readable file")
+    if target_status is not None and target_status not in (
+        "exploratory", "research_complete", "submission_candidate",
+    ):
+        errors.append(f"Invalid research.target_status: {target_status}")
+    max_citations = _get_by_path(data, "export.max_citations")
+    template_path = _get_by_path(data, "export.template_path")
+    if template_path is not None and not isinstance(template_path, str):
+        errors.append("export.template_path must be a path string")
+    elif template_path and check_paths:
+        path = ((project_root or Path.cwd()) / Path(template_path).expanduser()).resolve()
+        if not path.is_dir() and not (path.is_file() and path.suffix.lower() == ".zip"):
+            errors.append("export.template_path must point to a local directory or ZIP")
+    if max_citations is not None and (
+        type(max_citations) is not int or max_citations < 1
+    ):
+        errors.append("export.max_citations must be a positive integer or null")
+    baseline = _get_by_path(data, "experiment.comparison_baseline")
+    if baseline is not None and not isinstance(baseline, str):
+        errors.append("experiment.comparison_baseline must be a method ID string")
     quality_threshold = _get_by_path(data, "research.quality_threshold")
     if not _is_blank(quality_threshold):
         try:
@@ -1321,6 +1367,8 @@ def validate_config(
                     f"(minimum 3.0). Values below 3.0 allow fabricated papers to "
                     f"slip through graceful_degradation; raise to ≥3.0."
                 )
+            elif quality_threshold_value > 10.0:
+                errors.append("research.quality_threshold must not exceed 10.0")
 
     # Warn (don't fail) on short experiment budgets for empirical topics.
     exp_budget = _get_by_path(data, "experiment.time_budget_sec")
@@ -1369,7 +1417,7 @@ def validate_config(
 def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
     acp_data = data.get("acp") or {}
     return LlmConfig(
-        provider=data.get("provider", "openai-compatible"),
+        provider=data.get("provider", "acp"),
         base_url=data.get("base_url", ""),
         wire_api=data.get("wire_api", "chat_completions"),
         api_key_env=data.get("api_key_env", ""),
@@ -1389,7 +1437,7 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         tournament_enabled=bool(data.get("tournament_enabled", False)),
         tournament_candidates=_safe_int(data.get("tournament_candidates"), 3),
         acp=AcpConfig(
-            agent=acp_data.get("agent", "claude"),
+            agent=acp_data.get("agent", "codex"),
             cwd=acp_data.get("cwd", "."),
             acpx_command=acp_data.get("acpx_command", ""),
             session_name=acp_data.get("session_name", "researchclaw"),
@@ -1402,6 +1450,9 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
 def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchConfig:
     if not data:
         return LiteratureSearchConfig()
+    evidence_mode = data.get("evidence_mode", "auto")
+    if evidence_mode not in {"auto", "on", "off"}:
+        raise ValueError("literature_search.evidence_mode must be auto, on or off")
 
     sources_raw = data.get("sources", LiteratureSearchConfig.sources)
     if isinstance(sources_raw, str):
@@ -1416,6 +1467,11 @@ def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchCon
         sources = LiteratureSearchConfig.sources
 
     return LiteratureSearchConfig(
+        evidence_mode=evidence_mode,
+        evidence_max_papers=max(1, _safe_int(data.get("evidence_max_papers"), 12)),
+        evidence_max_calls=max(1, _safe_int(data.get("evidence_max_calls"), 32)),
+        evidence_max_chars=max(1000, _safe_int(data.get("evidence_max_chars"), 12000)),
+        citation_support_max_calls=max(1, _safe_int(data.get("citation_support_max_calls"), 128)),
         sources=sources,
         max_results_per_query=max(
             1,
@@ -1536,6 +1592,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         max_refine_duration_sec=_safe_int(data.get("max_refine_duration_sec"), 0),
         metric_key=data.get("metric_key", "primary_metric"),
         metric_direction=data.get("metric_direction", "minimize"),
+        comparison_baseline=data.get("comparison_baseline", ""),
         keep_threshold=_safe_float(data.get("keep_threshold"), 0.0),
         sandbox=SandboxConfig(
             python_path=sandbox_data.get("python_path", DEFAULT_PYTHON_PATH),
@@ -1696,7 +1753,7 @@ def _parse_cli_agent_config(data: dict[str, Any]) -> CliAgentConfig:
     if not data:
         return CliAgentConfig()
     return CliAgentConfig(
-        provider=data.get("provider", "llm"),
+        provider=data.get("provider", "codex"),
         binary_path=data.get("binary_path", ""),
         model=data.get("model", ""),
         max_budget_usd=_safe_float(data.get("max_budget_usd"), 5.0),

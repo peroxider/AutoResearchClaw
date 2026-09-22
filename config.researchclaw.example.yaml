@@ -8,6 +8,14 @@ research:
     - "machine-learning"
   daily_paper_count: 10
   quality_threshold: 4.0
+  # Per structured draft/revision/peer-review stage; includes failed model calls.
+  manuscript_max_calls: 160
+
+export:
+  # Structured manuscripts: directory/ZIP with main.tex and optional template.json.
+  # Empty uses a generic journal manuscript; venue constraints come from the bundle.
+  template_path: ""
+  authors: "Anonymous"
 
 runtime:
   timezone: "America/New_York"
@@ -35,15 +43,26 @@ openclaw_bridge:
   use_browser: false
 
 llm:
-  provider: "openai-compatible"
-  base_url: "https://api.openai.com/v1"
-  wire_api: "chat_completions"  # Set to "responses" for Responses-only gateways
-  api_key_env: "OPENAI_API_KEY"
+  # Default: use the authenticated Codex CLI through a persistent ACP session.
+  provider: "acp"
+  base_url: ""                    # Not used by ACP
+  wire_api: "chat_completions"   # Not used by ACP
+  api_key_env: ""                # Codex CLI handles authentication
   api_key: ""
-  primary_model: "gpt-4o"
-  fallback_models:
-    - "gpt-4.1"
-    - "gpt-4o-mini"
+  primary_model: ""              # Uses the Codex CLI's configured model
+  fallback_models: []
+  acp:
+    agent: "codex"
+    cwd: "."
+    session_name: "researchclaw"
+    timeout_sec: 1800
+    max_turns: 1
+  # --- OpenAI-compatible API example ---
+  # provider: "openai-compatible"
+  # base_url: "https://api.openai.com/v1"
+  # api_key_env: "OPENAI_API_KEY"
+  # primary_model: "gpt-4o"
+  # fallback_models: ["gpt-4.1", "gpt-4o-mini"]
   # --- MiniMax provider example (global OpenAI-compatible endpoint) ---
   # provider: "minimax-global"
   # base_url: "https://api.minimax.io/v1"
@@ -85,6 +104,13 @@ literature_search:
   openalex_api_key: ""
   s2_api_key_env: "S2_API_KEY"
   s2_api_key: ""
+  # Source-grounded literature and per-occurrence citation review.
+  # auto enables this for formal/structured studies or available full text.
+  evidence_mode: "auto"  # auto | on | off
+  evidence_max_papers: 12
+  evidence_max_calls: 32
+  evidence_max_chars: 12000
+  citation_support_max_calls: 128
 
 security:
   hitl_required_stages: [5, 9, 20]
@@ -136,13 +162,21 @@ experiment:
   # OpenCode Beast Mode — external AI coding agent for complex experiments
   # Install: npm i -g opencode-ai@latest  (or use `researchclaw setup`)
   opencode:
-    enabled: true                # Master switch (default: true)
+    enabled: false               # ACP/Codex is the default agent path
     auto: true                   # Auto-trigger without confirmation (default: true)
     complexity_threshold: 0.2    # 0.0-1.0 — higher = only trigger on complex experiments
     model: ""                    # Override model (empty = use llm.primary_model)
     timeout_sec: 600             # Max seconds for OpenCode generation
     max_retries: 1               # Retry count on failure
     workspace_cleanup: true      # Remove temp workspace after collection
+  # Direct CLI backend for code generation/refinement in Stages 10 and 13.
+  cli_agent:
+    provider: "codex"
+    binary_path: ""             # Auto-detect `codex` on PATH
+    model: ""                   # Uses the Codex CLI's configured model
+    max_budget_usd: 5.0
+    timeout_sec: 600
+    extra_args: []
 
 # ============================================================================
 # SSH Remote Examples

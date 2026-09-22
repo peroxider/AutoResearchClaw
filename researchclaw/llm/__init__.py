@@ -60,7 +60,7 @@ PROVIDER_PRESETS = {
 def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
     """Factory: return the right LLM client based on ``config.llm.provider``.
 
-    - ``"acp"`` → :class:`ACPClient` (spawns an ACP-compatible agent)
+    - ``"acp"`` (default) → :class:`ACPClient` (spawns Codex or another ACP agent)
     - providers with an ``"anthropic"`` adapter → :class:`LLMClient` with
       Anthropic Messages API support
     - ``"openrouter"`` → :class:`LLMClient` with OpenRouter base URL
@@ -69,7 +69,7 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
     - ``"atlascloud"`` → :class:`LLMClient` with Atlas Cloud base URL
     - ``"novita"`` → :class:`LLMClient` with Novita AI base URL
     - ``"minimax"`` → :class:`LLMClient` with MiniMax base URL
-    - ``"openai-compatible"`` (default) → :class:`LLMClient` with custom base_url
+    - ``"openai-compatible"`` → :class:`LLMClient` with custom base_url
 
     OpenRouter is fully compatible with the OpenAI API format, making it
     a drop-in replacement with access to 200+ models from Anthropic, Google,
