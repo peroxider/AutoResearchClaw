@@ -107,7 +107,7 @@ class TestGPUOOM:
 
 
 class TestIdenticalConditions:
-    def test_detects_from_ablation_warnings(self):
+    def test_null_result_is_not_an_implementation_defect(self):
         summary = {
             "condition_summaries": {"A": {"metrics": {"m": 1}}, "B": {"metrics": {"m": 1}}},
             "best_run": {"metrics": {}},
@@ -117,7 +117,13 @@ class TestIdenticalConditions:
         }
         diag = diagnose_experiment(experiment_summary=summary)
         types = {d.type for d in diag.deficiencies}
-        assert DeficiencyType.IDENTICAL_CONDITIONS in types
+        assert DeficiencyType.IDENTICAL_CONDITIONS not in types
+
+    def test_failed_component_execution_is_a_defect(self):
+        diag = diagnose_experiment(experiment_summary={
+            "ablation_execution_checks": [{"status": "failed", "detail": "disabled module executed"}],
+        })
+        assert DeficiencyType.IDENTICAL_CONDITIONS in {d.type for d in diag.deficiencies}
 
 
 class TestCodeCrash:

@@ -39,6 +39,16 @@ def _make_registry(**kwargs) -> VerifiedRegistry:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("body", [
+    "Baseline achieves 91.0, while Proposed achieves 81.0.",
+    "Baseline & 91.0 \\\\\nProposed & 81.0 \\\\",
+])
+def test_swapped_method_results_are_rejected(body):
+    registry = _make_registry(conditions={"Baseline": {0: 81.0}, "Proposed": {0: 91.0}})
+    result = verify_paper("\\section{Results}\n" + body, registry)
+    assert result.severity == "REJECT" and result.strict_violations == 2
+
+
 class TestCleanPaper:
     def test_all_numbers_verified_passes(self):
         reg = _make_registry(
