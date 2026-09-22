@@ -5,6 +5,8 @@ from typing import cast
 import pytest
 
 from researchclaw.config import (
+    AcpConfig,
+    CliAgentConfig,
     ExperimentConfig,
     LiteratureSearchConfig,
     RCConfig,
@@ -14,6 +16,11 @@ from researchclaw.config import (
     load_config,
     validate_config,
 )
+
+
+def test_agent_defaults_use_codex() -> None:
+    assert AcpConfig().agent == "codex"
+    assert CliAgentConfig().provider == "codex"
 
 
 def _write_valid_config(tmp_path: Path) -> Path:

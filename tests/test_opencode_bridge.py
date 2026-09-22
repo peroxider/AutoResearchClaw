@@ -597,7 +597,7 @@ class TestOpenCodeConfig:
 
     def test_default_values(self):
         cfg = OpenCodeConfig()
-        assert cfg.enabled is True
+        assert cfg.enabled is False
         assert cfg.auto is True
         assert cfg.complexity_threshold == 0.2
         assert cfg.model == ""
