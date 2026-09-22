@@ -56,6 +56,8 @@ def compile_latex(
     *,
     max_attempts: int = 3,
     timeout: int = 120,
+    allow_repairs: bool = True,
+    engine: str = "pdflatex",
 ) -> CompileResult:
     """Compile *tex_path* with pdflatex, auto-fixing common errors.
 
@@ -68,36 +70,45 @@ def compile_latex(
         Maximum compile→fix cycles.
     timeout:
         Seconds before killing a stuck pdflatex process.
+    allow_repairs:
+        If false, preserve the reviewed TeX and BibTeX bytes, skipping source
+        sanitation and automatic error fixes. Compilation failures stay failed.
 
     Returns
     -------
     CompileResult
         Contains success flag, log excerpt, errors found, and fixes applied.
     """
-    if not shutil.which("pdflatex"):
+    if engine not in {"pdflatex", "xelatex"}:
+        raise ValueError("Unsupported LaTeX engine")
+    if not shutil.which(engine):
         return CompileResult(
             success=False,
-            log_excerpt="pdflatex not found on PATH",
-            errors=["pdflatex not installed"],
+            log_excerpt=f"{engine} not found on PATH",
+            errors=[f"{engine} not installed"],
         )
 
     result = CompileResult(success=False)
     work_dir = tex_path.parent
     tex_name = tex_path.name
     bib_stem = tex_name.rsplit(".", 1)[0]
+    pdf_path = work_dir / f"{bib_stem}.pdf"
+    old_pdf = (pdf_path.stat().st_mtime_ns, pdf_path.stat().st_size) if pdf_path.is_file() else None
 
     # Pre-flight: sanitize .bib file (escape bare & in field values)
     # Find bib filename from \bibliography{...} in the tex source
     _tex_src = tex_path.read_text(encoding="utf-8", errors="replace")
     _bib_match = re.search(r"\\bibliography\{([^}]+)\}", _tex_src)
     _bib_name = _bib_match.group(1) if _bib_match else bib_stem
-    _sanitize_bib_file(work_dir / f"{_bib_name}.bib")
+    if allow_repairs:
+        _sanitize_bib_file(work_dir / f"{_bib_name}.bib")
 
     # BUG-197: Pre-flight — strip invisible/problematic Unicode from .tex.
     # Characters like U+202F (NARROW NO-BREAK SPACE) cause pdflatex to emit
     # broken UTF-8 in error messages, which crashes subprocess text decoding
     # and prevents the bibtex + multi-pass pipeline from completing.
-    _sanitize_tex_unicode(tex_path)
+    if allow_repairs:
+        _sanitize_tex_unicode(tex_path)
 
     for attempt in range(1, max_attempts + 1):
         result.attempts = attempt
@@ -106,7 +117,8 @@ def compile_latex(
         # Pass 1: generate .aux (needed by bibtex). Use nonstopmode (NOT
         # halt-on-error) so .aux is written even when there are non-fatal
         # errors like missing figures or overfull hboxes.
-        log_text, pass1_ok = _run_pdflatex(work_dir, tex_name, timeout)
+        log_text, pass1_ok = (_run_pdflatex(work_dir, tex_name, timeout) if engine == "pdflatex"
+                             else _run_pdflatex(work_dir, tex_name, timeout, engine=engine))
         if log_text is None:
             result.errors.append(f"pdflatex failed on pass 1 (attempt {attempt})")
             break
@@ -114,11 +126,12 @@ def compile_latex(
         # BibTeX: always run after pass 1 — it only needs .aux + .bib.
         # Previously gated behind pass1 success, which meant citations were
         # always [?] when the first pass had non-fatal errors.
-        _run_bibtex(work_dir, bib_stem, timeout=60)
+        bib_ok = _run_bibtex(work_dir, bib_stem, timeout=60)
 
         # Passes 2-3: resolve cross-references and bibliography
         for _pass in (2, 3):
-            pass_log, _ = _run_pdflatex(work_dir, tex_name, timeout)
+            pass_log, final_pass_ok = (_run_pdflatex(work_dir, tex_name, timeout) if engine == "pdflatex"
+                           else _run_pdflatex(work_dir, tex_name, timeout, engine=engine))
             if pass_log is not None:
                 log_text = pass_log  # keep final pass log for error analysis
 
@@ -130,6 +143,19 @@ def compile_latex(
         # Check for fatal errors only — non-fatal ones (overfull hbox,
         # missing figure in draft) don't prevent a valid PDF.
         fatal = [e for e in errors if _is_fatal_error(e)]
+        if not final_pass_ok or pass_log is None:
+            fatal.append("Final LaTeX pass failed or timed out")
+        if _bib_match and not bib_ok:
+            fatal.append("Bibliography compilation failed")
+        if (not pdf_path.is_file() or not pdf_path.read_bytes().startswith(b"%PDF-")
+                or (pdf_path.stat().st_mtime_ns, pdf_path.stat().st_size) == old_pdf):
+            fatal.append("Compilation did not produce a new PDF")
+        if not allow_repairs:
+            # Formal exports cannot accept dropped floats/glyphs as nonfatal.
+            fatal.extend(e for e in errors if e not in fatal)
+            if re.search(r"(?:Reference|Citation).*undefined|There were undefined references", log_text):
+                fatal.append("Unresolved references or citations in final LaTeX pass")
+        errors.extend(e for e in fatal if e not in errors)
         result.errors = errors
 
         if not fatal:
@@ -137,6 +163,8 @@ def compile_latex(
             logger.info("IMP-18: LaTeX compiled successfully on attempt %d", attempt)
             break
 
+        if not allow_repairs:
+            break
         # Try to auto-fix fatal errors
         tex_text = tex_path.read_text(encoding="utf-8")
         fixed_text, fixes = fix_common_latex_errors(tex_text, errors)
@@ -746,6 +774,7 @@ def _run_pdflatex(
     work_dir: Path,
     tex_name: str,
     timeout: int = 120,
+    *, engine: str = "pdflatex",
 ) -> tuple[str | None, bool]:
     """Run a single pdflatex pass with ``-interaction=nonstopmode``.
 
@@ -760,7 +789,7 @@ def _run_pdflatex(
     """
     try:
         proc = subprocess.run(
-            ["pdflatex", "-interaction=nonstopmode", tex_name],
+            [engine, "-no-shell-escape", "-recorder", "-interaction=nonstopmode", tex_name],
             cwd=work_dir,
             capture_output=True,
             timeout=timeout,
