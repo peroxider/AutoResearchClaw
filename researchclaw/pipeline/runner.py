@@ -544,7 +544,26 @@ def execute_pipeline(
             except RuntimeError as exc:
                 extension_error = str(exc)
 
-        if extension_error is not None:
+        input_error = None
+        input_contract = None
+        from researchclaw.research_inputs import InputContractError, contract_for_config
+        try:
+            input_contract = contract_for_config(config, run_dir, initialize=stage == Stage.TOPIC_INIT)
+            if input_contract is not None:
+                (run_dir / "data_preflight.json").write_text(json.dumps({
+                    "status": "verified", "contract_version": input_contract["version"],
+                    "checker": "research_inputs/v1", "scope": "local_csv_preflight",
+                }, indent=2), encoding="utf-8")
+        except InputContractError as exc:
+            input_error = str(exc)
+            (run_dir / "data_preflight.json").write_text(json.dumps({
+                "status": "failed", "reason": input_error, "checker": "research_inputs/v1",
+            }, indent=2), encoding="utf-8")
+
+        if input_error is not None:
+            result = StageResult(stage=stage, status=StageStatus.FAILED, artifacts=(),
+                                 error=input_error, decision="input_contract_invalid")
+        elif extension_error is not None:
             result = StageResult(
                 stage=stage,
                 status=StageStatus.FAILED,
@@ -560,6 +579,16 @@ def execute_pipeline(
                 adapters=adapters,
                 auto_approve_gates=auto_approve_gates,
             )
+        if result.status == StageStatus.DONE and input_contract is not None:
+            try:
+                contract_for_config(config, run_dir)
+            except InputContractError as exc:
+                (run_dir / "data_preflight.json").write_text(json.dumps({
+                    "status": "failed", "reason": str(exc), "checker": "research_inputs/v1",
+                }, indent=2), encoding="utf-8")
+                result = StageResult(stage=stage, status=StageStatus.FAILED,
+                                     artifacts=result.artifacts, error=str(exc),
+                                     decision="input_contract_invalid")
         elapsed = _time.monotonic() - t0
 
         # ── Event log: stage end ──
@@ -697,6 +726,7 @@ def execute_pipeline(
             stage == Stage.RESULT_ANALYSIS
             and result.status == StageStatus.DONE
             and config.experiment.repair.enabled
+            and not (input_contract and input_contract["brief"].get("protocol_path"))
             # Agent-based sandboxes (collider_agent / biology_agent / stat_agent)
             # write a canonical results.json atomically in stage 12.  Stage-14
             # repair would just iterate on python source files that the agent
@@ -721,6 +751,8 @@ def execute_pipeline(
         # --- Heartbeat for sentinel watchdog ---
         if result.status == StageStatus.DONE:
             _write_heartbeat(run_dir, stage, run_id)
+            if stage == Stage.RESEARCH_DECISION and result.decision == "proceed":
+                (run_dir / "quality_warning.txt").unlink(missing_ok=True)
 
         # --- PIVOT/REFINE decision handling ---
         if (
@@ -729,6 +761,27 @@ def execute_pipeline(
             and result.decision in DECISION_ROLLBACK
         ):
             pivot_count = _read_pivot_count(run_dir)
+            if input_contract and input_contract["brief"].get("protocol_path"):
+                results[-1] = StageResult(
+                    stage=stage, status=StageStatus.PAUSED, artifacts=result.artifacts,
+                    evidence_refs=result.evidence_refs, decision="new_protocol_required",
+                    error="Frozen test results cannot drive code or hypothesis refinement in the same run",
+                )
+                _write_checkpoint(run_dir, Stage.RESULT_ANALYSIS, run_id, adapters=adapters)
+                break
+            if config.research.target_status != "exploratory" and (
+                pivot_count >= MAX_DECISION_PIVOTS
+                or (pivot_count > 0 and _consecutive_empty_metrics(run_dir, pivot_count))
+            ):
+                reason = "Research evidence remains incomplete after the refinement budget"
+                results[-1] = StageResult(
+                    stage=stage, status=StageStatus.PAUSED, artifacts=result.artifacts,
+                    evidence_refs=result.evidence_refs, decision="evidence_required", error=reason,
+                )
+                (run_dir / "quality_warning.txt").write_text(reason, encoding="utf-8")
+                # Resume must revisit the decision, not skip into writing.
+                _write_checkpoint(run_dir, Stage.RESULT_ANALYSIS, run_id, adapters=adapters)
+                break
             # R6-4: Skip REFINE if experiment metrics are empty for consecutive cycles
             if pivot_count > 0 and _consecutive_empty_metrics(run_dir, pivot_count):
                 logger.warning(
@@ -845,7 +898,9 @@ def execute_pipeline(
             break
 
         if result.status == StageStatus.FAILED:
-            if skip_noncritical and stage in NONCRITICAL_STAGES:
+            if (skip_noncritical and stage in NONCRITICAL_STAGES
+                    and config.research.target_status == "exploratory"
+                    and result.decision not in {"input_contract_invalid", "experiment_matrix_incomplete"}):
                 logger.warning("Noncritical stage %s failed - skipping", stage.name)
             else:
                 break
@@ -909,6 +964,23 @@ def execute_pipeline(
         logger.warning("MetaClaw post-pipeline hook failed (non-blocking)")
 
     # --- Package deliverables into a single folder ---
+    blockers = [
+        {"stage": int(r.stage), "status": r.status.value, "reason": r.error or r.decision}
+        for r in results if r.status != StageStatus.DONE or r.decision == "degraded"
+    ]
+    for name in ("quality_warning.txt", "degradation_signal.json"):
+        if (run_dir / name).is_file():
+            blockers.append({"artifact": name, "reason": "unresolved_quality_warning"})
+    requirements = run_dir / "requirements_verdict.json"
+    if requirements.is_file():
+        try:
+            if json.loads(requirements.read_text(encoding="utf-8")).get("verdict") == "reject":
+                blockers.append({"artifact": requirements.name, "reason": "requirements_unmet"})
+        except (OSError, ValueError):
+            blockers.append({"artifact": requirements.name, "reason": "invalid_requirements_verdict"})
+    (run_dir / "pipeline_blockers.json").write_text(
+        json.dumps({"issues": blockers}, indent=2), encoding="utf-8"
+    )
     deliverables_dir = None
     try:
         deliverables_dir = _package_deliverables(run_dir, run_id, config)
@@ -940,6 +1012,30 @@ def execute_pipeline(
             summary["extensions_completed"] = post_hooks
             _write_pipeline_summary(run_dir, summary)
             print(f"[{run_id}] Extension gates passed → {', '.join(post_hooks)}")
+
+    # Final acceptance runs after all extensions, which may mutate the files.
+    from researchclaw.pipeline.final_acceptance import seal_delivery
+    if deliverables_dir is not None:
+        acceptance = seal_delivery(
+            deliverables_dir, target_status=config.research.target_status,
+            quality_threshold=config.research.quality_threshold,
+        )
+        summary["artifact_status"] = acceptance["artifact_status"]
+        summary["target_met"] = acceptance["target_met"]
+        summary["acceptance_issues"] = acceptance["issues"]
+    else:
+        summary["artifact_status"] = "exploratory"
+        summary["target_met"] = config.research.target_status == "exploratory"
+    if not summary["target_met"]:
+        results.append(StageResult(
+            stage=Stage.EXPORT_PUBLISH, status=StageStatus.FAILED,
+            artifacts=("final_acceptance.json",) if deliverables_dir else (),
+            error="Requested artifact quality not achieved; see final acceptance issues",
+        ))
+        summary["final_status"] = StageStatus.FAILED.value
+        summary["stages_failed"] = sum(r.status == StageStatus.FAILED for r in results)
+        summary["stages_executed"] = len(results)
+    _write_pipeline_summary(run_dir, summary)
 
     # --- HITL: Finalize session state ---
     try:
@@ -979,6 +1075,9 @@ def _package_deliverables(
     - code/                   — Experiment code package
     - verification_report.json — Citation verification report (if available)
     """
+    if (run_dir / "manuscript_ir.json").is_file():
+        from researchclaw.pipeline.manuscript import package_manuscript
+        return package_manuscript(run_dir, run_id, config)
     dest = run_dir / "deliverables"
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -1266,12 +1365,58 @@ def _package_deliverables(
         except Exception:  # noqa: BLE001
             logger.debug("Cite key verification/repair skipped")
 
-    # --- 9. IMP-18: Compile LaTeX to verify paper.tex ---
+    # Bundle acceptance inputs; absent evidence stays explicitly unknown.
+    for name, source in {
+        "quality_report.json": run_dir / "stage-20" / "quality_report.json",
+        "evidence_store.json": run_dir / "evidence_store.json",
+        "numeric_claims.json": run_dir / "numeric_claims.json",
+        "citation_support.json": run_dir / "citation_support.json",
+        "literature_evidence.json": run_dir / "literature_evidence.json",
+        "literature_coverage.json": run_dir / "literature_coverage.json",
+        "novelty_matrix.json": run_dir / "novelty_matrix.json",
+        "contribution_ledger.json": run_dir / "contribution_ledger.json",
+        "theory_bundle.json": run_dir / "theory_bundle.json",
+        "method_spec.json": run_dir / "method_spec.json",
+        "method_implementation.json": run_dir / "method_implementation.json",
+        "method_validation.json": run_dir / "method_validation.json",
+        "experiment_protocol.json": run_dir / "experiment_protocol.json",
+        "experiment_coverage.json": run_dir / "experiment_coverage.json",
+        "protocol_code.json": run_dir / "protocol_code.json",
+        "protocol_execution.jsonl": run_dir / "protocol_execution.jsonl",
+        "protocol_budget.json": run_dir / "protocol_budget.json",
+        "final_reviews.json": run_dir / "final_reviews.json",
+        "pipeline_blockers.json": run_dir / "pipeline_blockers.json",
+        "research_contract.json": run_dir / "research_contract.json",
+        "data_preflight.json": run_dir / "data_preflight.json",
+    }.items():
+        if source.is_file():
+            shutil.copy2(source, dest / name)
+            packaged.append(name)
+        elif (dest / name).is_file():
+            # Do not inherit an earlier run's acceptance evidence on resume.
+            (dest / name).write_text("{}", encoding="utf-8")
+    # Raw outputs referenced by EvidenceStore are kept relative to this bundle.
+    evidence_artifacts = run_dir / "evidence_artifacts"
+    if evidence_artifacts.is_dir():
+        shutil.copytree(evidence_artifacts, dest / "evidence_artifacts", dirs_exist_ok=True)
+        packaged.append("evidence_artifacts/")
+    prepared_inputs = run_dir / "research_inputs"
+    if prepared_inputs.is_dir():
+        shutil.copytree(prepared_inputs, dest / "research_inputs", dirs_exist_ok=True)
+        packaged.append("research_inputs/")
+
+    # --- 9. Compile the final LaTeX, after all figures and citations ---
+    from researchclaw.pipeline.final_acceptance import compilation_inputs, seal_delivery
+    from researchclaw.pipeline.evidence_store import file_hash
+    compilation = {"success": False, "errors": ["missing_compile_inputs"]}
     if tex_path.exists() and bib_path.exists():
         try:
             from researchclaw.templates.compiler import compile_latex
 
             compile_result = compile_latex(tex_path, max_attempts=3, timeout=120)
+            compilation = {"success": compile_result.success,
+                           "errors": compile_result.errors, "warnings": compile_result.warnings,
+                           "fixes_applied": compile_result.fixes_applied}
             if compile_result.success:
                 logger.info("IMP-18: paper.tex compiles successfully")
                 # Keep the generated PDF
@@ -1294,10 +1439,16 @@ def _package_deliverables(
         except Exception:  # noqa: BLE001
             logger.debug("IMP-18: LaTeX compilation skipped (non-blocking)")
 
+    compilation["inputs"] = compilation_inputs(dest)
+    compilation["pdf_sha256"] = file_hash(dest / "paper.pdf") if (dest / "paper.pdf").is_file() else None
+
     if not packaged:
         # Nothing to package — remove empty dir
         dest.rmdir()
         return None
+
+    (dest / "compilation.json").write_text(json.dumps(compilation, indent=2), encoding="utf-8")
+    packaged.append("compilation.json")
 
     # --- Write manifest ---
     manifest = {
@@ -1317,6 +1468,8 @@ def _package_deliverables(
     (dest / "manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
+    seal_delivery(dest, target_status=config.research.target_status,
+                  quality_threshold=config.research.quality_threshold)
 
     logger.info(
         "Deliverables packaged: %s (%d items)",
@@ -1679,52 +1832,15 @@ def _check_experiment_quality(
     except (json.JSONDecodeError, OSError):
         return False, "experiment_summary.json is malformed"
 
-    # Check 1: Are all metrics zero?
-    ms = data.get("metrics_summary", {})
-    if isinstance(ms, dict):
-        values: list[float] = []
-        for k, v in ms.items():
-            if isinstance(v, (int, float)):
-                values.append(float(v))
-            # BUG-212: metrics_summary values are often dicts {min,max,mean,count}
-            elif isinstance(v, dict) and "mean" in v:
-                _mv = v["mean"]
-                if isinstance(_mv, (int, float)):
-                    values.append(float(_mv))
-        if values and all(v == 0.0 for v in values):
-            return False, "All experiment metrics are zero — experiments likely failed"
-
-    # Check 2: Zero variance across conditions (R13-1)
-    # Look for ablation_warnings or condition comparison data
-    ablation_warnings = data.get("ablation_warnings", [])
-    # BUG-212: Key is "condition_summaries", not "conditions"
-    conditions = data.get(
-        "condition_summaries", data.get("condition_metrics", {})
-    )
-    if isinstance(conditions, dict) and len(conditions) >= 2:
-        primary_values: list[float] = []
-        for cond_name, cond_data in conditions.items():
-            if isinstance(cond_data, dict):
-                # BUG-212: Primary metric lives inside cond_data["metrics"]
-                _metrics = cond_data.get("metrics", cond_data)
-                pm = _metrics.get(
-                    "primary_metric",
-                    _metrics.get("primary_metric_mean"),
-                )
-                if isinstance(pm, (int, float)):
-                    primary_values.append(float(pm))
-        if len(primary_values) >= 2 and len(set(primary_values)) == 1:
-            return False, (
-                f"All {len(primary_values)} conditions have identical primary_metric "
-                f"({primary_values[0]}) — condition implementations are likely broken"
-            )
-
-    # Check 3: Too many ablation warnings
-    if isinstance(ablation_warnings, list) and len(ablation_warnings) >= 3:
-        return False, (
-            f"{len(ablation_warnings)} ablation warnings — most conditions "
-            f"produce identical results"
-        )
+    # Scientific null results do not establish an implementation failure.
+    # Execution status and missing evidence, rather than effect size, are gates.
+    best_run = data.get("best_run") or {}
+    if data.get("experiment_failed") or best_run.get("status") in {"failed", "error"}:
+        return False, "Experiment execution failed"
+    if not data.get("metrics_summary") and not best_run.get("metrics"):
+        return False, "No experiment metrics produced"
+    if data.get("implementation_issues"):
+        return False, "Implementation or execution checks reported unresolved defects"
 
     # Check 4: Analysis quality score (if available)
     quality = data.get("analysis_quality", data.get("quality_score"))

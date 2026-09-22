@@ -152,9 +152,13 @@ class VerifiedRegistry:
             ``"maximize"`` or ``"minimize"`` — used for best-result detection.
         """
         reg = cls(metric_direction=metric_direction)
+        best_run = experiment_summary.get("best_run") or {}
+        if (experiment_summary.get("experiment_failed")
+                or best_run.get("status") in {"failed", "error"}):
+            return reg
 
         # --- 1. Extract condition-level and per-seed metrics ---
-        best_run = experiment_summary.get("best_run", {})
+        best_run = experiment_summary.get("best_run") or {}
         metrics = best_run.get("metrics", {})
 
         # Parse per-seed structure: "CondName/seed/metric_key" → value

@@ -1062,6 +1062,16 @@ def _build_context_preamble(
         f"**Topic**: {config.research.topic}",
         f"**Domains**: {', '.join(config.research.domains) if config.research.domains else 'general'}",
     ]
+    from researchclaw.research_inputs import contract_for_config, public_context
+    contract = contract_for_config(config, run_dir)
+    if contract is not None:
+        parts.append(public_context(contract, run_dir))
+    from researchclaw.literature.evidence import evidence_context
+    literature_context = evidence_context(run_dir)
+    if literature_context:
+        parts.append(literature_context)
+        from researchclaw.literature.positioning import positioning_context
+        parts.append(positioning_context(run_dir))
     if include_goal:
         goal = _read_prior_artifact(run_dir, "goal.md")
         if goal:
