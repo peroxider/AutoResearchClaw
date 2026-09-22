@@ -71,6 +71,91 @@ def _plan_field_names(items: list) -> list[str]:
     return result
 
 
+def _freeze_medical_llm_contract(config: RCConfig, plan: dict[str, Any]) -> dict[str, Any]:
+    """Persist the prompt-injected clinical data contract as a binding Stage 9 artifact.
+
+    Profiles deliberately stay dataset-agnostic: a researcher supplies the source
+    paths and allowed/prohibited fields in ``prompts.extra_prompts``.  This helper
+    records that supplied specification verbatim enough for Stage 10 to obey it,
+    rather than inviting the code agent to infer a larger imaginary cohort.
+    """
+    prompt_text = "\n".join(
+        value for _stage, value in getattr(config.prompts, "extra_prompts", ())
+        if _stage in {"experiment_design", "code_generation"}
+    )
+    source_paths = [p.rstrip(".") for p in re.findall(
+        r"(?:[A-Za-z]:\\[^\s;,'\"]+|/[^\s;,'\"]+\.(?:csv|sav|parquet|xlsx?))",
+        prompt_text,
+    )]
+    contract = {
+        "schema_version": "medical_llm_audit/v1",
+        "status": "frozen_before_execution",
+        "source_paths": list(dict.fromkeys(source_paths)),
+        "prompt_injected_contract": prompt_text,
+        "allowed_execution": {
+            "api_only_if_declared": True,
+            "no_local_model_training_unless_declared": True,
+            "no_external_data_unless_declared": True,
+            "no_synthetic_records_or_imputed_metrics": True,
+        },
+        "required_provenance": [
+            "outcome-blind request hash before outcome join",
+            "patient-level API score or abstention",
+            "request/response hash, latency, error and condition label",
+        ],
+        "planned_conditions": {
+            "baselines": _normalize_plan_field(plan.get("baselines")),
+            "proposed_methods": _normalize_plan_field(plan.get("proposed_methods")),
+            "ablations": _normalize_plan_field(plan.get("ablations")),
+        },
+    }
+    marker = re.search(r"ARC_MEDICAL_EXECUTOR_CONFIG\s*:\s*(\{[^\r\n]+\})", prompt_text)
+    if marker:
+        try:
+            contract.update(json.loads(marker.group(1)))
+        except json.JSONDecodeError:
+            contract["executor_config_error"] = "invalid ARC_MEDICAL_EXECUTOR_CONFIG JSON"
+    return contract
+
+
+def _enforce_declared_medical_conditions(config: RCConfig, plan: dict[str, Any]) -> None:
+    """Make an explicit prompt-injected condition list binding for Stage 9.
+
+    This remains generic: an investigator chooses the names in the prompt.
+    When they write ``conditions are exactly A, B, and C``, an LLM may not add
+    unrequested fine-tuned or classical comparators merely because they are
+    common in a biomedical benchmark template.
+    """
+    prompt_text = "\n".join(
+        value for stage, value in getattr(config.prompts, "extra_prompts", ())
+        if stage == "experiment_design"
+    )
+    match = re.search(
+        r"conditions\s+are\s+exactly\s+([^.;\n]+)", prompt_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return
+    names = [part.strip(" ,") for part in re.split(r",|\band\b", match.group(1), flags=re.IGNORECASE) if part.strip(" ,")]
+    if len(names) < 2:
+        return
+    proposed = [name for name in names if any(token in name.lower() for token in ("full", "proposed", "agent"))]
+    ablations = [name for name in names if any(token in name.lower() for token in ("no", "ablation", "without"))]
+    baselines = [name for name in names if name not in proposed and name not in ablations]
+    plan["baselines"] = baselines
+    plan["proposed_methods"] = proposed or [names[-1]]
+    plan["ablations"] = ablations
+    plan["condition_contract"] = {
+        "declared_exactly": names,
+        "enforced_from_prompt": True,
+        "prohibited_substitutions": [
+            "undeclared local model training or fine-tuning",
+            "undeclared external dataset or gold cohort",
+            "undeclared synthetic records or proxy metrics",
+        ],
+    }
+
+
 def _execute_experiment_design(
     stage_dir: Path,
     run_dir: Path,
@@ -145,6 +230,16 @@ def _execute_experiment_design(
                 )
         except Exception:  # noqa: BLE001
             logger.debug("Domain experiment design context unavailable", exc_info=True)
+
+    if _domain_profile is not None and _domain_profile.domain_id == "medical_llm_audit":
+        _domain_design_context += (
+            "## Frozen-contract output requirements (mandatory)\n"
+            "Return only an experiment plan grounded in the prompt-injected DATA CONTRACT. "
+            "Use the exact source paths and cohort size stated there. Do not propose MIMIC, UCI, "
+            "FAISS, note corpora, temporal hold-outs, synthetic vignettes, local fine-tuning, or "
+            "unavailable gold records unless the contract explicitly names them. Limit the plan to "
+            "the declared LLM API conditions and CPU-side evaluation.\n\n"
+        )
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -590,6 +685,13 @@ def _execute_experiment_design(
     except Exception:
         pass
 
+    if _domain_profile is not None and _domain_profile.domain_id == "medical_llm_audit":
+        _enforce_declared_medical_conditions(config, plan)
+        frozen_contract = _freeze_medical_llm_contract(config, plan)
+        (stage_dir / "data_contract.json").write_text(
+            json.dumps(frozen_contract, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
     (stage_dir / "exp_plan.yaml").write_text(
         yaml.dump(plan, default_flow_style=False, allow_unicode=True),
         encoding="utf-8",
@@ -597,6 +699,6 @@ def _execute_experiment_design(
     return StageResult(
         stage=Stage.EXPERIMENT_DESIGN,
         status=StageStatus.DONE,
-        artifacts=("exp_plan.yaml",),
-        evidence_refs=("stage-09/exp_plan.yaml",),
+        artifacts=("exp_plan.yaml", "data_contract.json") if _domain_profile is not None and _domain_profile.domain_id == "medical_llm_audit" else ("exp_plan.yaml",),
+        evidence_refs=("stage-09/exp_plan.yaml", "stage-09/data_contract.json") if _domain_profile is not None and _domain_profile.domain_id == "medical_llm_audit" else ("stage-09/exp_plan.yaml",),
     )

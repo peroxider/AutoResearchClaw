@@ -3,6 +3,7 @@
 import json
 import logging
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 from typing import Any
 
 try:
@@ -13,6 +14,12 @@ except ImportError:
     HAS_HTTPX = False
 
 logger = logging.getLogger(__name__)
+
+# Single shared executor for wall-clock timeout enforcement.  httpx's per-read
+# timeout resets on every byte, so a server that trickles data slowly can hold
+# a connection open for hours.  Running the request in a worker and applying a
+# hard wall-clock cap from the outside side-steps that.
+_HARD_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 _JSON_MODE_INSTRUCTION = (
     "You MUST respond with valid JSON only. "
@@ -133,10 +140,41 @@ class AnthropicAdapter:
 
         try:
             if self._client is None:
-                self._client = httpx.Client(timeout=self.timeout_sec)
-            response = self._client.post(url, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
+                # Per-request read timeout (covers the streaming case where the
+                # server keeps the connection alive but never flushes a final
+                # response).  Connect timeout stays short so misconfigured
+                # proxies fail fast.
+                self._client = httpx.Client(
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=float(self.timeout_sec),
+                        write=float(self.timeout_sec),
+                        pool=10.0,
+                    )
+                )
+
+            def _do_post() -> dict[str, Any]:
+                resp = self._client.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+            # Hard wall-clock cap: httpx per-read timeout resets on every byte,
+            # so a slow-trickle server can hold a connection open indefinitely.
+            # Running the call in a worker and timing out the future enforces
+            # an absolute upper bound on the call regardless of data flow.
+            future = _HARD_TIMEOUT_EXECUTOR.submit(_do_post)
+            try:
+                data = future.result(timeout=float(self.timeout_sec) + 30.0)
+            except _FutTimeout:
+                future.cancel()
+                raise urllib.error.URLError(
+                    f"LLM call exceeded wall-clock budget "
+                    f"({self.timeout_sec + 30}s); aborted"
+                )
         except httpx.HTTPStatusError as exc:
             # Convert to urllib.error.HTTPError for upstream retry logic.
             # Include Anthropic's error body so upstream logs show the

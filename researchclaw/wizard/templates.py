@@ -6,8 +6,8 @@ from typing import Any
 
 TEMPLATES: dict[str, dict[str, Any]] = {
     "quick-demo": {
-        "description": "5-minute quick demo (simulated mode, no GPU needed)",
-        "experiment.mode": "simulated",
+        "description": "5-minute quick demo (local sandbox, no GPU needed)",
+        "experiment.mode": "sandbox",
         "experiment.time_budget_sec": 60,
         "experiment.max_iterations": 3,
     },

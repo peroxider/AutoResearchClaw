@@ -16,6 +16,11 @@ from researchclaw.config import RCConfig
 from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.knowledge.base import write_stage_to_kb
 from researchclaw.pipeline.executor import StageResult, execute_stage
+from researchclaw.pipeline.extensions import (
+    POST_RUN_HOOKS,
+    PRE_EXPERIMENT_HOOKS,
+    run_extension_hooks,
+)
 from researchclaw.pipeline.stages import (
     DECISION_ROLLBACK,
     MAX_DECISION_PIVOTS,
@@ -526,14 +531,35 @@ def execute_pipeline(
 
         t0 = _time.monotonic()
 
-        result = execute_stage(
-            stage,
-            run_dir=run_dir,
-            run_id=run_id,
-            config=config,
-            adapters=adapters,
-            auto_approve_gates=auto_approve_gates,
-        )
+        extension_error = None
+        if stage == Stage.EXPERIMENT_RUN:
+            try:
+                pre_hooks = run_extension_hooks(
+                    PRE_EXPERIMENT_HOOKS,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                )
+                if pre_hooks:
+                    logger.info("[%s] Pre-experiment hooks completed: %s", run_id, pre_hooks)
+            except RuntimeError as exc:
+                extension_error = str(exc)
+
+        if extension_error is not None:
+            result = StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=extension_error,
+            )
+        else:
+            result = execute_stage(
+                stage,
+                run_dir=run_dir,
+                run_id=run_id,
+                config=config,
+                adapters=adapters,
+                auto_approve_gates=auto_approve_gates,
+            )
         elapsed = _time.monotonic() - t0
 
         # ── Event log: stage end ──
@@ -883,12 +909,37 @@ def execute_pipeline(
         logger.warning("MetaClaw post-pipeline hook failed (non-blocking)")
 
     # --- Package deliverables into a single folder ---
+    deliverables_dir = None
     try:
         deliverables_dir = _package_deliverables(run_dir, run_id, config)
         if deliverables_dir is not None:
             print(f"[{run_id}] Deliverables packaged → {deliverables_dir}")
     except Exception:  # noqa: BLE001
         logger.warning("Deliverables packaging failed (non-blocking)")
+
+    complete_paper = (
+        deliverables_dir is not None
+        and (deliverables_dir / "paper.tex").is_file()
+        and (deliverables_dir / "paper_final.md").is_file()
+    )
+    if complete_paper and deliverables_dir is not None:
+        try:
+            post_hooks = run_extension_hooks(
+                POST_RUN_HOOKS,
+                run_dir=deliverables_dir,
+                run_id=run_id,
+            )
+        except RuntimeError as exc:
+            summary["extensions_status"] = "failed"
+            summary["extensions_error"] = str(exc)
+            _write_pipeline_summary(run_dir, summary)
+            logger.error("[%s] Post-run extension gate failed: %s", run_id, exc)
+            raise
+        if post_hooks:
+            summary["extensions_status"] = "passed"
+            summary["extensions_completed"] = post_hooks
+            _write_pipeline_summary(run_dir, summary)
+            print(f"[{run_id}] Extension gates passed → {', '.join(post_hooks)}")
 
     # --- HITL: Finalize session state ---
     try:
@@ -1354,6 +1405,125 @@ def _consecutive_empty_metrics(run_dir: Path, pivot_count: int) -> bool:
     return True  # Both cycles had empty metrics
 
 
+def _drop_untraceable_summary_values(run_dir: Path) -> None:
+    """Strip metric values from ``experiment_summary_best.json`` that cannot
+    be traced back to a real run payload.
+
+    paper_2's incident: Stage 13 ITERATIVE_REFINE wrote
+    ``experiment_summary_best.json`` containing 804 metric values across 8
+    conditions (RF 0.9658, LASSO 0.992, MLP 0.9801, etc.), but the only
+    actually-executed run payload (``stage-12/runs/run-1.json``) held 7 LR
+    scalars. Stage 17 PAPER_DRAFT read the synthesised summary and quoted the
+    fabricated numbers verbatim into the paper. This guard prevents that by
+    cross-checking every numeric in the summary against the set of values
+    that actually appear in ``stage-*/runs/*.json`` ``metrics`` / ``key_metrics``
+    dicts.
+
+    The check tolerates ±1e-6 float drift (numerical round-trip) and string
+    keys whose values are not floats are passed through unchanged. Counts
+    of dropped entries are recorded in
+    ``experiment_summary_best.synthesis_audit.json`` for debugging.
+    """
+    summary_path = run_dir / "experiment_summary_best.json"
+    if not summary_path.exists():
+        return
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(summary, dict):
+        return
+
+    # Collect traceable floats from every stage-*/runs/*.json payload.
+    traceable: set[float] = set()
+    for run_file in sorted(run_dir.glob("stage-*/runs/*.json")):
+        if run_file.name == "results.json":
+            continue
+        try:
+            payload = json.loads(run_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("status") == "simulated":
+            continue
+        for source_key in ("metrics", "key_metrics"):
+            metrics_dict = payload.get(source_key)
+            if not isinstance(metrics_dict, dict):
+                continue
+            for v in metrics_dict.values():
+                if isinstance(v, (int, float)) and not (
+                    isinstance(v, float) and (math.isnan(v) or math.isinf(v))
+                ):
+                    traceable.add(round(float(v), 6))
+
+    if not traceable:
+        return  # No run payloads at all — Stage 17 will block via R4-2 anyway.
+
+    def _is_traced(v: object) -> bool:
+        if isinstance(v, bool):
+            return True
+        if isinstance(v, (int, float)):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return True
+            return round(float(v), 6) in traceable
+        return True  # strings / lists / dicts — let downstream handle
+
+    dropped_count = 0
+    total_count = 0
+
+    def _scrub(container: dict, path: str = "") -> None:
+        nonlocal dropped_count, total_count
+        keys_to_drop: list[str] = []
+        for k, v in container.items():
+            if isinstance(v, dict):
+                _scrub(v, f"{path}.{k}")
+                continue
+            total_count += 1
+            if not _is_traced(v):
+                keys_to_drop.append(k)
+        for k in keys_to_drop:
+            container.pop(k, None)
+            dropped_count += 1
+
+    _scrub(summary)
+
+    if dropped_count:
+        try:
+            summary_path.write_text(
+                json.dumps(summary, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        audit_path = run_dir / "experiment_summary_best.synthesis_audit.json"
+        try:
+            audit_path.write_text(
+                json.dumps(
+                    {
+                        "dropped": dropped_count,
+                        "kept": total_count - dropped_count,
+                        "total_inspected": total_count,
+                        "traceable_run_values": len(traceable),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        logger.warning(
+            "Fabrication-guard: dropped %d untraceable metric value(s) from "
+            "experiment_summary_best.json (%d kept of %d). See "
+            "%s.",
+            dropped_count,
+            total_count - dropped_count,
+            total_count,
+            audit_path.name,
+        )
+
+
 def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
     """BUG-205: After forced PROCEED, promote the best stage-14 experiment.
 
@@ -1437,6 +1607,16 @@ def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
         _best_analysis = best_dir / "analysis.md"
         if _best_analysis.exists():
             shutil.copy2(_best_analysis, run_dir / "analysis_best.md")
+
+        # Fabrication-guard layer 3 (R6-paper2): the promoted summary may
+        # contain values synthesised by Stage 13's experiment_final.py that
+        # cannot be traced back to any executed run. Before downstream
+        # consumers (Stage 17 PAPER_DRAFT in particular) read the summary,
+        # strip any untraceable entries with a WARN log. paper_2's
+        # experiment_summary_best.json held 804 metric values covering 8
+        # conditions, while only 7 LR-only/LR-LLM scalars were ever
+        # actually computed by the executed main.py.
+        _drop_untraceable_summary_values(run_dir)
 
     if best_dir == current_dir:
         logger.info("BUG-205: stage-14/ already has the best result (%.4f)", best_val)

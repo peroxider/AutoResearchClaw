@@ -197,7 +197,13 @@ class PromptManager:
             if not text:
                 continue
             candidate = Path(text).expanduser()
-            if candidate.exists() and candidate.is_file():
+            # Inline prompts can be much longer than the platform's maximum
+            # filename length.  Treat an unstatable value as inline text.
+            try:
+                is_prompt_file = candidate.exists() and candidate.is_file()
+            except OSError:
+                is_prompt_file = False
+            if is_prompt_file:
                 try:
                     text = candidate.read_text(encoding="utf-8").strip()
                 except OSError as exc:

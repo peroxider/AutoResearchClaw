@@ -1,0 +1,78 @@
+domain_id: medical_llm_audit
+display_name: Auditable LLM Clinical Informatics
+parent_domain: medicine
+preferred_experiment_mode: sandbox
+preferred_project_mode: co-pilot
+preferred_target_conference: generic
+default_time_budget_sec: 7200
+default_metric_key: auroc
+default_metric_direction: maximize
+experiment_paradigm: comparison
+condition_terminology:
+  baseline: LLM or clinical-score comparator
+  proposed: auditable LLM/agent protocol
+  variant: protocol ablation
+  input: de-identified, time-indexed state card
+  metric: discrimination, calibration, utility, safety, cost
+core_libraries: [pandas, numpy, scipy, scikit-learn, matplotlib, httpx]
+pip_packages: [pandas, numpy, scipy, scikit-learn, matplotlib, httpx]
+docker_image: researchclaw/sandbox-generic:latest
+gpu_required: false
+metric_types: [scalar, table, structured]
+standard_baselines:
+  - direct structured prompting
+  - retrieval-constrained prompting
+  - fixed clinical score when source definitions are available
+  - no-critic ablation
+  - no-abstention ablation
+evaluation_protocol: >-
+  Freeze a data contract before scoring. Every model request must exclude direct
+  identifiers, outcome fields, and post-index variables; hash each canonical
+  request/response before outcome linkage. Evaluate patient-level AUROC, AUPRC,
+  calibration, decision utility, coverage, safety failures, cost, and latency.
+statistical_tests: [stratified_bootstrap_confidence_interval, paired_patient_level_comparison]
+paper_keywords: [clinical informatics, large language model, agentic workflow, auditability, calibration, decision curve]
+compute_budget_guidance: >-
+  Batch only de-identified public or approved state cards. Persist every batch
+  atomically and support resumption by request hash; never substitute synthetic
+  metrics when an API batch fails.
+dataset_guidance: >-
+  Stage 9 MUST emit data_contract.json defining dataset provenance/licence,
+  cohort, index time, outcome, feature allow-list, prohibited fields,
+  identifier removal, missingness, and validation role. A dataset with a
+  different endpoint, population, setting, or prediction horizon is a
+  transportability/method validation dataset, not same-task external
+  validation, unless compatibility is explicitly established.
+hp_reporting_guidance: >-
+  Record provider, model/version, API endpoint class, temperature, prompt hash,
+  retrieval corpus/version, batch size, retry policy, seed, timeout, token
+  usage, and cost estimate for each condition.
+code_generation_hints: >-
+  Implement the declared LLM/agent evaluation protocol as real, runnable
+  components. Select only the components the hypothesis requires from a
+  state-card compiler, retrieval layer, planner, tool executor, memory,
+  reasoner, critic, abstention policy, and write-ahead ledger. The proposed
+  method and ablations must have distinct executable logic. Produce
+  data_contract.json, ledger/*.json, patient_results.jsonl, metrics.json,
+  calibration.csv when scores are probabilities, decision_curve.csv when a
+  clinical threshold analysis is justified, and results.json. A failed request
+  must be recorded as failed/abstained, never imputed or fabricated.
+result_analysis_hints: >-
+  Stage 14 must reject aggregate-only evidence. Report only metrics traceable
+  to patient_results.jsonl and ledger hashes. Separate discrimination,
+  calibration, net benefit, coverage, unsafe-output rate, token cost, and
+  latency. Bootstrap draws are confidence intervals, not independent seeds.
+  Stage 16-19 must produce a medical-informatics AI-methodology paper, not a
+  system-design or governance report. Methods require mathematical formulation,
+  theoretical analysis/proposition, computational complexity, and a detailed
+  algorithm framework figure. Introduction additionally requires a separate,
+  abstract input-data -> LLM method/model -> output/evaluation overview that
+  highlights innovations visually with minimal text and no emoji. The Methods
+  figure must be more detailed, group components in dashed functional modules,
+  use one color family per module, and use a different source asset from the
+  Introduction figure. Add a dataset statistical-profile subsection with
+  an outcome-stratified descriptive table and multi-panel figure. Results cannot
+  consist of one aggregate table: analyze discrimination, calibration,
+  score-versus-release coverage, failures, latency/cost, critic behavior, and a
+  supported sensitivity analysis, with at least two result figures. Use one
+  shared colorblind-safe plot style and export PNG plus vector PDF.

@@ -1131,7 +1131,7 @@ _DEFAULT_SUB_PROMPTS: dict[str, dict[str, Any]] = {
             "Output ALL files in ```filename:xxx.py``` format, including files "
             "that don't need changes."
         ),
-        "max_tokens": 16384,
+        "max_tokens": 8192,
     },
     "code_reviewer": {
         "system": (

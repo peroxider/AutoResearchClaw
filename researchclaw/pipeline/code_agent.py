@@ -926,7 +926,7 @@ class CodeAgent:
         )
 
         sys_prompt = self._pm.system("code_generation")
-        resp = self._chat(sys_prompt, prompt, max_tokens=16384)
+        resp = self._chat(sys_prompt, prompt, max_tokens=8192)
 
         fixed = self._extract_files(resp.content)
         if fixed:
@@ -1027,7 +1027,7 @@ class CodeAgent:
         if not files and resp.content.strip():
             # Retry with higher token budget
             self._log_event("  Empty extraction, retrying with 32768 tokens")
-            resp = self._chat(sp.system, sp.user, max_tokens=32768)
+            resp = self._chat(sp.system, sp.user, max_tokens=8192)
             files = self._extract_files(resp.content)
 
         return files
@@ -1068,7 +1068,7 @@ class CodeAgent:
             returncode=str(result.returncode),
             files_context=files_ctx,
         )
-        resp = self._chat(sp.system, sp.user, max_tokens=16384)
+        resp = self._chat(sp.system, sp.user, max_tokens=8192)
 
         fixed = self._extract_files(resp.content)
         if fixed:
@@ -1174,7 +1174,7 @@ class CodeAgent:
             "shown. Preserve experiment design and scientific methodology. "
             "Output the COMPLETE fixed file."
         )
-        resp = self._chat(sys_prompt, prompt, max_tokens=16384)
+        resp = self._chat(sys_prompt, prompt, max_tokens=8192)
 
         fixed = self._extract_files(resp.content)
         if not fixed:
@@ -1373,7 +1373,7 @@ class CodeAgent:
                 "including unchanged files."
             )
             sys_prompt = self._pm.system("code_generation")
-            fix_resp = self._chat(sys_prompt, fix_prompt, max_tokens=16384)
+            fix_resp = self._chat(sys_prompt, fix_prompt, max_tokens=8192)
 
             fixed = self._extract_files(fix_resp.content)
             if fixed:

@@ -133,7 +133,17 @@ class TestStage12HardGuards:
         result = MagicMock()
         result.returncode = 0
         result.timed_out = False
-        result.metrics = {"accuracy": 0.85, "loss": 0.32}
+        # Layer 2 (R6-paper2) requires >=5 metric keys when the run
+        # consumed <2% of the time budget; the previous 2-key fixture
+        # was the exact paper_2 pattern that the new guard now blocks.
+        result.metrics = {
+            "accuracy": 0.85,
+            "loss": 0.32,
+            "auc_roc": 0.74,
+            "f1": 0.61,
+            "precision": 0.66,
+            "recall": 0.58,
+        }
         result.stdout = "Training complete"
         result.stderr = ""
         result.elapsed_sec = 120.0

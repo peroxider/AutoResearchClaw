@@ -471,7 +471,7 @@ class TestWizard:
 
         tpl = get_template("quick-demo")
         assert tpl is not None
-        assert tpl["experiment.mode"] == "simulated"
+        assert tpl["experiment.mode"] == "sandbox"
 
     def test_get_template_missing(self) -> None:
         from researchclaw.wizard.templates import get_template

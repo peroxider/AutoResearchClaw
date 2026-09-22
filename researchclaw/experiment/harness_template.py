@@ -21,7 +21,7 @@ class ExperimentHarness:
     """Immutable experiment infrastructure for time and metric management."""
 
     def __init__(self, time_budget: int = 120):
-        self._start = time.time()
+        self._start = time.monotonic()
         self._time_budget = max(1, int(time_budget))
         self._metrics: dict[str, float] = {}
         self._partial_results: list[dict[str, object]] = []
@@ -31,7 +31,7 @@ class ExperimentHarness:
     @property
     def elapsed(self) -> float:
         """Seconds elapsed since harness creation."""
-        return time.time() - self._start
+        return time.monotonic() - self._start
 
     @property
     def progress(self) -> float:

@@ -243,7 +243,12 @@ def get_generic_profile() -> DomainProfile:
 
 # Ordered list: first match wins (more specific patterns first).
 _KEYWORD_RULES: list[tuple[list[str], str]] = [
+    (["auditable clinical llm", "clinical llm audit", "scaffold-r", "outcome-blind llm", "write-ahead clinical"], "medical_llm_audit"),
     # ML sub-domains (most specific first)
+    (['llm agent', 'agentic system', 'agentic workflow', 'retrieval augmented',
+      'rag', 'tool use', 'tool-using', 'function calling', 'multi-agent',
+      'agent memory', 'agent planning', 'agent reflection', 'react agent',
+      'plan-and-execute'], 'ml_llm_agent'),
     (["reinforcement learning", "rl agent", "policy gradient", "q-learning",
       "actor-critic", "reward shaping", "gymnasium", "stable-baselines"],
      "ml_rl"),

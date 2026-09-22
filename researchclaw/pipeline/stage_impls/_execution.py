@@ -142,8 +142,22 @@ def _execute_experiment_run(
     from researchclaw.experiment.runner import ExperimentRunner
 
     schedule_text = _read_prior_artifact(run_dir, "schedule.json") or "{}"
-    # Try multi-file experiment directory first, fall back to single file
+    # Contract-driven medical audit templates must execute the *current*
+    # Stage-10 project.  Generic artifact search can otherwise select an
+    # older stage-10_vN project after a resume, dropping data_contract.json.
     exp_dir_path = _read_prior_artifact(run_dir, "experiment/")
+    if config.project.profile == "medical_llm_audit":
+        current_template_dir = run_dir / "stage-10" / "experiment"
+        contract_file = current_template_dir / "data_contract.json"
+        if not contract_file.is_file():
+            return StageResult(
+                stage=Stage.EXPERIMENT_RUN,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="medical audit template is missing stage-10/experiment/data_contract.json",
+                decision="blocked_missing_template_contract",
+            )
+        exp_dir_path = str(current_template_dir)
     code_text = ""
     if exp_dir_path and Path(exp_dir_path).is_dir():
         main_path = Path(exp_dir_path) / "main.py"
@@ -324,7 +338,15 @@ def _execute_experiment_run(
             )
         # Try to read structured results.json from sandbox working dir
         structured_results: dict[str, Any] | None = None
-        sandbox_project = runs_dir / "sandbox" / "_project"
+        # Sandboxes use unique `_project_N` directories.  Select the newest
+        # project so contract-template results are not silently ignored.
+        _sandbox_root = runs_dir / "sandbox"
+        _projects = sorted(
+            (p for p in _sandbox_root.glob("_project*") if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        sandbox_project = _projects[0] if _projects else _sandbox_root / "_project"
         results_json_path = sandbox_project / "results.json"
         if results_json_path.exists():
             try:
@@ -343,6 +365,16 @@ def _execute_experiment_run(
         effective_metrics = result.metrics
         if not effective_metrics and result.stdout:
             effective_metrics = _parse_metrics_from_stdout(result.stdout)
+        # Contract templates expose authoritative metrics in results.json.
+        # Promote simple scalar values for ARC's normal stage accounting while
+        # retaining the nested result as `structured_results`.
+        if not effective_metrics and isinstance(structured_results, dict):
+            raw_metrics = structured_results.get("metrics", {})
+            if isinstance(raw_metrics, dict):
+                effective_metrics = {
+                    str(k): v for k, v in raw_metrics.items()
+                    if isinstance(v, (int, float))
+                }
 
         # Determine run status: completed / partial (timed out with data) / failed
         # R6-2: Detect stdout failure signals even when exit code is 0
@@ -500,6 +532,7 @@ def _execute_experiment_run(
     # with zero metrics (or only noise) must NOT proceed to paper writing.
     # The old code always returned DONE, which let fabricated papers through.
     _has_real_metrics = False
+    _real_metric_count = 0
     if mode in ("sandbox", "docker"):
         # Check that we have at least one non-trivial float metric
         _real_metric_count = sum(
@@ -565,6 +598,48 @@ def _execute_experiment_run(
                     f"without experiment data."
                 ),
             )
+        # Fabrication-guard layer 2 (R6-paper2): if the run completed using
+        # less than 2 % of the configured budget AND the metric count is
+        # suspiciously small (<5 floats), treat it as a partial execution
+        # and refuse to proceed. This catches paper_2's pattern where the
+        # stub main.py produced only 7 LR-only/LR-LLM scalars in 1.8 s and
+        # Stage 13 then synthesized a richer-looking summary that Stage 17
+        # quoted as ground truth.
+        if (
+            run_status == "completed"
+            and _has_real_metrics
+            and result.elapsed_sec is not None
+            and config.experiment.time_budget_sec > 0
+        ):
+            _budget_used_frac = result.elapsed_sec / config.experiment.time_budget_sec
+            _elapsed_too_fast = _budget_used_frac < 0.02
+            _metrics_too_few = _real_metric_count < 5
+            if _elapsed_too_fast and _metrics_too_few:
+                logger.error(
+                    "Stage 12: Experiment 'completed' in %.1fs "
+                    "(%.1f%% of %ds budget) with only %d metric keys. "
+                    "Refusing to mark DONE — this matches the paper_2 "
+                    "fabrication pattern (fast stub returning a sparse "
+                    "metric set that downstream stages fill in with "
+                    "synthesized numbers).",
+                    result.elapsed_sec,
+                    _budget_used_frac * 100,
+                    config.experiment.time_budget_sec,
+                    _real_metric_count,
+                )
+                return StageResult(
+                    stage=Stage.EXPERIMENT_RUN,
+                    status=StageStatus.FAILED,
+                    artifacts=("runs/",),
+                    evidence_refs=("stage-12/runs/",),
+                    error=(
+                        f"Experiment completed in {result.elapsed_sec:.1f}s "
+                        f"({_budget_used_frac:.1%} of {config.experiment.time_budget_sec}s "
+                        f"budget) producing only {_real_metric_count} metric key(s); "
+                        f"this is the paper_2 fabrication pattern — refusing "
+                        f"to proceed with insufficient data."
+                    ),
+                )
     return StageResult(
         stage=Stage.EXPERIMENT_RUN,
         status=StageStatus.DONE,

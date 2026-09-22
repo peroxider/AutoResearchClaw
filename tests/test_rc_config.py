@@ -58,7 +58,7 @@ llm:
 security:
   hitl_required_stages: [5, 9, 20]
 experiment:
-  mode: simulated
+  mode: sandbox
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -90,7 +90,7 @@ def _valid_config_data() -> dict[str, dict[str, object]]:
         },
         "security": {"hitl_required_stages": [5, 9, 20]},
         "experiment": {
-            "mode": "simulated",
+            "mode": "sandbox",
             "metric_direction": "minimize",
         },
     }
@@ -193,6 +193,47 @@ def test_validate_config_rejects_invalid_experiment_mode(tmp_path: Path):
 
     assert result.ok is False
     assert "Invalid experiment.mode: kubernetes" in result.errors
+
+
+def test_validate_config_rejects_simulated_experiment_mode(tmp_path: Path):
+    data = _valid_config_data()
+    data["experiment"]["mode"] = "simulated"
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert any("simulated" in error for error in result.errors)
+
+
+def test_validate_config_rejects_string_low_quality_threshold(tmp_path: Path):
+    data = _valid_config_data()
+    data["research"]["quality_threshold"] = "2.0"
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert any("quality_threshold" in error for error in result.errors)
+
+
+def test_validate_config_rejects_non_finite_quality_threshold(tmp_path: Path):
+    data = _valid_config_data()
+    data["research"]["quality_threshold"] = ".nan"
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert any("quality_threshold" in error for error in result.errors)
+
+
+def test_rcconfig_from_dict_defaults_missing_experiment_mode_to_sandbox(
+    tmp_path: Path,
+):
+    data = _valid_config_data()
+    data["experiment"].pop("mode")
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    assert config.experiment.mode == "sandbox"
 
 
 def test_validate_config_accepts_docker_mode(tmp_path: Path):
@@ -312,10 +353,10 @@ def test_security_config_defaults_match_expected_values():
     assert defaults.redact_sensitive_logs is True
 
 
-def test_experiment_config_defaults_mode_is_simulated():
+def test_experiment_config_defaults_mode_is_sandbox():
     defaults = ExperimentConfig()
 
-    assert defaults.mode == "simulated"
+    assert defaults.mode == "sandbox"
     assert defaults.metric_direction == "minimize"
 
 

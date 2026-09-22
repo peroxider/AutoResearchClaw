@@ -219,6 +219,25 @@ experiment:
     strict_mode: false
     dpi: 300
 
+  # Methodology framework diagram (Stage 22)
+  # Hybrid mode locks labels/arrows in editable SVG and permits GRSAI to
+  # influence only a faint visual layer. API failure remains deterministic.
+  framework_diagram:
+    enabled: true
+    provider: "auto"  # auto | grsai_gpt_images | openai_compatible | gemini | matplotlib
+    grsai_base_url: "https://grsaiapi.com"
+    grsai_api_key_env: "GRSAI_API_KEY"  # export this; do not commit the key
+    grsai_model: "gpt-image-2"
+    grsai_api_style: "openai"  # openai or unified
+    grsai_quality: "auto"  # use high only with gpt-image-2-vip
+    render_mode: "hybrid"  # hybrid (recommended) or direct
+    professional_style: "strict_academic"
+    visual_influence: 0.06  # safety range: 0.0–0.15
+    size: "1536x1024"
+    aspect_ratio: "16:9"
+    timeout_sec: 180
+    dpi: 300
+
 # === Prompts ===
 # Customize LLM prompts by pointing to your own YAML file.
 # Copy prompts.default.yaml, edit the prompts you want, and set the path here.

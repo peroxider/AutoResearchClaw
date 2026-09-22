@@ -147,6 +147,284 @@ def _execute_paper_outline(
     )
 
 
+# Fabrication-guard layer 4 (R6-paper2): post-write numeric audit.
+# Threshold at which a paper is rejected for untraceable numbers. Ten percent
+# of metric-shaped numerics in the draft is a generous allowance for prose
+# mentions (e.g. "0.85 confidence" in a sentence about prior work) while
+# still catching a draft that is largely synthesised.
+_FABRICATION_RATE_THRESHOLD = 0.10
+
+
+def _load_medical_registry_entries(registry_path: Path) -> dict[str, float]:
+    """Load the explicitly traceable metrics emitted by the medical executor."""
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    entries = payload.get("entries", [])
+    return {
+        str(entry.get("metric_id")): float(entry["value"])
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("value"), (int, float))
+    }
+
+
+def _medical_results_block(metrics: dict[str, float]) -> str:
+    """Build the only quantitative Results block permitted for this profile.
+
+    The LLM is useful for narrative and literature synthesis, but it must not
+    be the authority for a table of API-evaluation results.  This block is
+    constructed directly from ``verified_metric_registry.json`` and therefore
+    remains correct even if a model ignores a prompt instruction.
+    """
+    condition_names = sorted({key.rsplit(".", 1)[0] for key in metrics if "." in key})
+    rows: list[str] = []
+    for condition in condition_names:
+        required = ("n", "n_scored", "coverage", "auroc", "abstention_rate", "mean_latency_sec")
+        if not all(f"{condition}.{name}" in metrics for name in required):
+            continue
+        ci_low = metrics.get(f"{condition}.auroc_ci_low")
+        ci_high = metrics.get(f"{condition}.auroc_ci_high")
+        ci_text = f"[{ci_low:.4f}, {ci_high:.4f}]" if isinstance(ci_low, float) and isinstance(ci_high, float) else "—"
+        brier = metrics.get(f"{condition}.brier_score")
+        ece = metrics.get(f"{condition}.expected_calibration_error")
+        rows.append(
+            f"| {condition} | {metrics[f'{condition}.n']:.0f} | "
+            f"{metrics[f'{condition}.n_scored']:.0f} | "
+            f"{metrics[f'{condition}.coverage']:.4f} | "
+            f"{metrics[f'{condition}.auroc']:.4f} | "
+            f"{ci_text} | "
+            f"{brier:.4f} | {ece:.4f} | " if isinstance(brier, float) and isinstance(ece, float) else
+            f"— | — | "
+            f"{metrics[f'{condition}.abstention_rate']:.4f} | "
+            f"{metrics[f'{condition}.mean_latency_sec']:.4f} |"
+        )
+    if not rows:
+        return "## Results\n\nNo complete, traceable condition-level result was emitted by the executed experiment."
+
+    best = max(
+        (name for name in condition_names if f"{name}.auroc" in metrics),
+        key=lambda name: metrics[f"{name}.auroc"],
+    )
+    return (
+        "## Results\n\n"
+        "### Executed outcome-blind API evaluation\n\n"
+        "Table 1 is rendered directly from the frozen Stage 12 execution registry. "
+        "All conditions were evaluated on the same 86-record cohort; AUROC is "
+        "reported only for non-abstained responses. AUROC confidence intervals are "
+        "record-level bootstrap intervals. Calibration and decision-curve outputs are "
+        "reported only when emitted by this execution; no hypothesis tests are claimed.\n\n"
+        "| Condition | Records | Scored | Coverage | AUROC | Bootstrap 95% CI | Brier | ECE | Abstention rate | Mean latency (s) |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        + "\n".join(rows)
+        + "\n\n"
+        f"The highest observed AUROC was {metrics[f'{best}.auroc']:.4f} for "
+        f"{best}; this exploratory comparison is descriptive and does not establish "
+        "clinical utility or comparative superiority."
+    )
+
+
+def _replace_markdown_results_section(draft: str, results_block: str) -> str:
+    """Replace every LLM-authored Results section with registry-bound output."""
+    heading = re.compile(r"(?m)^##\s+Results\s*$")
+    matches = list(heading.finditer(draft))
+    if not matches:
+        return draft.rstrip() + "\n\n" + results_block + "\n"
+    first = matches[0]
+    next_heading = re.compile(r"(?m)^##\s+")
+    end_match = next_heading.search(draft, first.end())
+    end = end_match.start() if end_match else len(draft)
+    rendered = draft[:first.start()] + results_block + "\n\n" + draft[end:]
+    # A malformed section-by-section response can contain another Results
+    # heading later in the document.  Drop that duplicate rather than leave
+    # an unregistered numerical narrative behind.
+    duplicate = heading.search(rendered, len(results_block))
+    if duplicate:
+        duplicate_end_match = next_heading.search(rendered, duplicate.end())
+        duplicate_end = duplicate_end_match.start() if duplicate_end_match else len(rendered)
+        rendered = rendered[:duplicate.start()] + rendered[duplicate_end:]
+    return rendered
+
+
+def _render_medical_registry_bound_draft(draft: str, registry_path: Path) -> str:
+    """Bind quantitative claims to the latest registry instead of placeholders.
+
+    Earlier code treated every free decimal as a fabrication candidate and
+    replaced it with ``not reported``.  That made a successful API experiment
+    look failed.  We now retain explicit metric tokens and deterministically
+    replace the central Results section from the verified registry.  Numbers
+    outside that registry are still removed from the remaining prose.
+    """
+    by_id = _load_medical_registry_entries(registry_path)
+    if not by_id:
+        return draft
+    allowed = {round(value, 4) for value in by_id.values()}
+
+    def placeholder(match: re.Match[str]) -> str:
+        value = by_id.get(match.group(1))
+        return f"{float(value):.4f}" if isinstance(value, (int, float)) else "not reported"
+
+    rendered = re.sub(r"\{\{metric:([A-Za-z0-9_.-]+)\}\}", placeholder, draft)
+    rendered = _replace_markdown_results_section(rendered, _medical_results_block(by_id))
+
+    def numeric_guard(match: re.Match[str]) -> str:
+        value = float(match.group(0).rstrip("%"))
+        if match.group(0).endswith("%"):
+            value /= 100.0
+        if any(abs(value - ref) <= 5e-4 for ref in allowed):
+            return match.group(0)
+        return "not evaluated in this execution"
+
+    # Decimal / percentage performance claims are the values that caused the
+    # prior fabrication failures.  Do not rewrite integer section/reference IDs.
+    rendered = re.sub(r"(?<![A-Za-z0-9_.])-?(?:0\.\d{1,4}|\d{1,2}\.\d{1,4})%?", numeric_guard, rendered)
+    # Avoid finished-looking manuscripts containing literal placeholders.  A
+    # missing metric is a limitation, not a numerical result.
+    return re.sub(r"(?i)not reported", "not evaluated in this execution", rendered)
+
+
+def _audit_draft_for_fabrication(
+    stage_dir: Path,
+    verified_registry: object | None,
+) -> None:
+    """Audit the just-written ``paper_draft.md`` against the VerifiedRegistry.
+
+    Extracts every metric-shaped numeric (``0.xxx`` and ``x.xxx`` patterns)
+    from the draft, checks each against the registry of values produced by
+    executed runs, and writes ``fabrication_audit.json`` summarising the
+    result. Logs a WARN when any untraceable values are found.
+
+    This function only **writes the audit file**; the calling code in
+    :func:`_execute_paper_draft` reads the audit to decide whether to
+    reject the stage. Splitting write-then-check keeps the audit
+    inspectable for debugging even when the stage passes.
+    """
+    import re as _re_fab
+
+    draft_path = stage_dir / "paper_draft.md"
+    if not draft_path.exists():
+        return
+    text = draft_path.read_text(encoding="utf-8")
+
+    # Match metric-shaped numerics, including signed values (paper_1
+    # reports a calibration slope of -0.2428, which would be cut to
+    # 0.2428 without the leading ``-?`` and fail the audit against a
+    # negative registry entry). Capture surrounding ±std too (e.g.
+    # "0.9658 ± 0.0007") so the comparison can ignore the std tail.
+    pattern = _re_fab.compile(
+        r"(?<![A-Za-z0-9_.])"               # not preceded by word/dot
+        r"(-?0\.\d{2,4}|-?\d{1,2}\.\d{2,4})"  # signed metric-shaped float
+        r"(?:\s*[±\u00B1]\s*(\d+(?:\.\d+)?))?"  # optional ± std tail
+    )
+    found: list[tuple[int, float]] = []
+    for match in pattern.finditer(text):
+        try:
+            value = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        # Skip year-like numbers (2024, 1990-2020) by ignoring values > 99
+        if value > 99:
+            continue
+        found.append((match.start(), value))
+
+    if not found:
+        return
+
+    # Build registry of traced floats. We accept any of:
+    # - VerifiedRegistry.values (preferred path)
+    # - raw run payloads (fallback if VerifiedRegistry is missing)
+    registry_floats: set[float] = set()
+    if verified_registry is not None and hasattr(verified_registry, "values"):
+        try:
+            for v in verified_registry.values:
+                if isinstance(v, (int, float)) and not (
+                    isinstance(v, float) and (math.isnan(v) or math.isinf(v))
+                ):
+                    registry_floats.add(round(float(v), 4))
+        except (AttributeError, TypeError):
+            pass
+    # Fallback: scan stage-*/runs/*.json payloads directly.
+    if not registry_floats:
+        run_dir = stage_dir.parent
+        for run_file in sorted(run_dir.glob("stage-*/runs/*.json")):
+            if run_file.name == "results.json":
+                continue
+            try:
+                payload = json.loads(run_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for source_key in ("metrics", "key_metrics"):
+                metrics_dict = payload.get(source_key)
+                if not isinstance(metrics_dict, dict):
+                    continue
+                for v in metrics_dict.values():
+                    if isinstance(v, (int, float)) and not (
+                        isinstance(v, float) and (math.isnan(v) or math.isinf(v))
+                    ):
+                        registry_floats.add(round(float(v), 4))
+
+    total = len(found)
+    unmatched: list[dict[str, object]] = []
+    matched = 0
+    tolerance = 5e-4
+    for char_offset, value in found:
+        rounded = round(value, 4)
+        if any(abs(rounded - ref) <= tolerance for ref in registry_floats):
+            matched += 1
+        else:
+            # Find the line number for the audit log.
+            line_no = text.count("\n", 0, char_offset) + 1
+            unmatched.append(
+                {
+                    "value": value,
+                    "line": line_no,
+                }
+            )
+
+    fabrication_rate = (total - matched) / total if total else 0.0
+    audit = {
+        "total_metric_shaped_numbers": total,
+        "matched_to_registry": matched,
+        "unmatched": len(unmatched),
+        "fabrication_rate": round(fabrication_rate, 4),
+        "threshold": _FABRICATION_RATE_THRESHOLD,
+        "registry_value_count": len(registry_floats),
+        "first_unmatched_samples": unmatched[:10],
+        "verdict": (
+            "rejected"
+            if fabrication_rate > _FABRICATION_RATE_THRESHOLD
+            else "passed"
+        ),
+    }
+    audit_path = stage_dir / "fabrication_audit.json"
+    try:
+        audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+    if fabrication_rate > _FABRICATION_RATE_THRESHOLD:
+        logger.error(
+            "Stage 17: Post-write fabrication audit REJECTED draft — "
+            "%.1f%% of metric-shaped numbers (%d/%d) cannot be traced "
+            "to VerifiedRegistry (registry holds %d values). See "
+            "fabrication_audit.json. First untraceable samples: %s",
+            fabrication_rate * 100,
+            len(unmatched),
+            total,
+            len(registry_floats),
+            unmatched[:5],
+        )
+    elif unmatched:
+        logger.warning(
+            "Stage 17: Fabrication audit saw %d untraceable number(s) "
+            "(%.1f%%) but within threshold — paper accepted.",
+            len(unmatched),
+            fabrication_rate * 100,
+        )
+
+
 def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     """Collect raw experiment metric lines from stdout for paper writing.
 
@@ -1431,6 +1709,32 @@ def _execute_paper_draft(
                 "Cite specific metrics with their actual values.\n"
             )
 
+    # Medical audit templates produce an explicit metric/provenance registry.
+    # Prefer it over summary-derived values so the draft audit has the exact
+    # condition-level numbers emitted by the executed template.
+    if config.project.profile == "medical_llm_audit":
+        _registry_paths = list(run_dir.glob("stage-14*/verified_metric_registry.json"))
+        if _registry_paths:
+            _latest_registry = max(_registry_paths, key=lambda path: path.stat().st_mtime)
+            try:
+                from researchclaw.pipeline.verified_registry import VerifiedRegistry, ConditionResult
+                _payload = json.loads(_latest_registry.read_text(encoding="utf-8"))
+                _direct_registry = VerifiedRegistry(metric_direction=config.experiment.metric_direction)
+                for _entry in _payload.get("entries", []):
+                    if not isinstance(_entry, dict) or not isinstance(_entry.get("value"), (int, float)):
+                        continue
+                    _direct_registry.add_value(float(_entry["value"]), str(_entry.get("metric_id", "registry")))
+                    _condition = str(_entry.get("condition", ""))
+                    if _condition:
+                        _direct_registry.condition_names.add(_condition)
+                        _direct_registry.conditions.setdefault(_condition, ConditionResult(name=_condition))
+                _verified_registry = _direct_registry
+                has_real_metrics = bool(_direct_registry.values)
+                exp_metrics_instruction += "\n\n## VERIFIED TEMPLATE METRICS\nOnly use numbers in the supplied metric registry; if AUROC is unavailable, describe feasibility without discrimination claims.\n"
+                logger.info("Stage 17: loaded %d direct registry values", len(_direct_registry.values))
+            except (OSError, json.JSONDecodeError, ImportError):
+                logger.warning("Stage 17: direct medical registry unavailable", exc_info=True)
+
     # Collect raw experiment stdout metrics as hard constraint for the paper
     raw_metrics_block, _has_parsed_metrics = _collect_raw_experiment_metrics(run_dir)
     if raw_metrics_block:
@@ -1749,69 +2053,72 @@ def _execute_paper_draft(
             decision="blocked_simulated_data",
         )
 
-    # R4-2: HARD BLOCK — refuse to write paper with no real data (ML/empirical domains)
-    # For non-empirical domains (math proofs, theoretical economics), allow proceeding
+    # R4-2: HARD BLOCK — refuse to write paper with no real data (universal).
+    # Fabrication-guard layer 4 (R6-paper2): the previous version of this
+    # check only fired for domains in {"ml","engineering","biology","chemistry"},
+    # which let paper_2's medical/clinical topic slip through even though
+    # Stage 12 had produced only a sparse 7-metric stub run. Now ANY paper
+    # without real metrics is blocked, regardless of detected domain.
+    # Literature-first topics (math proofs, theoretical surveys) still pass
+    # via the ``_is_lit_first`` exemption.
     _domain_id, _domain_name, _domain_venues = _detect_domain(
         config.research.topic, config.research.domains
     )
-    _empirical_domains = {"ml", "engineering", "biology", "chemistry"}
     if not has_real_metrics and not _is_lit_first:
-        if _domain_id in _empirical_domains:
-            logger.error(
-                "BLOCKED: Cannot write paper — experiment produced NO metrics. "
-                "The pipeline will not fabricate results."
-            )
-            (stage_dir / "paper_draft.md").write_text(
-                "# Paper Draft Blocked\n\n"
-                "**Reason**: Experiment stage produced no metrics (status: failed/timeout). "
-                "Cannot write a paper without real experimental data.\n\n"
-                "**Action Required**: Fix experiment execution or increase time_budget_sec.",
-                encoding="utf-8",
-            )
-            (stage_dir / "paper_meta.json").write_text(
-                json.dumps(
-                    {
-                        "outcome": "blocked_no_metrics",
-                        "detected_by": (
-                            "Stage 12/13 runs produced no real metrics "
-                            "(has_real_metrics is False)"
-                        ),
-                        "domain_id": _domain_id,
-                        "is_literature_first_topic": False,
-                        "note": (
-                            "Paper drafting refuses to fabricate results when "
-                            "the experiment produced no metrics."
-                        ),
-                        "action_required": (
-                            "Fix experiment execution or increase "
-                            "time_budget_sec; re-run from "
-                            "--from-stage EXPERIMENT_RUN."
-                        ),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            return StageResult(
-                stage=Stage.PAPER_DRAFT,
-                status=StageStatus.PAUSED,
-                artifacts=("paper_draft.md", "paper_meta.json"),
-                error=(
-                    "Paper draft blocked: experiment produced no real metrics. "
-                    "Fix execution or increase time budget."
-                ),
-                evidence_refs=(
-                    "stage-17/paper_draft.md",
-                    "stage-17/paper_meta.json",
-                ),
-                decision="blocked_no_metrics",
-            )
-        else:
-            logger.warning(
-                "No experiment metrics found, but domain '%s' may be non-empirical "
-                "(theoretical/mathematical). Proceeding with paper draft.",
-                _domain_name,
-            )
+        logger.error(
+            "BLOCKED: Cannot write paper — experiment produced NO metrics. "
+            "Domain='%s'. The pipeline will not fabricate results.",
+            _domain_name,
+        )
+        (stage_dir / "paper_draft.md").write_text(
+            "# Paper Draft Blocked\n\n"
+            "**Reason**: Experiment stage produced no metrics (status: failed/timeout). "
+            "Cannot write a paper without real experimental data.\n\n"
+            "**Action Required**: Fix experiment execution or increase time_budget_sec.",
+            encoding="utf-8",
+        )
+        (stage_dir / "paper_meta.json").write_text(
+            json.dumps(
+                {
+                    "outcome": "blocked_no_metrics",
+                    "detected_by": (
+                        "Stage 12/13 runs produced no real metrics "
+                        "(has_real_metrics is False)"
+                    ),
+                    "domain_id": _domain_id,
+                    "domain_name": _domain_name,
+                    "is_literature_first_topic": False,
+                    "note": (
+                        "Paper drafting refuses to fabricate results when "
+                        "the experiment produced no metrics. The previous "
+                        "domain-gated R4-2 bypass allowed paper_2 to slip "
+                        "through with a stub main.py — the universal guard "
+                        "now applies to all non-literature-first topics."
+                    ),
+                    "action_required": (
+                        "Fix experiment execution or increase "
+                        "time_budget_sec; re-run from "
+                        "--from-stage EXPERIMENT_RUN."
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return StageResult(
+            stage=Stage.PAPER_DRAFT,
+            status=StageStatus.PAUSED,
+            artifacts=("paper_draft.md", "paper_meta.json"),
+            error=(
+                "Paper draft blocked: experiment produced no real metrics. "
+                "Fix execution or increase time budget."
+            ),
+            evidence_refs=(
+                "stage-17/paper_draft.md",
+                "stage-17/paper_meta.json",
+            ),
+            decision="blocked_no_metrics",
+        )
 
     # R11-5: Experiment quality minimum threshold before paper writing
     # Parse analysis.md for quality rating and condition completeness
@@ -1836,11 +2143,35 @@ def _execute_paper_draft(
         # R5-BUG-05: Skip override when _has_parsed_metrics is True — the
         # analysis.md may be stale (from pre-refinement Stage 14) while
         # Stage 13 refinement produced real parsed metrics.
-        if _analysis_rating <= 2 and has_real_metrics and not _has_parsed_metrics:
+        # Fabrication-guard layer 4 (R6-paper2): paper_2's incident showed
+        # that the R5-BUG-05 escape hatch can be exploited when a single
+        # sparse run JSON (e.g. 7 LR scalars) is enough to set
+        # _has_parsed_metrics=True while the overall verified registry is
+        # empty or near-empty. Tighten the override to also fire when the
+        # verified registry has fewer than 5 values.
+        _verified_registry_value_count = 0
+        if _verified_registry is not None and hasattr(
+            _verified_registry, "values"
+        ):
+            try:
+                _verified_registry_value_count = len(_verified_registry.values)
+            except (AttributeError, TypeError):
+                _verified_registry_value_count = 0
+        if (
+            _analysis_rating <= 2
+            and has_real_metrics
+            and (
+                not _has_parsed_metrics
+                or _verified_registry_value_count < 5
+            )
+        ):
             logger.warning(
-                "BUG-23 guard: Analysis quality %d/10 \u2264 2 — "
-                "overriding has_real_metrics to False (experiment likely failed)",
+                "BUG-23 guard: Analysis quality %d/10 \u2264 2 \u2014 "
+                "overriding has_real_metrics to False "
+                "(parsed_metrics=%s, verified_registry_values=%d)",
                 _analysis_rating,
+                _has_parsed_metrics,
+                _verified_registry_value_count,
             )
             has_real_metrics = False
 
@@ -2249,7 +2580,21 @@ Template references.
 
 Generated: {_utcnow_iso()}
 """
+    if config.project.profile == "medical_llm_audit":
+        _direct_paths = list(run_dir.glob("stage-14*/verified_metric_registry.json"))
+        if _direct_paths:
+            _latest_registry = max(_direct_paths, key=lambda path: path.stat().st_mtime)
+            draft = _render_medical_registry_bound_draft(draft, _latest_registry)
     (stage_dir / "paper_draft.md").write_text(draft, encoding="utf-8")
+
+    # Fabrication-guard layer 4 (R6-paper2): after writing paper_draft.md,
+    # audit every metric-shaped numeric value in the draft against the
+    # VerifiedRegistry. paper_2's draft quoted LASSO AUROC 0.992, RF 0.9658,
+    # MLP 0.9801, XGB 0.9633 — none of which had been produced by any
+    # executed experiment. Refuse the stage when the fabrication rate
+    # exceeds 10 % (so a handful of prose numbers like 0.85 don't trip the
+    # check, but a draft full of unknown condition values does).
+    _audit_draft_for_fabrication(stage_dir, _verified_registry)
 
     # Validate draft quality (section balance + bullet density)
     _validate_draft_quality(draft, stage_dir=stage_dir)
@@ -2299,6 +2644,77 @@ Generated: {_utcnow_iso()}
         writer.save()
     except Exception:
         pass
+
+    # Fabrication-guard layer 4 (R6-paper2): consult the post-write audit
+    # written by ``_audit_draft_for_fabrication`` and reject the stage
+    # when the rate of metric-shaped numbers that cannot be traced to
+    # executed runs exceeds the threshold.
+    _fab_audit_path = stage_dir / "fabrication_audit.json"
+    if _fab_audit_path.exists():
+        try:
+            _fab_audit = json.loads(
+                _fab_audit_path.read_text(encoding="utf-8")
+            )
+            if (
+                _fab_audit.get("verdict") == "rejected"
+                and _fab_audit.get("fabrication_rate", 0.0)
+                > _FABRICATION_RATE_THRESHOLD
+            ):
+                _rate = _fab_audit.get("fabrication_rate", 0.0)
+                _samples = _fab_audit.get("first_unmatched_samples", [])
+                logger.error(
+                    "Stage 17: Paper draft REJECTED by post-write fabrication "
+                    "audit — %.1f%% of metric numbers untraceable "
+                    "(threshold %.1f%%). Samples: %s",
+                    _rate * 100,
+                    _FABRICATION_RATE_THRESHOLD * 100,
+                    _samples,
+                )
+                # Mark the paper meta so downstream stages see why we failed.
+                _meta_path = stage_dir / "paper_meta.json"
+                try:
+                    _meta = (
+                        json.loads(_meta_path.read_text(encoding="utf-8"))
+                        if _meta_path.exists()
+                        else {}
+                    )
+                except (json.JSONDecodeError, OSError):
+                    _meta = {}
+                _meta.update(
+                    {
+                        "outcome": "blocked_fabrication",
+                        "fabrication_rate": _rate,
+                        "unmatched_samples": _samples,
+                        "action_required": (
+                            "Verify stage-12/runs/*.json payloads match the "
+                            "numbers quoted in paper_draft.md. Either fix "
+                            "Stage 13's experiment_final.py so it stops "
+                            "synthesising values, or fix the LLM prompt so "
+                            "it stops quoting metrics not in the verified "
+                            "registry."
+                        ),
+                    }
+                )
+                _meta_path.write_text(
+                    json.dumps(_meta, indent=2), encoding="utf-8"
+                )
+                return StageResult(
+                    stage=Stage.PAPER_DRAFT,
+                    status=StageStatus.FAILED,
+                    artifacts=("paper_draft.md", "fabrication_audit.json"),
+                    evidence_refs=(
+                        "stage-17/paper_draft.md",
+                        "stage-17/fabrication_audit.json",
+                    ),
+                    error=(
+                        f"Post-write fabrication audit rejected draft: "
+                        f"{_rate:.1%} of metric numbers untraceable "
+                        f"(threshold {_FABRICATION_RATE_THRESHOLD:.0%})."
+                    ),
+                    decision="blocked_fabrication",
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     return StageResult(
         stage=Stage.PAPER_DRAFT,

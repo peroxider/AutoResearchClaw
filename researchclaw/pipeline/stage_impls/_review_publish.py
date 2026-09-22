@@ -24,7 +24,6 @@ from researchclaw.pipeline._helpers import (
     _default_quality_report,
     _extract_paper_title,
     _find_prior_file,
-    _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
     _get_evolution_overlay,
     _read_best_analysis,
@@ -38,6 +37,114 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+def _medical_registry_for_export(run_dir: Path, metric_direction: str):
+    """Build a verifier registry from the authoritative medical metric file."""
+    from researchclaw.pipeline.verified_registry import VerifiedRegistry
+    candidates = list(run_dir.glob("stage-14*/verified_metric_registry.json"))
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda path: path.stat().st_mtime)
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    registry = VerifiedRegistry(metric_direction=metric_direction)
+    for entry in payload.get("entries", []):
+        if not isinstance(entry, dict) or not isinstance(entry.get("value"), (int, float)):
+            continue
+        metric_id = str(entry.get("metric_id", "medical_registry"))
+        registry.add_value(float(entry["value"]), metric_id)
+        # The generic condition-name detector treats every row label in a
+        # non-result protocol table as an experimental condition.  Medical
+        # profile condition membership is enforced by the frozen Stage 14
+        # registry / Stage 17 renderer, so retain value provenance here but
+        # leave the generic heuristic disabled for export verification.
+    return registry if registry.values else None
+
+
+def _load_current_medical_execution(run_dir: Path) -> tuple[dict[str, Any], Path | None]:
+    """Load only the frozen Stage 12 result for the medical audit profile.
+
+    A resumed run shares its directory with historical repair attempts.  The
+    generic quality gate used to select the "richest" Stage 14 summary, which
+    allowed a stale failed summary to contradict a successful Stage 12 run.
+    This profile has a single authoritative execution artifact, so do not
+    search versions or promotions here.
+    """
+    result_path = run_dir / "stage-12" / "runs" / "results.json"
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, None
+    conditions = payload.get("conditions")
+    if not isinstance(conditions, dict):
+        metrics = payload.get("metrics", {})
+        conditions = metrics.get("conditions", {}) if isinstance(metrics, dict) else {}
+    if not isinstance(conditions, dict):
+        return {}, result_path
+    return {
+        "total_conditions": len(conditions),
+        "total_metric_keys": sum(
+            len(values) for values in conditions.values() if isinstance(values, dict)
+        ),
+        "condition_summaries": conditions,
+        "metrics_summary": {"source": "stage-12/runs/results.json"},
+        "best_run": {"status": "done", "metrics": payload.get("metrics", {})},
+    }, result_path
+
+
+def _medical_quality_report(
+    paper: str,
+    execution: dict[str, Any],
+    execution_path: Path,
+) -> dict[str, Any]:
+    """Deterministic consistency gate for registry-bound clinical manuscripts."""
+    conditions = execution.get("condition_summaries", {})
+    expected = set(conditions) if isinstance(conditions, dict) else set()
+    present = {name for name in expected if name in paper}
+    placeholders = len(re.findall(r"(?i)\bnot reported\b", paper))
+    results_heading_count = len(re.findall(r"(?m)^##\s+Results\s*$", paper))
+    score = 8.0
+    weaknesses: list[str] = []
+    if not expected:
+        score = 1.0
+        weaknesses.append("Stage 12 has no usable condition-level execution results.")
+    if expected and present != expected:
+        score = min(score, 4.0)
+        weaknesses.append(
+            "The paper does not name every executed condition: "
+            + ", ".join(sorted(expected - present))
+        )
+    if placeholders:
+        score = min(score, 3.0)
+        weaknesses.append(f"The paper retains {placeholders} literal 'not reported' placeholders.")
+    if results_heading_count != 1:
+        score = min(score, 4.0)
+        weaknesses.append("The paper must contain exactly one Results section.")
+    weaknesses.extend([
+        "Confidence intervals, calibration, and decision-curve analyses require additional executed outputs.",
+        "The current executor must implement an independent critic call before claims about critic effects are made.",
+    ])
+    return {
+        "score_1_to_10": score,
+        "verdict": "proceed" if score >= 7 else "revise",
+        "strengths": [
+            "Quality gate read the current Stage 19 paper and frozen Stage 12 execution only.",
+            f"{len(expected)} executed conditions were discovered in {execution_path.as_posix()}.",
+        ],
+        "weaknesses": weaknesses,
+        "required_actions": [
+            "Run the registered uncertainty, calibration, and decision analyses before making those claims.",
+            "Implement and log an independent critic API call for the full-agent condition.",
+        ],
+        "data_sources": {
+            "paper": "stage-19/paper_revised.md",
+            "execution": str(execution_path.relative_to(execution_path.parents[2])).replace("\\", "/"),
+        },
+        "generated": _utcnow_iso(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +523,24 @@ def _execute_paper_revision(
                 revised = draft
     else:
         revised = draft
+    # The revision model can rewrite or reintroduce numerical prose.  For the
+    # contract-first medical profile, restore the deterministic result block
+    # after revision so Stage 20 evaluates the same registered values Stage 17
+    # audited.
+    if config.project.profile == "medical_llm_audit":
+        registry_paths = sorted(
+            run_dir.glob("stage-14*/verified_metric_registry.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if registry_paths:
+            try:
+                from researchclaw.pipeline.stage_impls._paper_writing import (
+                    _render_medical_registry_bound_draft,
+                )
+                revised = _render_medical_registry_bound_draft(revised, registry_paths[0])
+            except Exception:
+                logger.warning("Stage 19: registry-bound medical rendering failed", exc_info=True)
     (stage_dir / "paper_revised.md").write_text(revised, encoding="utf-8")
     return StageResult(
         stage=Stage.PAPER_REVISION,
@@ -438,7 +563,15 @@ def _execute_quality_gate(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
+    # Do not use the generic reverse-glob helper for resumed medical runs.
+    # It can select a paper from an earlier Stage 19 version.
+    _medical_profile = config.project.profile == "medical_llm_audit"
+    _current_paper_path = run_dir / "stage-19" / "paper_revised.md"
+    revised = (
+        _current_paper_path.read_text(encoding="utf-8")
+        if _medical_profile and _current_paper_path.is_file()
+        else (_read_prior_artifact(run_dir, "paper_revised.md") or "")
+    )
     report: dict[str, Any] | None = None
     # The author model should not be the one deciding whether its own paper
     # passes the gate: judge with the independent model when configured.
@@ -453,7 +586,12 @@ def _execute_quality_gate(
     _exp_summary: dict[str, Any] = {}
     _exp_summary_text = ""
     _best_richness = -1
-    for _es_path in sorted(run_dir.glob("stage-14*/experiment_summary.json")):
+    _medical_execution_path: Path | None = None
+    if _medical_profile:
+        _exp_summary, _medical_execution_path = _load_current_medical_execution(run_dir)
+        _best_richness = len(_exp_summary.get("condition_summaries", {}))
+        _exp_summary_text = json.dumps(_exp_summary, ensure_ascii=False)
+    for _es_path in ([] if _medical_profile else sorted(run_dir.glob("stage-14*/experiment_summary.json"))):
         try:
             _es_text = _es_path.read_text(encoding="utf-8")
             _es_data = _safe_json_loads(_es_text, {})
@@ -480,7 +618,7 @@ def _execute_quality_gate(
         except OSError:
             pass
     # Fallback to _read_prior_artifact if nothing found above
-    if not _exp_summary:
+    if not _exp_summary and not _medical_profile:
         _exp_summary_text = _read_prior_artifact(run_dir, "experiment_summary.json") or ""
         _exp_summary = _safe_json_loads(_exp_summary_text, {}) if _exp_summary_text else {}
 
@@ -499,7 +637,34 @@ def _execute_quality_gate(
         if _best_richness > 0:
             _exp_failed = False
 
-    if _judge_llm is not None:
+    if _medical_profile and _medical_execution_path is not None:
+        report = _medical_quality_report(revised, _exp_summary, _medical_execution_path)
+        # Structural quality is deterministic and must not be delegated to an
+        # LLM reviewer. This blocks the recurrent "short paper + one Results
+        # table" failure mode before export.
+        try:
+            from researchclaw.pipeline.medical_paper_quality import (
+                audit_medical_ai_manuscript,
+            )
+            _medical_manuscript_report = audit_medical_ai_manuscript(revised)
+            (stage_dir / "medical_manuscript_quality.json").write_text(
+                json.dumps(_medical_manuscript_report.to_dict(), indent=2),
+                encoding="utf-8",
+            )
+            if not _medical_manuscript_report.passed:
+                _messages = [
+                    f"[{issue.code}] {issue.message}"
+                    for issue in _medical_manuscript_report.issues
+                    if issue.severity == "error"
+                ]
+                report.setdefault("weaknesses", []).extend(_messages)
+                report["score_1_to_10"] = min(
+                    float(report.get("score_1_to_10", 4.0)), 4.0,
+                )
+                report["verdict"] = "revise"
+        except Exception:
+            logger.warning("Stage 20: medical manuscript structural audit failed", exc_info=True)
+    elif _judge_llm is not None:
         _pm = prompts or PromptManager()
         # IMP-33: Evaluate the full paper instead of truncating to 12K chars.
         # Split into chunks if very long, but prefer sending the full text.
@@ -2179,10 +2344,16 @@ def _execute_export_publish(
             from researchclaw.pipeline.verified_registry import (
                 VerifiedRegistry as _VR22,
             )
-            _vr22 = _VR22.from_run_dir(
-                run_dir,
-                metric_direction=config.experiment.metric_direction,
-                best_only=True,
+            _vr22 = (
+                _medical_registry_for_export(
+                    run_dir, config.experiment.metric_direction,
+                )
+                if config.project.profile == "medical_llm_audit"
+                else _VR22.from_run_dir(
+                    run_dir,
+                    metric_direction=config.experiment.metric_direction,
+                    best_only=True,
+                )
             )
             if _vr22.values:
                 _vresult = _verify_paper(tex_content, _vr22)
@@ -2593,20 +2764,35 @@ def _execute_export_publish(
                 "Stage 22: Packaged single-file code release with %d deps",
                 len(requirements),
             )
-    # WS-5.5: Generate framework diagram prompt for methodology section
+    # WS-5.5: Generate the framework diagram artifact (PNG + prompt md).
+    # Replaces the previous prompt-only behavior with a real PNG via either an
+    # external image-gen provider (GRSAI GPT-Images / OpenAI-compatible /
+    # Gemini) or a matplotlib fallback. Provider selection is controlled by
+    # experiment.framework_diagram in YAML; no API key is persisted here.
     try:
-        _framework_prompt = _generate_framework_diagram_prompt(
-            final_paper, config, llm=llm
+        from researchclaw.agents.figure_agent.framework_diagram import (
+            generate_framework_diagram_artifacts,
         )
-        if _framework_prompt:
-            _chart_dir = stage_dir / "charts"
-            _chart_dir.mkdir(parents=True, exist_ok=True)
-            (_chart_dir / "framework_diagram_prompt.md").write_text(
-                _framework_prompt, encoding="utf-8"
+
+        _chart_dir = stage_dir / "charts"
+        _chart_dir.mkdir(parents=True, exist_ok=True)
+        _framework_artifacts, _framework_png = generate_framework_diagram_artifacts(
+            paper_text=final_paper,
+            config=config,
+            output_dir=_chart_dir,
+            llm=llm,
+        )
+        for _art in _framework_artifacts:
+            if _art not in artifacts:
+                artifacts.append(_art)
+        if _framework_png is not None:
+            logger.info(
+                "Stage 22: Generated framework diagram → charts/%s (%d bytes)",
+                _framework_png.name,
+                _framework_png.stat().st_size,
             )
-            logger.info("Stage 22: Generated framework diagram prompt → charts/framework_diagram_prompt.md")
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Stage 22: Framework diagram prompt generation skipped: %s", exc)
+        logger.debug("Stage 22: Framework diagram generation skipped: %s", exc)
 
     return StageResult(
         stage=Stage.EXPORT_PUBLISH,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -203,8 +204,148 @@ Save all figures to output/figures/ in PDF and PNG format.
 """
 
 
+# Numeric / ML libraries whose presence in main.py indicates a real driver
+# rather than a config-only stub. Used by ``_validate_generated_main_py`` to
+# fail Stage 10 fast when the LLM emits a non-executable skeleton (paper_2
+# shipped only a Config class, which let Stage 12 finish in 0.3 s with no
+# metrics, leading Stage 13 to synthesize a fake ``experiment_summary.json``
+# that Stage 17 quoted as ground truth).
+_REAL_DRIVER_IMPORTS = frozenset(
+    {"numpy", "np", "sklearn", "scipy", "pandas", "pd", "torch", "statsmodels"}
+)
+_MIN_RUN_BODY_STMTS = 30
+
+
+def _count_module_stmts(tree: ast.Module) -> int:
+    """Count top-level statements across the whole module.
+
+    Real experiment drivers spread the work across helper functions; counting
+    only ``def run():`` body would penalise well-factored drivers.
+    """
+    total = 0
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            total += len(node.body)
+            for stmt in node.body:
+                if isinstance(stmt, ast.If):
+                    total += sum(
+                        len(s.body) for s in stmt.body if hasattr(s, "body")
+                    )
+        elif isinstance(node, ast.If):
+            total += sum(
+                len(s.body) for s in node.body if hasattr(s, "body")
+            )
+        else:
+            total += 1
+    return total
+
+
+def _validate_generated_main_py(src: str) -> tuple[bool, str]:
+    """AST-validate a generated ``main.py`` before Stage 10 returns DONE.
+
+    Returns ``(ok, detail)``. On failure, ``detail`` names the offending issue
+    so the failure log makes the cause obvious.
+    """
+    if not src or not src.strip():
+        return False, "main.py is empty"
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        return False, f"syntax error: {exc.msg}"
+
+    run_fn: ast.FunctionDef | None = None
+    # Accept either the conventional ``def run():`` (the harness default)
+    # or ``def main():`` (paper_1 uses this with ``sys.exit(main())``).
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in ("run", "main"):
+            run_fn = node
+            break
+    if run_fn is None:
+        return (
+            False,
+            "no `def run():` or `def main():` defined — this will not "
+            "execute as an experiment",
+        )
+
+    # Body length: count top-level statements plus those nested one level
+    # inside an ``if __name__ == "__main__":`` wrapper, summed across ALL
+    # top-level functions in the module so well-factored drivers pass.
+    run_body_stmts = len(run_fn.body)
+    for stmt in run_fn.body:
+        if isinstance(stmt, ast.If):
+            run_body_stmts += sum(
+                len(s.body) for s in stmt.body if hasattr(s, "body")
+            )
+    module_stmts = _count_module_stmts(tree)
+    if module_stmts < _MIN_RUN_BODY_STMTS:
+        return (
+            False,
+            f"module has only {module_stmts} statements across all functions "
+            f"(minimum {_MIN_RUN_BODY_STMTS}); refusing to ship a trivial "
+            f"driver that cannot produce real experiment output",
+        )
+
+    # Numerical-library import check.
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    if not (_REAL_DRIVER_IMPORTS & imported):
+        return (
+            False,
+            f"no numerical-analysis library imported "
+            f"(expected one of {sorted(_REAL_DRIVER_IMPORTS)}); "
+            f"found {sorted(imported) or '<none>'}",
+        )
+
+    # Metric-emission check: the sandbox extracts results from stdout lines
+    # in multiple shapes — ``print("METRIC: key=value")`` (the original
+    # spec), ``print("name: value")`` (the ExperimentHarness default), or
+    # any ``harness.report_metric(...)`` / ``.report_metric(...)`` call
+    # (the sidecar harness abstraction paper_2's driver uses). We accept
+    # any of these so well-factored drivers using the harness pattern
+    # pass without false positives, but a config-only stub that prints
+    # nothing metric-shaped still fails.
+    metric_prints = len(re.findall(
+        r"^\s*print\([^)]*METRIC:", src, re.MULTILINE
+    ))
+    # Any ``print(`` whose first argument is a string literal containing
+    # a colon — this covers ``print("name: value")`` (harness default),
+    # ``print(f"summary: ...")`` (paper_2's wrap-up print), and
+    # ``print("name:", value)`` (Python 3 sep-style). The presence of a
+    # colon inside a print argument is a strong signal that the driver
+    # is producing parseable metric lines.
+    colon_prints = len(re.findall(
+        r"^\s*print\([^)]*:", src, re.MULTILINE
+    ))
+    harness_calls = len(re.findall(
+        r"\breport_metric\s*\(", src
+    ))
+    if metric_prints + colon_prints + harness_calls == 0:
+        return (
+            False,
+            "no metric emission found (no `print('METRIC: ...')`, no "
+            "`print('name: value')`, and no `report_metric(...)` call) — "
+            "sandbox will receive zero metrics; this run cannot produce "
+            "real results",
+        )
+
+    return True, (
+        f"entry=def {run_fn.name}(), "
+        f"entry_body={run_body_stmts} stmts, "
+        f"module={module_stmts} stmts, "
+        f"imports={sorted(_REAL_DRIVER_IMPORTS & imported)}, "
+        f"metric_prints={metric_prints}, "
+        f"colon_prints={colon_prints}, "
+        f"harness_calls={harness_calls}"
+    )
+
+
 def _check_rl_compatibility(code: str) -> list[str]:
-    """Detect DQN + continuous-action environment mismatches.
+    """Check the generated code for incompatible algorithm/environment pairs.
 
     Returns a list of error strings if incompatible combinations are found.
     """
@@ -241,8 +382,53 @@ def _execute_code_generation(
     # ── End ColliderAgent bypass ──────────────────────────────────────────────
 
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
+    # Medical LLM/agent runs are contract-first.  Stage 10 must never infer a
+    # larger dataset or an unrelated training setup from a free-text plan.
+    _frozen_data_contract = ""
+    if config.project.profile == "medical_llm_audit":
+        _contract_path = run_dir / "stage-09" / "data_contract.json"
+        if not _contract_path.exists():
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="medical_llm_audit requires stage-09/data_contract.json",
+                decision="blocked_missing_data_contract",
+            )
+        try:
+            _frozen_data_contract = _contract_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"could not read frozen data contract: {exc}",
+                decision="blocked_unreadable_data_contract",
+            )
+        try:
+            from researchclaw.experiment.medical_llm_audit_templates import write_template
+            _contract_obj = json.loads(_frozen_data_contract)
+            template_artifacts = write_template(stage_dir, _contract_obj)
+            (stage_dir / "experiment_spec.md").write_text(
+                "# Contract-driven medical LLM audit\n\n"
+                "Stage 10 used a deterministic ARC template rather than free-form code generation.\n",
+                encoding="utf-8",
+            )
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.DONE,
+                artifacts=tuple(template_artifacts) + ("experiment_spec.md",),
+                evidence_refs=("stage-09/data_contract.json", "stage-10/experiment/"),
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=(), error=f"medical audit template contract error: {exc}",
+                decision="blocked_invalid_template_contract",
+            )
     metric = config.experiment.metric_key
-    max_repair = 5  # BUG-14: Increased from 3 to give more chances for critical bugs
+    max_repair = 2  # Bounded to avoid hang loops on thinking-model providers
     files: dict[str, str] = {}
     validation_log: list[str] = []
 
@@ -313,6 +499,16 @@ def _execute_code_generation(
 
     # --- Dataset guidance + setup script + HP reporting (docker/sandbox modes) ---
     extra_guidance = ""
+    if _frozen_data_contract:
+        extra_guidance += (
+            "\n\n## BINDING FROZEN DATA CONTRACT (Stage 9)\n"
+            "Implement this contract literally. It overrides general prompt examples. "
+            "Any source, split, method, package, record count, or outcome not present here is unavailable.\n"
+            f"```json\n{_frozen_data_contract}\n```\n"
+            "Generate a compact API-evaluation script that reads only declared local paths, removes "
+            "prohibited fields before requests, invokes only the declared provider/model through its "
+            "environment key, and calculates metrics solely from returned real-record scores.\n"
+        )
     _net_policy = getattr(getattr(config, "docker", None), "network_policy", "setup_only")
     if config.experiment.mode in ("sandbox", "docker"):
         _net_policy = (
@@ -395,6 +591,9 @@ def _execute_code_generation(
         "instruction tun", "rlhf", "dpo", "sft", "alignment",
         "transformer train", "causal lm", "chat model", "qwen", "llama",
         "mistral", "phi-", "gemma", "pretraining", "tokeniz",
+        "llm agent", "agentic", "retrieval augmented", "rag", "tool use",
+        "tool-using", "function calling", "multi-agent", "agent memory",
+        "agent planning", "agent reflection", "react agent", "plan-and-execute",
     )
     topic_lower = config.research.topic.lower()
     is_llm_topic = any(kw in topic_lower for kw in _llm_keywords)
@@ -429,7 +628,31 @@ def _execute_code_generation(
     except Exception:  # noqa: BLE001
         logger.debug("F-01: Framework doc injection skipped", exc_info=True)
 
-    if is_llm_topic and config.experiment.mode == "docker":
+    # Load the exact profile even for ML domains. Most ML profiles return empty
+    # blocks, while ml_llm_agent contributes mandatory Stage-10 guidance.
+    _is_llm_agent_domain = False
+    try:
+        from researchclaw.domains.detector import detect_domain as _dd_s10
+        from researchclaw.domains.prompt_adapter import get_adapter as _ga
+
+        _dp = _dd_s10(topic=config.research.topic)
+        _is_llm_agent_domain = _dp.domain_id == "ml_llm_agent"
+        _blocks = _ga(_dp).get_code_generation_blocks({})
+        if _blocks.compute_budget:
+            compute_budget = _blocks.compute_budget
+        if _blocks.dataset_guidance:
+            extra_guidance = _blocks.dataset_guidance + "\n" + extra_guidance
+        if _blocks.code_generation_hints:
+            extra_guidance += "\n" + _blocks.code_generation_hints
+        if _blocks.output_format_guidance:
+            extra_guidance += "\n" + _blocks.output_format_guidance
+        if any((_blocks.compute_budget, _blocks.dataset_guidance,
+                _blocks.code_generation_hints, _blocks.output_format_guidance)):
+            logger.info("Injected domain-specific guidance for %s", _dp.domain_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("Domain guidance injection skipped", exc_info=True)
+
+    if (is_llm_topic or _is_llm_agent_domain) and config.experiment.mode == "docker":
         try:
             extra_guidance += _pm.block("llm_training_guidance")
         except Exception:  # noqa: BLE001
@@ -453,29 +676,21 @@ def _execute_code_generation(
                 f"- If possible, use a smaller model (<=7B parameters)\n"
             )
 
-    # --- Domain-specific guidance injection for non-ML domains ---
-    try:
-        from researchclaw.domains.detector import detect_domain as _dd_s10, is_ml_domain as _is_ml_s10
-        _dp = _dd_s10(topic=config.research.topic)
-        if not _is_ml_s10(_dp):
-            from researchclaw.domains.prompt_adapter import get_adapter as _ga
-            _adapter = _ga(_dp)
-            _blocks = _adapter.get_code_generation_blocks({})
-            if _blocks.compute_budget:
-                compute_budget = _blocks.compute_budget
-            if _blocks.dataset_guidance:
-                extra_guidance = _blocks.dataset_guidance + "\n" + extra_guidance
-            if _blocks.code_generation_hints:
-                extra_guidance += "\n" + _blocks.code_generation_hints
-            if _blocks.output_format_guidance:
-                extra_guidance += "\n" + _blocks.output_format_guidance
-            logger.info("Injected domain-specific guidance for %s", _dp.domain_id)
-    except Exception:  # noqa: BLE001
-        logger.debug("Domain guidance injection skipped", exc_info=True)
-
     # BUG-R6-01: Add explicit implementation constraints to prevent LLM
     # from substituting unrelated DL models for lightweight algorithms.
-    extra_guidance += (
+    if _is_llm_agent_domain:
+        extra_guidance += (
+            "\n\nIMPLEMENTATION CONSTRAINTS (LLM/AGENT PROFILE — MUST FOLLOW):\n"
+            "- Implement the stated LLM/Agent method; do NOT substitute sklearn, "
+            "MLP, XGBoost, or a synthetic proxy.\n"
+            "- The proposed method must include an explicit bounded agent loop, "
+            "typed tools/retrieval where claimed, trajectory logging, and failure handling.\n"
+            "- Classical methods may appear only as explicitly labelled control baselines.\n"
+            "- Use deterministic replay or mocks for tests; use real model/API outputs "
+            "for reported experiment evidence.\n"
+        )
+    else:
+        extra_guidance += (
         "\n\nIMPLEMENTATION CONSTRAINTS (MUST FOLLOW):\n"
         "- Implement EXACTLY the algorithm/method described in the topic.\n"
         "- Do NOT replace the stated method with a deep-learning proxy "
@@ -484,7 +699,7 @@ def _execute_code_generation(
         "- Prefer lightweight CPU-friendly libraries (numpy, scipy, "
         "sklearn, pandas) unless deep learning is inherent to the topic.\n"
         "- The experiment MUST be self-contained and runnable without GPU.\n"
-    )
+        )
 
     # --- Code generation: Beast Mode → CodeAgent → Legacy single-shot ---
     _code_agent_active = False
@@ -636,7 +851,7 @@ def _execute_code_generation(
             config.llm.primary_model.startswith(p)
             for p in ("gpt-5", "o3", "o4")
         ):
-            _code_max_tokens = 16384
+            _code_max_tokens = 8192
 
         # ── Domain detection + Code Search for non-ML domains ──────────
         _domain_profile = None
@@ -737,7 +952,7 @@ def _execute_code_generation(
         # for internal chain-of-thought). Retry once with even higher limit on empty.
         _code_max_tokens = sp.max_tokens or 8192
         if any(config.llm.primary_model.startswith(p) for p in ("gpt-5", "o3", "o4")):
-            _code_max_tokens = max(_code_max_tokens, 16384)
+            _code_max_tokens = max(_code_max_tokens, 8192)
 
         resp = _chat_with_prompt(
             llm,
@@ -1521,6 +1736,33 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
             evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
             error=f"Topic-experiment misalignment: {alignment_note}",
         )
+
+    # In-process backstop for the pre_experiment_hooks stub detector.
+    # If the LLM-generated main.py is a stub (no def run():, no numerical
+    # imports, no METRIC: prints) Stage 10 must NOT declare DONE — Stage 12
+    # would otherwise execute a 0.3 s empty run and Stage 13 would synthesize
+    # a fabricated experiment_summary.json that Stage 17 quotes as ground
+    # truth (paper_2 incident).
+    main_src = files.get("main.py", "")
+    _stub_ok, _stub_detail = _validate_generated_main_py(main_src)
+    if not _stub_ok:
+        logger.error(
+            "Stage 10: Generated main.py failed structural validation "
+            "(stub detector). Detail: %s. Failing stage to prevent "
+            "downstream fabrication.",
+            _stub_detail,
+        )
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.FAILED,
+            artifacts=tuple(artifacts),
+            evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
+            error=f"Generated main.py is a stub: {_stub_detail}",
+        )
+    logger.info(
+        "Stage 10: Generated main.py passed structural validation — %s",
+        _stub_detail,
+    )
 
     return StageResult(
         stage=Stage.CODE_GENERATION,

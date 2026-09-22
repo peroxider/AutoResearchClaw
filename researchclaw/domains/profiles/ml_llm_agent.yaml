@@ -1,0 +1,123 @@
+domain_id: ml_llm_agent
+display_name: Large Language Models and Agentic Systems
+parent_domain: ml
+
+# Deployment defaults are applied only when this profile is explicitly chosen.
+preferred_experiment_mode: docker
+preferred_project_mode: full-auto
+preferred_target_conference: neurips_2025
+default_time_budget_sec: 7200
+default_metric_key: task_success_rate
+default_metric_direction: maximize
+
+experiment_paradigm: comparison
+condition_terminology:
+  baseline: LLM/agent baseline
+  proposed: proposed agentic method
+  variant: component ablation
+  input: task instance
+  metric: task quality, tool success, cost, latency, robustness
+
+typical_file_structure:
+  config.py: "Model, API, retrieval, tool, and evaluation configuration"
+  agent.py: "Agent state machine, planner, memory, and recovery policy"
+  tools.py: "Typed tool interfaces and deterministic test tools"
+  retrieval.py: "Retriever, index, and grounding implementation"
+  evaluate.py: "Task-quality, tool-use, cost, latency, and robustness evaluation"
+  main.py: "Entry point that runs conditions and writes structured results"
+
+entry_point: main.py
+
+core_libraries:
+  - torch
+  - transformers
+  - datasets
+  - accelerate
+  - peft
+  - vllm
+  - pydantic
+
+docker_image: researchclaw/sandbox-ml:latest
+gpu_required: true
+pip_packages:
+  - transformers
+  - datasets
+  - accelerate
+  - peft
+  - bitsandbytes
+  - vllm
+
+metric_types:
+  - scalar
+  - table
+  - learning_curve
+  - structured
+
+standard_baselines:
+  - direct prompting
+  - chain-of-thought prompting
+  - ReAct
+  - retrieval-augmented generation
+  - plan-and-execute agent
+  - reflection agent
+
+evaluation_protocol: >-
+  Evaluate identical task instances across at least 5 seeds or deterministic
+  replayed trajectories. Report task success/quality, groundedness or citation
+  correctness where applicable, tool success rate, token cost, latency, and
+  robustness under tool/retrieval failures.
+statistical_tests:
+  - paired_t_test
+  - bootstrap_confidence_interval
+
+github_search_terms:
+  - llm agent tool use rag evaluation
+  - retrieval augmented generation agent benchmark
+  - multi agent planning reflection memory
+
+paper_keywords:
+  - large language model
+  - llm agent
+  - agentic system
+  - retrieval augmented generation
+  - rag
+  - tool use
+  - function calling
+  - multi-agent
+  - agent memory
+  - agent planning
+  - reflection
+
+compute_budget_guidance: >-
+  Prefer API-backed evaluation or parameter-efficient fine-tuning of models no
+  larger than 7B. Cache retrieval and model outputs, cap trajectories and tool
+  calls, and report token/cost budgets. Do not claim full-model training unless
+  the available hardware and time budget support it.
+
+dataset_guidance: >-
+  Use established LLM/agent benchmarks or a versioned task suite. For every
+  task instance, log prompts, model/version, retrieval corpus version, tool
+  inputs/outputs, trajectory, termination reason, token usage, latency, and
+  final answer. Include adversarial or degraded-tool/retrieval regimes.
+
+hp_reporting_guidance: >-
+  Report model identifier and revision, decoding parameters, prompt template,
+  context window, retrieval top-k, chunking/index settings, tool timeout,
+  maximum steps, memory policy, planner/reflection policy, seed, and token
+  budget for every condition.
+
+code_generation_hints: >-
+  The proposed method MUST be an LLM- or Agent-based implementation, not a
+  sklearn/MLP/XGBoost substitute. Implement an explicit agent loop with typed
+  tool calls, bounded steps, trajectory logging, failure handling, and a
+  deterministic mock or replay mode for tests. Keep direct prompting, CoT,
+  ReAct, RAG, plan-and-execute, or reflection as literature-grounded baselines
+  where appropriate. Measure answer/task quality together with tool success,
+  token cost, latency, and robustness.
+
+result_analysis_hints: >-
+  Compare methods on task quality and operational reliability, not a single
+  accuracy number. Break down results by task difficulty and tool/retrieval
+  failure regime; report cost-quality and latency-quality trade-offs, failed
+  trajectories, and component ablations for planning, memory, retrieval, and
+  reflection.

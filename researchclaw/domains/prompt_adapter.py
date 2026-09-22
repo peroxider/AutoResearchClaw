@@ -280,6 +280,17 @@ def _build_adapter_registry() -> dict[str, type[PromptAdapter]]:
         "generic": GenericPromptAdapter,
     }
     try:
+        from researchclaw.domains.adapters.llm_agent import LLMAgentPromptAdapter
+        # Exact-id match wins over the generic "ml_" prefix.
+        registry["ml_llm_agent"] = LLMAgentPromptAdapter
+    except ImportError:
+        pass
+    try:
+        from researchclaw.domains.adapters.medical_llm_audit import MedicalLLMAuditPromptAdapter
+        registry["medical_llm_audit"] = MedicalLLMAuditPromptAdapter
+    except ImportError:
+        pass
+    try:
         from researchclaw.domains.adapters.physics import PhysicsPromptAdapter
         registry["physics_"] = PhysicsPromptAdapter
     except ImportError:

@@ -40,6 +40,25 @@ def _execute_result_analysis(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    # Contract-template studies emit nested condition metrics in Stage 12.
+    # Persist an explicit provenance registry before any LLM analysis/writing.
+    if config.project.profile == "medical_llm_audit":
+        candidates = sorted(run_dir.glob("stage-12/runs/**/*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        source = next((p for p in candidates if p.name == "results.json"), None)
+        if source is not None:
+            try:
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                conditions = payload.get("conditions", payload.get("metrics", {}).get("conditions", {}))
+                entries: list[dict[str, Any]] = []
+                if isinstance(conditions, dict):
+                    for cname, metrics in conditions.items():
+                        if isinstance(metrics, dict):
+                            for name, value in metrics.items():
+                                if isinstance(value, (int, float)):
+                                    entries.append({"metric_id": f"{cname}.{name}", "value": value, "condition": cname, "source_file": str(source.relative_to(run_dir)).replace("\\", "/"), "source_path": f"$.conditions.{cname}.{name}", "traceable": True})
+                (stage_dir / "verified_metric_registry.json").write_text(json.dumps({"schema_version":"medical_llm_audit/v1", "entries":entries}, ensure_ascii=False, indent=2), encoding="utf-8")
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Medical metric registry generation failed", exc_info=True)
     # --- Collect experiment data ---
     exp_data = _collect_experiment_results(
         run_dir,

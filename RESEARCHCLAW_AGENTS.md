@@ -66,6 +66,28 @@ Three stages require approval (use `--auto-approve` for fully autonomous mode):
 | `researchclaw/experiment/validator.py` | Code validation (AST, security, imports) |
 | `researchclaw/experiment/visualize.py` | Chart generation |
 
+## Medical-Informatics AI-Methods Papers
+
+When `project.profile` is `medical_llm_audit`, read and obey
+[`docs/standards/medical_ai_methods_paper.md`](docs/standards/medical_ai_methods_paper.md).
+The standard is a required Stage-20 quality gate, not optional writing advice.
+In particular, do not export a short manuscript whose Results consist of one
+aggregate table. Require a dataset statistical profile and figure, formal
+algorithm theory and a detailed Methods framework diagram, multidimensional Results with at least
+two result figures, one shared publication plot style, sequential figure
+references, and evidence-backed numbers. Run the deterministic checker before
+delivery:
+
+Introduction additionally requires a distinct abstract architecture figure that
+shows input data → LLM method/model → outputs and visually highlights innovations
+with minimal text and no emoji. Do not reuse the detailed Methods diagram. The
+Methods diagram must group functional blocks with dashed boundaries and use a
+consistent color family within each module.
+
+```bash
+python scripts/check_medical_ai_paper.py PAPER.md --assets FIGURE_DIRECTORY --report medical_manuscript_quality.json
+```
+
 ## Decision Guide
 
 | Situation | Action |

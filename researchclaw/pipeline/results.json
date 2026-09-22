@@ -1,0 +1,15 @@
+{
+  "metrics": {
+    "lr_only_auc_roc": 0.48247978436657685,
+    "lr_llm_auc_roc": 0.5956873315363881,
+    "delta_auc_roc": 0.11320754716981124,
+    "lr_only_brier": 0.10446488569409366,
+    "lr_llm_brier": 0.10145267856983703,
+    "lr_only_calibration_slope": -0.03720731182016047,
+    "lr_llm_calibration_slope": 0.06595958100488865
+  },
+  "elapsed_sec": 2.02,
+  "time_budget_sec": 720,
+  "steps_completed": 0,
+  "nan_count": 0
+}

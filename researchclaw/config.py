@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import math
 import sys
 import yaml
 
@@ -141,7 +142,7 @@ class ResearchConfig:
     topic: str
     domains: tuple[str, ...] = ()
     daily_paper_count: int = 0
-    quality_threshold: float = 0.0
+    quality_threshold: float = 7.0
     graceful_degradation: bool = True
 
 
@@ -541,6 +542,51 @@ class FigureAgentConfig:
 
 
 @dataclass(frozen=True)
+class FrameworkDiagramConfig:
+    """Configuration for the Stage 22 methodology framework-diagram artifact.
+
+    Stage 22 EXPORT_PUBLISH always references ``charts/framework_diagram.png``
+    in the paper markdown. This config controls whether that PNG is produced
+    by an external image-gen API and which backend is used. When no provider
+    is configured (or all providers fail), a matplotlib-rendered "traditional
+    framework diagram" is written instead so the placeholder never dangles.
+    """
+
+    enabled: bool = True
+    # Provider selection: "auto" | "grsai_gpt_images" |
+    # "openai_compatible" | "gemini" | "matplotlib"
+    provider: str = "auto"
+    # OpenAI-compatible image API (DALL-E, Stability, OpenRouter image,
+    # local SD servers, etc.).  base_url is the API root; the helper appends
+    # "/images/generations".  Auth is Bearer-token unless api_key is empty.
+    base_url: str = ""
+    api_key_env: str = "OPENAI_API_KEY"
+    api_key: str = ""
+    model: str = "dall-e-3"
+    # GRSAI GPT-Images. Keep the secret in GRSAI_API_KEY rather than YAML.
+    # api_style="openai" uses /v1/images/generations; "unified" uses
+    # /v1/api/generate. Both are synchronous JSON interfaces.
+    grsai_base_url: str = "https://grsaiapi.com"
+    grsai_api_key_env: str = "GRSAI_API_KEY"
+    grsai_api_key: str = ""
+    grsai_model: str = "gpt-image-2"
+    grsai_api_style: str = "openai"
+    grsai_quality: str = "auto"
+    # "direct" preserves the original bitmap-only path. "hybrid" makes a
+    # deterministic SVG/PNG semantic skeleton authoritative and permits the
+    # image model to influence only a heavily whitened background layer.
+    render_mode: str = "hybrid"
+    professional_style: str = "strict_academic"
+    visual_influence: float = 0.06
+    # Image output hints — providers map these to their native schema.
+    size: str = "1792x1024"
+    aspect_ratio: str = "16:9"
+    timeout_sec: int = 120
+    # Matplotlib fallback
+    dpi: int = 300
+
+
+@dataclass(frozen=True)
 class ExperimentRepairConfig:
     """Experiment repair loop — diagnose and fix failed experiments before paper writing.
 
@@ -582,7 +628,7 @@ class CliAgentConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    mode: str = "simulated"
+    mode: str = "sandbox"
     time_budget_sec: int = 300
     max_iterations: int = 10
     max_refine_duration_sec: int = 0  # 0 = auto (3× time_budget_sec)
@@ -601,6 +647,9 @@ class ExperimentConfig:
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     benchmark_agent: BenchmarkAgentConfig = field(default_factory=BenchmarkAgentConfig)
     figure_agent: FigureAgentConfig = field(default_factory=FigureAgentConfig)
+    framework_diagram: FrameworkDiagramConfig = field(
+        default_factory=FrameworkDiagramConfig
+    )
     repair: ExperimentRepairConfig = field(default_factory=ExperimentRepairConfig)
     cli_agent: CliAgentConfig = field(default_factory=CliAgentConfig)
 
@@ -961,7 +1010,7 @@ class RCConfig:
                 topic=research["topic"],
                 domains=tuple(research.get("domains") or ()),
                 daily_paper_count=int(research.get("daily_paper_count", 0)),
-                quality_threshold=float(research.get("quality_threshold", 0.0)),
+                quality_threshold=_safe_float(research.get("quality_threshold"), 7.0),
                 graceful_degradation=bool(research.get("graceful_degradation", True)),
             ),
             runtime=RuntimeConfig(
@@ -1150,6 +1199,145 @@ def validate_config(
     exp_mode = _get_by_path(data, "experiment.mode")
     if not _is_blank(exp_mode) and exp_mode not in EXPERIMENT_MODES:
         errors.append(f"Invalid experiment.mode: {exp_mode}")
+
+    framework_provider = _get_by_path(
+        data, "experiment.framework_diagram.provider"
+    )
+    valid_framework_providers = {
+        "auto",
+        "grsai_gpt_images",
+        "openai_compatible",
+        "gemini",
+        "matplotlib",
+    }
+    if (
+        not _is_blank(framework_provider)
+        and str(framework_provider).lower() not in valid_framework_providers
+    ):
+        errors.append(
+            "Invalid experiment.framework_diagram.provider: "
+            f"{framework_provider}"
+        )
+
+    grsai_api_style = _get_by_path(
+        data, "experiment.framework_diagram.grsai_api_style"
+    )
+    if (
+        not _is_blank(grsai_api_style)
+        and str(grsai_api_style).lower() not in {"openai", "unified"}
+    ):
+        errors.append(
+            "Invalid experiment.framework_diagram.grsai_api_style: "
+            f"{grsai_api_style}"
+        )
+
+    framework_render_mode = _get_by_path(
+        data, "experiment.framework_diagram.render_mode"
+    )
+    if (
+        not _is_blank(framework_render_mode)
+        and str(framework_render_mode).lower() not in {"direct", "hybrid"}
+    ):
+        errors.append(
+            "Invalid experiment.framework_diagram.render_mode: "
+            f"{framework_render_mode}"
+        )
+
+    visual_influence = _get_by_path(
+        data, "experiment.framework_diagram.visual_influence"
+    )
+    if not _is_blank(visual_influence):
+        try:
+            influence_value = float(visual_influence)
+        except (TypeError, ValueError):
+            errors.append(
+                "experiment.framework_diagram.visual_influence must be numeric"
+            )
+        else:
+            if not 0.0 <= influence_value <= 0.15:
+                errors.append(
+                    "experiment.framework_diagram.visual_influence must be "
+                    "between 0.0 and 0.15"
+                )
+
+    grsai_quality = _get_by_path(
+        data, "experiment.framework_diagram.grsai_quality"
+    )
+    if (
+        not _is_blank(grsai_quality)
+        and str(grsai_quality).lower() not in {"auto", "low", "medium", "high"}
+    ):
+        errors.append(
+            "Invalid experiment.framework_diagram.grsai_quality: "
+            f"{grsai_quality}"
+        )
+
+    professional_style = _get_by_path(
+        data, "experiment.framework_diagram.professional_style"
+    )
+    if (
+        not _is_blank(professional_style)
+        and str(professional_style).lower() != "strict_academic"
+    ):
+        errors.append(
+            "Invalid experiment.framework_diagram.professional_style: "
+            f"{professional_style}; only strict_academic is publication-safe"
+        )
+
+    # Fabrication-guard layer 5 (R6-paper2): paper_2 used experiment.mode
+    # 'sandbox' (acceptable) but the resulting stub main.py ran for 0.3 s
+    # and Stage 13 synthesised fabricated numbers. The simulated mode is
+    # an even worse footgun (LLM-as-experiment), so refuse it outright.
+    if exp_mode == "simulated":
+        errors.append(
+            "experiment.mode='simulated' is forbidden: it requires the LLM "
+            "to act as the experiment, which permits fabricated results. "
+            "Use 'sandbox' (or 'docker' / 'ssh_remote') so that real code "
+            "actually executes and VerifiedRegistry can audit numbers."
+        )
+
+    # paper_2 set quality_threshold=3.0 — exactly the lowest value that
+    # papers_2's quality gate could accept. The threshold gates downstream
+    # graceful_degradation; values below 3.0 mean a Stage 20 score of 2
+    # (REJECT) can still pass via degraded mode, which is the path that
+    # produced paper_2's sanitized-but-still-fabricated deliverable. Floor
+    # at 3.0 so a low-quality run fails loudly.
+    quality_threshold = _get_by_path(data, "research.quality_threshold")
+    if not _is_blank(quality_threshold):
+        try:
+            quality_threshold_value = float(quality_threshold)
+        except (TypeError, ValueError):
+            errors.append(
+                f"research.quality_threshold={quality_threshold!r} must be numeric"
+            )
+        else:
+            if not math.isfinite(quality_threshold_value):
+                errors.append(
+                    f"research.quality_threshold={quality_threshold!r} must be finite"
+                )
+            elif quality_threshold_value < 3.0:
+                errors.append(
+                    f"research.quality_threshold={quality_threshold} is too low "
+                    f"(minimum 3.0). Values below 3.0 allow fabricated papers to "
+                    f"slip through graceful_degradation; raise to ≥3.0."
+                )
+
+    # Warn (don't fail) on short experiment budgets for empirical topics.
+    exp_budget = _get_by_path(data, "experiment.time_budget_sec")
+    topic = _get_by_path(data, "research.topic") or ""
+    if (
+        isinstance(exp_budget, (int, float))
+        and exp_budget < 600
+        and any(
+            kw in str(topic).lower()
+            for kw in ("risk", "predict", "auc", "roc", "ehr", "diabetes", "clinical")
+        )
+    ):
+        warnings.append(
+            f"experiment.time_budget_sec={exp_budget} is short for empirical "
+            f"topic '{topic}'. Experiments under 600 s are likely to produce "
+            f"stub-like runs (see paper_2 incident); consider ≥600 s."
+        )
 
     exp_direction = _get_by_path(data, "experiment.metric_direction")
     if not _is_blank(exp_direction) and exp_direction not in ("minimize", "maximize"):
@@ -1342,7 +1530,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
     ssh_data = data.get("ssh_remote") or {}
     colab_data = data.get("colab_drive") or {}
     return ExperimentConfig(
-        mode=data.get("mode", "simulated"),
+        mode=data.get("mode", "sandbox"),
         time_budget_sec=_safe_int(data.get("time_budget_sec"), 300),
         max_iterations=_safe_int(data.get("max_iterations"), 10),
         max_refine_duration_sec=_safe_int(data.get("max_refine_duration_sec"), 0),
@@ -1411,6 +1599,9 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
             data.get("benchmark_agent") or {}
         ),
         figure_agent=_parse_figure_agent_config(data.get("figure_agent") or {}),
+        framework_diagram=_parse_framework_diagram_config(
+            data.get("framework_diagram") or {}
+        ),
         repair=_parse_experiment_repair_config(data.get("repair") or {}),
         cli_agent=_parse_cli_agent_config(data.get("cli_agent") or {}),
     )
@@ -1465,6 +1656,39 @@ def _parse_experiment_repair_config(data: dict[str, Any]) -> ExperimentRepairCon
         min_conditions=_safe_int(data.get("min_conditions"), 2),
         use_opencode=bool(data.get("use_opencode", True)),
         timeout_sec_per_cycle=_safe_int(data.get("timeout_sec_per_cycle"), 600),
+    )
+
+
+def _parse_framework_diagram_config(data: dict[str, Any]) -> FrameworkDiagramConfig:
+    if not data:
+        return FrameworkDiagramConfig()
+    provider = str(data.get("provider", "auto")).lower()
+    return FrameworkDiagramConfig(
+        enabled=bool(data.get("enabled", True)),
+        provider=provider,
+        base_url=str(data.get("base_url", "")),
+        api_key_env=str(data.get("api_key_env", "OPENAI_API_KEY")),
+        api_key=str(data.get("api_key", "")),
+        model=str(data.get("model", "dall-e-3")),
+        grsai_base_url=str(
+            data.get("grsai_base_url", "https://grsaiapi.com")
+        ),
+        grsai_api_key_env=str(
+            data.get("grsai_api_key_env", "GRSAI_API_KEY")
+        ),
+        grsai_api_key=str(data.get("grsai_api_key", "")),
+        grsai_model=str(data.get("grsai_model", "gpt-image-2")),
+        grsai_api_style=str(data.get("grsai_api_style", "openai")).lower(),
+        grsai_quality=str(data.get("grsai_quality", "auto")).lower(),
+        render_mode=str(data.get("render_mode", "hybrid")).lower(),
+        professional_style=str(
+            data.get("professional_style", "strict_academic")
+        ).lower(),
+        visual_influence=_safe_float(data.get("visual_influence"), 0.06),
+        size=str(data.get("size", "1792x1024")),
+        aspect_ratio=str(data.get("aspect_ratio", "16:9")),
+        timeout_sec=_safe_int(data.get("timeout_sec"), 120),
+        dpi=_safe_int(data.get("dpi"), 300),
     )
 
 

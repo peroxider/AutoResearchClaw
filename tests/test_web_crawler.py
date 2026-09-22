@@ -161,10 +161,20 @@ class TestCrawlAsync:
 
 
 class TestCheckUrlSsrf:
-    def test_http_allowed(self):
+    @patch("researchclaw.web._ssrf.socket.getaddrinfo")
+    def test_http_allowed(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (None, None, None, None, ("93.184.216.34", 80))
+        ]
+
         assert check_url_ssrf("http://example.com") is None
 
-    def test_https_allowed(self):
+    @patch("researchclaw.web._ssrf.socket.getaddrinfo")
+    def test_https_allowed(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (None, None, None, None, ("151.101.1.42", 443))
+        ]
+
         assert check_url_ssrf("https://arxiv.org/abs/2301.00001") is None
 
     def test_rejects_file_scheme(self):

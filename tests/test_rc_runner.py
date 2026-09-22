@@ -1126,3 +1126,133 @@ def test_imp21_stage6_empty_shortlist_gate_halts_pipeline_under_auto_approve(
     )
     assert summary["final_status"] == "paused"
     assert summary["stages_paused"] == 1
+
+
+# ── Installed extension hook integration ──
+
+
+def test_pre_experiment_extensions_run_before_stage_12(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    events: list[object] = []
+
+    def mock_hooks(group: str, **kwargs: Any) -> list[str]:
+        _ = kwargs
+        if group == rc_runner.PRE_EXPERIMENT_HOOKS:
+            events.append("pre-experiment")
+            return ["patch"]
+        return []
+
+    def mock_execute_stage(stage: Stage, **kwargs: Any) -> StageResult:
+        _ = kwargs
+        events.append(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "run_extension_hooks", mock_hooks)
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+
+    rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-extension-order",
+        config=rc_config,
+        adapters=adapters,
+    )
+
+    assert events.index("pre-experiment") < events.index(Stage.EXPERIMENT_RUN)
+
+
+def test_pre_experiment_extension_failure_blocks_stage_12(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    executed: list[Stage] = []
+
+    def mock_hooks(group: str, **kwargs: Any) -> list[str]:
+        _ = kwargs
+        if group == rc_runner.PRE_EXPERIMENT_HOOKS:
+            raise RuntimeError("patch rejected generated code")
+        return []
+
+    def mock_execute_stage(stage: Stage, **kwargs: Any) -> StageResult:
+        _ = kwargs
+        executed.append(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "run_extension_hooks", mock_hooks)
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-extension-fail",
+        config=rc_config,
+        adapters=adapters,
+    )
+
+    assert results[-1].stage == Stage.EXPERIMENT_RUN
+    assert results[-1].status == StageStatus.FAILED
+    assert results[-1].error == "patch rejected generated code"
+    assert Stage.EXPERIMENT_RUN not in executed
+
+
+def test_post_run_extensions_receive_packaged_deliverables(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    _setup_stage_artifacts(run_dir)
+    calls: list[tuple[str, Path]] = []
+
+    def mock_hooks(group: str, **kwargs: Any) -> list[str]:
+        calls.append((group, kwargs["run_dir"]))
+        return ["patch"] if group == rc_runner.PRE_EXPERIMENT_HOOKS else ["sync", "verify"]
+
+    monkeypatch.setattr(rc_runner, "run_extension_hooks", mock_hooks)
+    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_kwargs: _done(stage))
+
+    rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-post-extensions",
+        config=rc_config,
+        adapters=adapters,
+    )
+
+    assert (rc_runner.POST_RUN_HOOKS, run_dir / "deliverables") in calls
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text(encoding="utf-8"))
+    assert summary["extensions_status"] == "passed"
+    assert summary["extensions_completed"] == ["sync", "verify"]
+
+
+def test_post_run_extension_failure_updates_summary_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    _setup_stage_artifacts(run_dir)
+
+    def mock_hooks(group: str, **kwargs: Any) -> list[str]:
+        _ = kwargs
+        if group == rc_runner.POST_RUN_HOOKS:
+            raise RuntimeError("verification gate failed")
+        return []
+
+    monkeypatch.setattr(rc_runner, "run_extension_hooks", mock_hooks)
+    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_kwargs: _done(stage))
+
+    with pytest.raises(RuntimeError, match="verification gate failed"):
+        rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="run-post-extension-fail",
+            config=rc_config,
+            adapters=adapters,
+        )
+
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text(encoding="utf-8"))
+    assert summary["extensions_status"] == "failed"
+    assert summary["extensions_error"] == "verification gate failed"
