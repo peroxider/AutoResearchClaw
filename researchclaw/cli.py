@@ -842,8 +842,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Interactive provider prompt (TTY only, else default to openai)
-    choice = "1"
+    # Interactive provider prompt (TTY only, else default to Codex via ACP)
+    choice = "5"
     if sys.stdin.isatty():
         print("Select LLM provider:")
         print("  1) openai       (requires OPENAI_API_KEY)")
@@ -857,7 +857,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  9) minimax-cn-anthropic     (requires MINIMAX_API_KEY)")
         print(" 10) atlascloud   (requires ATLASCLOUD_API_KEY)")
         try:
-            raw = input("Choice [1]: ").strip()
+            raw = input("Choice [5]: ").strip()
         except (EOFError, KeyboardInterrupt):
             raw = ""
         if raw in _PROVIDER_CHOICES:
@@ -869,7 +869,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # String-based replacement to preserve YAML comments
     content = content.replace(
-        'provider: "openai-compatible"', f'provider: "{provider}"'
+        'provider: "acp"', f'provider: "{provider}"', 1
     )
 
     if provider == "acp":
@@ -887,25 +887,34 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Ollama runs locally — set base_url, clear api_key_env, set dummy key
         base_url = _PROVIDER_URLS["ollama"]
         content = content.replace(
-            'base_url: "https://api.openai.com/v1"', f'base_url: "{base_url}"'
+            'base_url: ""                    # Not used by ACP',
+            f'base_url: "{base_url}"'
         )
-        content = content.replace('api_key_env: "OPENAI_API_KEY"', 'api_key_env: ""')
+        content = content.replace(
+            'api_key_env: ""                # Codex CLI handles authentication',
+            'api_key_env: ""',
+        )
         content = content.replace('api_key: ""', 'api_key: "ollama"')
     else:
         base_url = _PROVIDER_URLS.get(provider, "https://api.openai.com/v1")
         content = content.replace(
-            'base_url: "https://api.openai.com/v1"', f'base_url: "{base_url}"'
+            'base_url: ""                    # Not used by ACP',
+            f'base_url: "{base_url}"',
         )
         if api_key_env:
             content = content.replace(
-                'api_key_env: "OPENAI_API_KEY"', f'api_key_env: "{api_key_env}"'
+                'api_key_env: ""                # Codex CLI handles authentication',
+                f'api_key_env: "{api_key_env}"',
             )
 
     if provider in _PROVIDER_MODELS:
         primary, fallbacks = _PROVIDER_MODELS[provider]
-        content = content.replace('primary_model: "gpt-4o"', f'primary_model: "{primary}"')
+        content = content.replace(
+            'primary_model: ""              # Uses the Codex CLI\'s configured model',
+            f'primary_model: "{primary}"',
+        )
         # Replace fallback models block
-        old_fallbacks = '  fallback_models:\n    - "gpt-4.1"\n    - "gpt-4o-mini"'
+        old_fallbacks = '  fallback_models: []'
         new_fallbacks = "  fallback_models:\n" + "".join(
             f'    - "{m}"\n' for m in fallbacks
         )
