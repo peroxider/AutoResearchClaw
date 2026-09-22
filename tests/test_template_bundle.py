@@ -1,0 +1,241 @@
+import json
+import zipfile
+
+import pytest
+
+from researchclaw.literature.evidence import write_json
+from researchclaw.pipeline.evidence_store import content_hash
+from researchclaw.templates.bundle import (
+    GENERIC, TemplateError, copy_template_resources, freeze_template, inspect_constraints,
+    render_frame, verify_template, verify_template_resources,
+)
+from researchclaw.pipeline.manuscript import build_manuscript, export_manuscript, render_manuscript, validate_manuscript, verify_exports
+from tests.test_research_inputs import inputs
+from tests.test_experiment_protocol import spec
+from tests.test_manuscript import study, Writer
+
+
+def bundle(tmp_path, **policy):
+    directory = tmp_path / "template-source"
+    directory.mkdir(exist_ok=True)
+    (directory / "main.tex").write_text(r"""\documentclass[twocolumn]{article}
+\usepackage{localstyle}
+\title{A sample title}
+\author{Real Person\thanks{An identifying grant}}
+\begin{document}
+\maketitle
+EXAMPLE PAPER CONTENT MUST NOT SURVIVE
+\bibliographystyle{abbrvnat}
+\bibliography{sample}
+\end{document}
+""", encoding="utf-8")
+    (directory / "localstyle.sty").write_text(r"\ProvidesPackage{localstyle}")
+    write_json(directory / "template.json", {"schema_version": 1, "name": "fixture-journal", **policy})
+    return directory
+
+
+def test_raw_template_parsing_preserves_class_style_and_removes_sample(tmp_path):
+    source = bundle(tmp_path)
+    root = tmp_path / "run"
+    report = freeze_template(root, source, authors="Private Name")
+    assert verify_template(root) == report
+    prefix, suffix, policy = render_frame(root, "A & B")
+    assert r"\documentclass[twocolumn]{article}" in prefix
+    assert "Private Name" not in prefix and "Real Person" not in prefix and "grant" not in prefix
+    assert r"\author{Anonymous}" in prefix and r"A \& B" in prefix
+    assert "EXAMPLE" not in prefix + suffix and "sample}" not in suffix
+    assert r"\bibliographystyle{abbrvnat}" in suffix
+    assert policy["columns"] == 2
+    copy_template_resources(root, root)
+    verify_template_resources(root)
+    assert (root / "localstyle.sty").is_file()
+
+
+def test_zip_import_and_content_addressed_history(tmp_path):
+    source = bundle(tmp_path)
+    archive = tmp_path / "template.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for path in source.iterdir():
+            output.write(path, path.name)
+    root = tmp_path / "run"
+    first = freeze_template(root, archive)
+    (source / "localstyle.sty").write_text(r"\ProvidesPackage{localstyle}[v2]")
+    second = freeze_template(root, source)
+    assert first["directory"] != second["directory"]
+    assert (root / first["directory"] / "localstyle.sty").read_text() == r"\ProvidesPackage{localstyle}"
+
+
+@pytest.mark.parametrize("name", ["../escape.tex", "/absolute.tex", "C:/outside.tex", "styles/../../escape.tex", "CON.tex"])
+def test_zip_path_escape_is_rejected_before_writing(tmp_path, name):
+    archive = tmp_path / "template.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(name, "forbidden")
+    with pytest.raises(TemplateError):
+        freeze_template(tmp_path / "run", archive)
+    assert not (tmp_path / "escape.tex").exists()
+
+
+def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
+    root = tmp_path / "run"
+    record = freeze_template(root, bundle(tmp_path))
+    copy_template_resources(root, root)
+    (root / "localstyle.sty").write_text("An altered style")
+    with pytest.raises(TemplateError, match="Materialized"):
+        verify_template_resources(root)
+    (root / record["directory"] / "localstyle.sty").write_text("An altered frozen style")
+    with pytest.raises(TemplateError, match="Frozen"):
+        verify_template(root)
+
+
+@pytest.mark.parametrize("change", [
+    {"max_pages": 0}, {"max_pages": True}, {"engine": "sh"}, {"columns": 3},
+    {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
+])
+def test_invalid_policy_fields_are_not_silently_ignored(tmp_path, change):
+    with pytest.raises(TemplateError):
+        freeze_template(tmp_path / "run", bundle(tmp_path, **change))
+
+
+def test_unsupported_bibliography_and_identifying_metadata_fail(tmp_path):
+    source = bundle(tmp_path)
+    path = source / "main.tex"
+    path.write_text(GENERIC.replace("{{ARC_PACKAGES}}", r"\usepackage{biblatex}" + "\n{{ARC_PACKAGES}}"))
+    with pytest.raises(TemplateError, match="BibLaTeX"):
+        freeze_template(tmp_path / "run", source)
+    path.write_text(GENERIC.replace("{{ARC_PACKAGES}}", r"\hypersetup{pdfauthor={Private Name}}" + "\n{{ARC_PACKAGES}}"))
+    with pytest.raises(TemplateError, match="identifying metadata"):
+        freeze_template(tmp_path / "run", source)
+
+
+def test_page_limits_use_physical_pdf_pages_not_tex_counters(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, max_pages=2, max_main_pages=1, appendix_roles=["results"]))
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.new_page()
+        pdf.set_metadata({"author": "Anonymous"})
+        pdf.save(root / "paper.pdf")
+    missing = inspect_constraints(root)
+    assert "main_page_count_unavailable" in missing["issues"]
+    with fitz.open(root / "paper.pdf") as pdf:
+        pdf[1].insert_text((72, 72), "Appendix")
+        pdf.saveIncr()
+    checked = inspect_constraints(root)
+    assert checked["status"] == "passed" and checked["pages"] == 2 and checked["main_pages"] == 1
+    (root / "paper.aux").write_text(r"\newlabel{arc:appendix-start}{{}{99}}")
+    assert inspect_constraints(root)["main_pages"] == 1
+    with fitz.open(root / "paper.pdf") as pdf:
+        pdf[0].insert_text((72, 72), "Appendix")
+        pdf.saveIncr()
+    assert "main_page_count_unavailable" in inspect_constraints(root)["issues"]
+
+
+def test_pdf_author_metadata_cannot_pass_anonymous_policy(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    root = tmp_path / "run"
+    freeze_template(root)
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.set_metadata({"author": "Private Name"})
+        pdf.save(root / "paper.pdf")
+    assert "pdf_author_metadata_not_anonymous" in inspect_constraints(root)["issues"]
+
+
+def test_appendix_and_highlights_preserve_numeric_spans_in_both_formats(study):
+    root, _ = study
+    source = bundle(root.parent, appendix_roles=["results"], highlights_required=True)
+    freeze_template(root, source)
+    ir = build_manuscript(root, "Fixture study", llm=Writer())
+    export_manuscript(root, root)
+    verify_exports(root)
+    texts, bindings = render_manuscript(root, ir)
+    assert texts["paper_final.md"].index("# Appendix") > texts["paper_final.md"].index("## Conclusion")
+    assert r"\begin{table*}" in texts["paper.tex"] and r"\begin{longtable}" not in texts["paper.tex"]
+    assert r"\begin{figure*}" in texts["paper.tex"]
+    assert "zero difference" in (root / "highlights.md").read_text(encoding="utf-8")
+    for claim in bindings["numeric"]:
+        for name, span in claim["spans"].items():
+            assert texts[name][span["start"]:span["end"]] == claim["rendered"]
+    (root / "highlights.md").write_text("An unsupported highlight")
+    with pytest.raises(ValueError, match="Auxiliary"):
+        verify_exports(root)
+
+
+def test_template_refresh_invalidates_old_manuscript_and_removes_only_managed_highlights(study):
+    root, _ = study
+    source = bundle(root.parent, highlights_required=True)
+    freeze_template(root, source)
+    old = build_manuscript(root, "Fixture study", llm=Writer())
+    export_manuscript(root, root)
+    source = bundle(root.parent, highlights_required=False, max_pages=12)
+    freeze_template(root, source)
+    with pytest.raises(ValueError, match="dependencies"):
+        validate_manuscript(root, old)
+    build_manuscript(root, "Fixture study", llm=Writer())
+    export_manuscript(root, root)
+    assert not (root / "highlights.md").exists()
+
+
+def test_xelatex_invocation_disables_shell_escape(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from researchclaw.templates import compiler
+    calls = []
+    monkeypatch.setattr(compiler.subprocess, "run", lambda command, **kwargs: (
+        calls.append(command) or SimpleNamespace(stdout=b"", stderr=b"", returncode=0)))
+    _, success = compiler._run_pdflatex(tmp_path, "paper.tex", engine="xelatex")
+    assert success and calls[0][:2] == ["xelatex", "-no-shell-escape"]
+
+
+def test_config_template_paths_resolve_from_project_root_and_validate(tmp_path):
+    from researchclaw.config import RCConfig, validate_config
+    source = bundle(tmp_path)
+    data = {"project": {"name": "template-test"}, "research": {"topic": "Fixture"},
+        "runtime": {"timezone": "UTC"}, "notifications": {"channel": "local"},
+        "knowledge_base": {"root": str(tmp_path / "kb")},
+        "llm": {"provider": "openai-compatible", "base_url": "http://localhost:1234/v1", "api_key": "fixture", "api_key_env": "RC_TEST_KEY"},
+        "export": {"template_path": "template-source"}}
+    cfg = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+    assert cfg.export.template_path == str(source.resolve())
+    invalid = validate_config({"export": {"template_path": 123}}, check_paths=False)
+    assert any("export.template_path" in error for error in invalid.errors)
+
+
+def test_template_with_exact_markers_preserves_special_title_layout(tmp_path):
+    source = bundle(tmp_path, anonymous=False, engine="xelatex")
+    raw = GENERIC.replace(r"\maketitle", r"\begin{center}\Huge Custom journal heading\end{center}\maketitle")
+    (source / "main.tex").write_text(raw)
+    root = tmp_path / "run"
+    freeze_template(root, source, authors="A & B")
+    prefix, _, policy = render_frame(root, "Title")
+    assert "Custom journal heading" in prefix and r"A \& B" in prefix
+    assert "inputenc" not in prefix and policy["engine"] == "xelatex"
+
+
+def test_pdf_total_limit_is_enforced_even_without_appendix(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, max_pages=1))
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    result = inspect_constraints(root)
+    assert result["pages"] == 2 and "max_pages_unavailable_or_exceeded" in result["issues"]
+
+
+def test_export_refresh_detects_external_template_change(study):
+    from dataclasses import replace
+    from researchclaw.adapters import AdapterBundle
+    from researchclaw.pipeline.stage_impls._review_publish import _execute_export_publish
+    from researchclaw.pipeline.stages import StageStatus
+    root, cfg = study
+    source = bundle(root.parent)
+    freeze_template(root, source)
+    build_manuscript(root, "Fixture study", llm=Writer())
+    cfg = replace(cfg, export=replace(cfg.export, template_path=str(source)))
+    stage = root / "stage-22"
+    stage.mkdir()
+    write_json(source / "template.json", {"max_pages": 12})
+    result = _execute_export_publish(stage, root, cfg, AdapterBundle())
+    assert result.status == StageStatus.FAILED and "dependencies" in result.error
