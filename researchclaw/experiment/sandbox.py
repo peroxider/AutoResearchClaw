@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
@@ -286,6 +286,7 @@ class SandboxResult:
     elapsed_sec: float
     metrics: dict[str, object]
     timed_out: bool = False
+    output_dir: str = ""
 
 
 class SandboxProtocol(Protocol):
@@ -385,6 +386,8 @@ class ExperimentSandbox:
         self._inject_harness(sandbox_project)
 
         # Copy all project files (will NOT overwrite harness — harness name is unique)
+        from researchclaw.research_inputs import bind_project_data
+        bind_project_data(project_dir)
         for src_file in project_dir.iterdir():
             if src_file.is_file():
                 dest = sandbox_project / src_file.name
@@ -448,7 +451,7 @@ class ExperimentSandbox:
                 exc, elapsed_sec=time.monotonic() - start
             )
 
-        return result
+        return replace(result, output_dir=str(sandbox_project))
 
     @staticmethod
     def _inject_harness(target_dir: Path) -> None:

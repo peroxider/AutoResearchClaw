@@ -160,6 +160,8 @@ class DockerSandbox:
         self._inject_harness(staging)
 
         # Copy project files and subdirectories (skip harness overwrite)
+        from researchclaw.research_inputs import bind_project_data
+        bind_project_data(project_dir)
         import shutil as _shutil
         for src_item in project_dir.iterdir():
             dest = staging / src_item.name
@@ -359,6 +361,7 @@ class DockerSandbox:
             elapsed_sec=elapsed,
             metrics=metrics,
             timed_out=timed_out,
+            output_dir=str(staging_dir),
         )
 
     def _build_run_command(
