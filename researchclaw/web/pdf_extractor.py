@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import tempfile
 from dataclasses import dataclass, field
@@ -47,6 +48,8 @@ class PDFContent:
     error: str = ""
     backend: str = "pymupdf"
     metadata: dict[str, Any] = field(default_factory=dict)
+    page_texts: list[str] = field(default_factory=list)
+    document_sha256: str = ""
 
     @property
     def has_content(self) -> bool:
@@ -125,6 +128,8 @@ class PDFExtractor:
                 page_count=page_count,
                 success=True,
                 metadata=meta,
+                page_texts=all_text,
+                document_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("PDF extraction failed for %s: %s", path, exc)

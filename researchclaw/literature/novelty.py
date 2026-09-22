@@ -221,6 +221,7 @@ def check_novelty(
     # --- Search for similar existing work ---
     similar_papers: list[dict[str, Any]] = []
     total_papers_retrieved = 0  # Track total API results (even below threshold)
+    search_status = "unavailable"
 
     # Build search queries from hypotheses
     queries = _build_novelty_queries(topic, hypotheses_text)
@@ -235,6 +236,7 @@ def check_novelty(
             s2_api_key=s2_api_key,
         )
         total_papers_retrieved = len(found)
+        search_status = "completed" if found else "empty"
         for paper in found[:max_search_results]:
             sim = _compute_similarity(hyp_keywords, paper.title, paper.abstract)
             if sim >= similarity_threshold:
@@ -303,8 +305,8 @@ def check_novelty(
 
     # When search coverage is insufficient, flag the assessment as unreliable
     # instead of reporting a misleading perfect novelty score.
-    if search_coverage == "insufficient" and not similar_papers:
-        assessment = "insufficient_data"
+    if not similar_papers:
+        assessment = "unknown"
         recommendation = "proceed_with_caution"
     elif assessment == "critical":
         recommendation = "abort"
@@ -330,6 +332,7 @@ def check_novelty(
         "recommendation": recommendation,
         "similarity_threshold": similarity_threshold,
         "search_coverage": search_coverage,
+        "search_status": search_status,
         "total_papers_retrieved": total_papers_retrieved,
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -359,14 +362,15 @@ def _build_novelty_queries(topic: str, hypotheses_text: str) -> list[str]:
 def _assess_novelty(
     similar_papers: list[dict[str, Any]],
     threshold: float,
-) -> tuple[float, str]:
+) -> tuple[float | None, str]:
     """Compute overall novelty score and assessment.
 
     Returns (score, assessment) where score is 0-1 (higher = more novel)
-    and assessment is 'high' | 'moderate' | 'low' | 'critical'.
+    and assessment is 'high' | 'moderate' | 'low' | 'critical' | 'unknown'.
+    No comparison evidence means an unknown score, not perfect novelty.
     """
     if not similar_papers:
-        return 1.0, "high"
+        return None, "unknown"
 
     # Take top-5 most similar
     top = similar_papers[:5]

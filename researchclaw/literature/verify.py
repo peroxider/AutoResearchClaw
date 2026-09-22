@@ -95,11 +95,11 @@ class VerificationReport:
     results: list[CitationResult] = field(default_factory=list)
 
     @property
-    def integrity_score(self) -> float:
+    def integrity_score(self) -> float | None:
         """Fraction of verifiable citations that are verified (0.0–1.0)."""
         verifiable = self.total - self.skipped
         if verifiable <= 0:
-            return 1.0
+            return None
         return round(self.verified / verifiable, 3)
 
     def to_dict(self) -> dict[str, object]:
