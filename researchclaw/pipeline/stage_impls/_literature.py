@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -401,6 +402,10 @@ def _execute_literature_collect(
     candidates: list[dict[str, Any]] = []
     bibtex_entries: list[str] = []
     real_search_succeeded = False
+    expanded_queries = list(queries)
+    from researchclaw.literature.evidence import read_local_sources
+    for local_paper in read_local_sources(run_dir):
+        candidates.append({k: v for k, v in local_paper.items() if k not in {"_local_path", "path"}})
 
     try:
         from researchclaw.literature.search import (
@@ -522,6 +527,10 @@ def _execute_literature_collect(
             web_result = web_agent.search_and_extract(
                 topic, search_queries=queries,
             )
+            from researchclaw.literature.evidence import write_json
+            write_json(stage_dir / "literature_fulltext.json", {
+                "schema_version": 1, "documents": [asdict(pdf) for pdf in getattr(web_result, "pdf_extractions", []) if is_dataclass(pdf)],
+            })
 
             # Convert Google Scholar papers into candidates
             for sp in web_result.scholar_papers:
@@ -581,13 +590,9 @@ def _execute_literature_collect(
             for idx in range(max(20, config.research.daily_paper_count or 20))
         ]
 
-    # Write candidates
-    out = stage_dir / "candidates.jsonl"
-    _write_jsonl(out, candidates)
-
-    # BUG-50 fix: Generate BibTeX from candidates when real search failed
-    # (LLM/placeholder fallback paths don't populate bibtex_entries)
-    if not bibtex_entries and candidates:
+    # Include local and seed-library entries even when API search also succeeded.
+    existing_bib_keys = set(re.findall(r"@\w+\s*\{\s*([^,\s]+)", "\n".join(bibtex_entries)))
+    if candidates:
         for c in candidates:
             if c.get("is_placeholder"):
                 continue
@@ -604,6 +609,9 @@ def _execute_literature_collect(
                     w[0] for w in str(c.get("title", "study")).split()[:3]
                 ).lower()
                 _ck = f"{_surname}{_yr}{_title_word}"
+                c["cite_key"] = _ck
+            if _ck in existing_bib_keys:
+                continue
             _title = c.get("title", "Untitled")
             _year = c.get("year", 2024)
             _author_str = ""
@@ -624,10 +632,14 @@ def _execute_literature_collect(
                 f"  url={{{c.get('url', '')}}},\n"
                 f"}}"
             )
+            existing_bib_keys.add(_ck)
         logger.info(
             "Stage 4: Generated %d BibTeX entries from candidates (fallback)",
             len(bibtex_entries),
         )
+
+    # Persist the same citation identities used by the bibliography.
+    _write_jsonl(stage_dir / "candidates.jsonl", candidates)
 
     # Write references.bib (F2.4)
     artifacts = ["candidates.jsonl"]
@@ -635,6 +647,8 @@ def _execute_literature_collect(
         artifacts.append("web_context.md")
     if (stage_dir / "web_search_result.json").exists():
         artifacts.append("web_search_result.json")
+    if (stage_dir / "literature_fulltext.json").exists():
+        artifacts.append("literature_fulltext.json")
     if bibtex_entries:
         bib_content = "\n\n".join(bibtex_entries) + "\n"
         (stage_dir / "references.bib").write_text(bib_content, encoding="utf-8")
@@ -649,6 +663,10 @@ def _execute_literature_collect(
             {
                 "real_search": real_search_succeeded,
                 "queries_used": queries,
+                "expanded_queries": expanded_queries,
+                "providers_requested": list(config.literature_search.sources),
+                "status": "results_found" if real_search_succeeded else "empty_or_unavailable",
+                "observation_scope": "aggregate_backend_results_not_per_query_success",
                 "year_min": year_min,
                 "total_candidates": len(candidates),
                 "bibtex_entries": len(bibtex_entries),
@@ -915,6 +933,48 @@ def _execute_knowledge_extract(
             evidence_refs=("stage-06/knowledge_meta.json",),
             decision="upstream_blocked",
         )
+
+    # Evidence-first extraction for formal/structured studies and available full text.
+    from researchclaw.literature.evidence import build_evidence, coverage_report, write_json, read_local_sources
+    settings = config.literature_search
+    fulltext_data = _safe_json_loads(_read_prior_artifact(run_dir, "literature_fulltext.json") or "{}", {})
+    fulltexts = fulltext_data.get("documents", []) if isinstance(fulltext_data, dict) else []
+    use_evidence = settings.evidence_mode == "on" or (settings.evidence_mode == "auto" and (
+        config.research.target_status != "exploratory" or config.research.brief_path
+        or fulltexts or (run_dir / "literature_input" / "sources.json").is_file()))
+    if use_evidence:
+        from researchclaw.llm import build_reviewer_llm
+        rows = _parse_jsonl_rows(shortlist)
+        candidates = _parse_jsonl_rows(_read_prior_artifact(run_dir, "candidates.jsonl") or "")
+        authoritative = {c["cite_key"]: c for c in candidates if c.get("cite_key")}
+        authoritative.update({p["cite_key"]: p for p in read_local_sources(run_dir)})
+        rows = [authoritative.get(row.get("cite_key"), row) for row in rows]
+        search_log = _safe_json_loads(_read_prior_artifact(run_dir, "search_meta.json") or "{}", {})
+        bundle = build_evidence(run_dir, rows, llm=llm,
+                                reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+                                fulltexts=fulltexts, search_log=search_log,
+                                max_papers=settings.evidence_max_papers, max_calls=settings.evidence_max_calls,
+                                max_chars=settings.evidence_max_chars)
+        coverage = coverage_report(bundle)
+        cards_dir = stage_dir / "cards"
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        parts = ["# Source-grounded evidence cards", f"Evidence version: {bundle['version']}", ""]
+        for card in bundle["cards"]:
+            parts.extend([f"## {card['cite_key']} — {card['card_id']}",
+                          f"Review: {card['review']['status']}", card["claim"],
+                          f"Scope: {card['conditions']}", f"Source: {card['locator']}",
+                          "> " + card["excerpt"].replace("\n", "\n> "), ""])
+        if not bundle["cards"]:
+            parts.append("No source-grounded claims available. Literature evidence remains unknown.")
+        (cards_dir / "evidence_index.md").write_text("\n".join(parts), encoding="utf-8")
+        write_json(stage_dir / "knowledge_meta.json", coverage)
+        strict_failure = config.research.target_status != "exploratory" and coverage["status"] != "review_ready"
+        return StageResult(stage=Stage.KNOWLEDGE_EXTRACT,
+                           status=StageStatus.PAUSED if strict_failure else StageStatus.DONE,
+                           artifacts=("cards/", "knowledge_meta.json"),
+                           decision="literature_evidence_incomplete" if strict_failure else "evidence_extracted",
+                           error="Literature coverage needs full-text evidence or completed search" if strict_failure else "",
+                           evidence_refs=("literature_evidence.json", "literature_coverage.json"))
 
     # Inject web context from Stage 4 if available
     web_context = _read_prior_artifact(run_dir, "web_context.md") or ""

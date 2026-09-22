@@ -34,6 +34,17 @@ def _execute_topic_init(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    from researchclaw.research_inputs import InputContractError, contract_for_config, public_context
+    try:
+        contract = contract_for_config(config, run_dir, initialize=True)
+    except InputContractError as exc:
+        (stage_dir / "input_preflight.json").write_text(
+            json.dumps({"status": "failed", "reason": str(exc)}), encoding="utf-8"
+        )
+        return StageResult(stage=Stage.TOPIC_INIT, status=StageStatus.FAILED,
+                           artifacts=("input_preflight.json",), error=str(exc),
+                           decision="input_contract_invalid")
+    frozen_context = public_context(contract, run_dir) if contract else ""
     topic = config.research.topic
     domains = (
         ", ".join(config.research.domains) if config.research.domains else "general"
@@ -50,7 +61,7 @@ def _execute_topic_init(
             quality_threshold=config.research.quality_threshold,
         )
         resp = llm.chat(
-            [{"role": "user", "content": sp.user}],
+            [{"role": "user", "content": sp.user + frozen_context}],
             system=sp.system,
         )
         goal_md = resp.content
@@ -91,7 +102,7 @@ Investigate the topic with emphasis on reproducible methods and measurable outco
 ## Generated
 {_utcnow_iso()}
 """
-    (stage_dir / "goal.md").write_text(goal_md, encoding="utf-8")
+    (stage_dir / "goal.md").write_text(goal_md + frozen_context, encoding="utf-8")
 
     # --- Hardware detection (GPU / MPS / CPU) ---
     # When using ssh_remote, detect hardware on the remote host instead of locally

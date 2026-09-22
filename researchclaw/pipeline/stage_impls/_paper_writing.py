@@ -1505,27 +1505,18 @@ def _check_ablation_effectiveness(
             # AND absolute < 1pp → TRIVIAL
             if rel_diff < threshold and abs_diff < 1.0:
                 warnings.append(
-                    f"TRIVIAL: Ablation '{name}' {mk}={abl_val:.4f} is within "
-                    f"{rel_diff:.1%} (abs {abs_diff:.4f}pp) of baseline "
+                    f"SMALL EFFECT: Ablation '{name}' {mk}={abl_val:.4f} is within "
+                    f"{rel_diff:.1%} (absolute difference {abs_diff:.4f}) of baseline "
                     f"'{baseline_name}' {mk}={baseline_mean:.4f} — "
-                    f"ablation is ineffective"
+                    f"report this observation; component removal requires execution evidence"
                 )
             elif rel_diff < threshold:
                 warnings.append(
                     f"Ablation '{name}' {mk}={abl_val:.4f} is within "
                     f"{rel_diff:.1%} of baseline '{baseline_name}' "
-                    f"{mk}={baseline_mean:.4f} — ablation may be ineffective"
+                    f"{mk}={baseline_mean:.4f} — the effect is small; this alone does not imply an implementation defect"
                 )
             break  # Only check the first _mean metric per condition
-
-    # Improvement C: Prepend CRITICAL summary if >50% trivial
-    trivial_count = sum(1 for w in warnings if w.startswith("TRIVIAL:"))
-    if trivial_count > 0 and len(warnings) > 0 and trivial_count / len(warnings) > 0.5:
-        warnings.insert(0, (
-            f"CRITICAL: {trivial_count}/{len(warnings)} ablations are trivially "
-            f"similar to baseline (<{threshold:.0%} relative, <1pp absolute). "
-            f"The ablation design is likely broken — components are not effectively removed."
-        ))
 
     return warnings
 
@@ -1614,6 +1605,9 @@ def _execute_paper_draft(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    if config.research.target_status != "exploratory" or (run_dir / "research_contract.json").is_file():
+        from researchclaw.pipeline.manuscript import execute_writing_stage
+        return execute_writing_stage(stage_dir, run_dir, config, llm=llm)
     outline = _read_prior_artifact(run_dir, "outline.md") or ""
     preamble = _build_context_preamble(
         config,
@@ -1623,6 +1617,22 @@ def _execute_paper_draft(
         include_analysis=True,
         include_experiment_data=True,  # WS-5.1: inject real experiment data
     )
+    evidence_path = run_dir / "evidence_store.json"
+    if evidence_path.is_file():
+        from researchclaw.pipeline.evidence_store import EvidenceStore
+        try:
+            store = EvidenceStore.from_dict(json.loads(evidence_path.read_text(encoding="utf-8")))
+            table = store.render_table(list(store.records), run_dir)
+            preamble += (
+                "\n\n## Independently evaluated evidence\n"
+                "Preserve every dataset/version/split/method/metric identity in this table. "
+                "Explain the results without changing labels, units or values.\n" + table
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            logger.warning("Typed evidence unavailable for writing: %s", exc)
+            if config.research.target_status != "exploratory":
+                return StageResult(stage=Stage.PAPER_DRAFT, status=StageStatus.FAILED,
+                                   artifacts=(), error="Typed evidence failed validation before writing")
 
     # BUG-222: Read PROMOTED BEST experiment_summary for the paper prompt.
     # Previous code (R21-1) picked the "richest" experiment_summary across

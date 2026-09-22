@@ -556,7 +556,7 @@ def _execute_code_generation(
         if _candidate.exists():
             _bp_path = _candidate
             break
-    if _bp_path is not None:
+    if _bp_path is not None and not (run_dir / "research_contract.json").is_file():
         try:
             import json as _json_bp
             _bp_data = _json_bp.loads(_bp_path.read_text(encoding="utf-8"))

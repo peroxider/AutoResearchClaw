@@ -168,10 +168,41 @@ def _execute_experiment_run(
                 code_text = ""
     if not code_text:
         code_text = _read_prior_artifact(run_dir, "experiment.py") or ""
+    if (run_dir / "research_contract.json").is_file() and not exp_dir_path and code_text:
+        # The single-file compatibility path also needs the public data bundle.
+        input_project = stage_dir / "input_project"
+        input_project.mkdir(parents=True, exist_ok=True)
+        (input_project / "main.py").write_text(code_text, encoding="utf-8")
+        exp_dir_path = str(input_project)
 
     runs_dir = stage_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     mode = config.experiment.mode
+
+    from researchclaw.pipeline.experiment_protocol import load_protocol
+    protocol = load_protocol(run_dir)
+    if protocol is not None:
+        from researchclaw.experiment.protocol_runner import run_matrix
+        if not exp_dir_path:
+            return StageResult(stage=Stage.EXPERIMENT_RUN, status=StageStatus.FAILED,
+                               artifacts=(), error="Frozen matrix requires an experiment project")
+        budget = run_matrix(run_dir, Path(exp_dir_path), config.experiment)
+        if budget["status"] == "complete":
+            from researchclaw.pipeline.evidence_store import EvidenceStore
+            store = EvidenceStore.from_dict(json.loads((run_dir / "evidence_store.json").read_text(encoding="utf-8")))
+            metrics = {f"{r.key.method}/{r.key.dataset}/{r.key.regime}/{r.key.seed}/{r.key.metric}": r.value
+                       for r in store.records.values()}
+            (runs_dir / "run-001.json").write_text(json.dumps({
+                "status": "completed", "metrics": metrics, "source": "host_independent_evaluation",
+                "evidence_version": store.version, "elapsed_sec": budget["used_seconds"],
+            }, indent=2), encoding="utf-8")
+        (stage_dir / "protocol_execution_summary.json").write_text(
+            json.dumps(budget, indent=2), encoding="utf-8")
+        return StageResult(stage=Stage.EXPERIMENT_RUN,
+                           status=StageStatus.DONE if budget["status"] == "complete" else StageStatus.FAILED,
+                           artifacts=("protocol_execution_summary.json",),
+                           decision="frozen_matrix_complete" if budget["status"] == "complete" else "experiment_matrix_incomplete",
+                           error=None if budget["status"] == "complete" else "Frozen matrix incomplete; inspect protocol_budget.json")
 
     # ── ColliderAgent physics mode ─────────────────────────────────────
     if mode == "collider_agent":
@@ -658,6 +689,16 @@ def _execute_iterative_refine(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     from researchclaw.experiment.factory import create_sandbox
+
+    from researchclaw.pipeline.experiment_protocol import load_protocol
+    if load_protocol(run_dir) is not None:
+        # Do not expose test metrics to an edit/evaluate loop after configuration freeze.
+        (stage_dir / "refinement_log.json").write_text(json.dumps({
+            "status": "frozen_test_protocol", "iterations": [],
+            "reason": "Post-test model selection is disabled; source changes require a new run",
+        }, indent=2), encoding="utf-8")
+        return StageResult(stage=Stage.ITERATIVE_REFINE, status=StageStatus.DONE,
+                           artifacts=("refinement_log.json",), decision="frozen_test_protocol")
 
     def _to_float(value: Any) -> float | None:
         try:

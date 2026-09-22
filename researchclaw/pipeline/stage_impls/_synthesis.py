@@ -44,6 +44,9 @@ def _execute_synthesis(
         for path in sorted(Path(cards_path).glob("*.md"))[:24]:
             snippets.append(path.read_text(encoding="utf-8"))
         cards_context = "\n\n".join(snippets)
+    from researchclaw.literature.evidence import evidence_context
+    if (run_dir / "literature_evidence.json").is_file():
+        cards_context = evidence_context(run_dir)
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -101,6 +104,8 @@ def _execute_hypothesis_gen(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     synthesis = _read_prior_artifact(run_dir, "synthesis.md") or ""
+    from researchclaw.literature.evidence import evidence_context
+    synthesis += evidence_context(run_dir)
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -250,13 +255,21 @@ def _execute_hypothesis_gen(
         )
         novelty_artifacts = ("novelty_report.json",)
         logger.info(
-            "Novelty check: score=%.3f  assessment=%s  recommendation=%s",
+            "Novelty check: score=%s  assessment=%s  recommendation=%s",
             novelty_report["novelty_score"],
             novelty_report["assessment"],
             novelty_report["recommendation"],
         )
     except Exception:  # noqa: BLE001
         logger.warning("Novelty check failed (non-blocking)", exc_info=True)
+
+    if (run_dir / "literature_evidence.json").is_file():
+        from researchclaw.literature.positioning import build_novelty_matrix
+        from researchclaw.research_inputs import contract_for_config
+        contract = contract_for_config(config, run_dir)
+        ideas = list(contract["brief"]["ideas"]) if contract is not None else [hypotheses_md]
+        build_novelty_matrix(run_dir, ideas, reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+                             max_calls=config.literature_search.evidence_max_calls)
 
     return StageResult(
         stage=Stage.HYPOTHESIS_GEN,

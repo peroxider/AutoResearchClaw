@@ -170,6 +170,10 @@ def _execute_experiment_design(
         config, run_dir, include_goal=True, include_hypotheses=True
     )
     plan: dict[str, Any] | None = None
+    from researchclaw.research_inputs import contract_for_config
+    from researchclaw.pipeline.experiment_protocol import load_protocol, apply_protocol_to_plan
+    _input_contract = contract_for_config(config, run_dir)
+    _protocol = load_protocol(run_dir, _input_contract)
 
     # ── Domain detection ──────────────────────────────────────────────────
     # Detect the research domain early so we can adapt experiment design
@@ -445,6 +449,8 @@ def _execute_experiment_design(
     # _normalize_plan_field so the guard accepts every shape the rest of
     # this file already supports (str, dict, list[str], list[dict]).
     _required_any = ("baselines", "proposed_methods", "ablations")
+    if _protocol is not None:
+        apply_protocol_to_plan(plan, _protocol)
     _normalized = {k: _normalize_plan_field(plan.get(k)) for k in _required_any}
     if not any(_normalized.values()):
         (stage_dir / "plan_meta.json").write_text(
@@ -503,6 +509,7 @@ def _execute_experiment_design(
         )
     if (
         _ba_domain_ok
+        and _input_contract is None
         and config.experiment.benchmark_agent.enabled
         and config.experiment.mode in ("sandbox", "docker")
         and llm is not None
@@ -586,6 +593,11 @@ def _execute_experiment_design(
             pass
 
     plan.setdefault("topic", config.research.topic)
+    if _input_contract is not None:
+        plan["datasets"] = [d["manifest"]["dataset"] for d in _input_contract["datasets"]]
+        plan["data_contract_version"] = _input_contract["version"]
+        plan["dataset_metrics"] = {d["manifest"]["dataset"]: d["manifest"]["metric"]
+                                   for d in _input_contract["datasets"]}
 
     # BUG-R41-09: Enforce condition count limit based on time budget.
     # Too many conditions (30+) guarantee timeouts and wasted compute.
@@ -603,7 +615,7 @@ def _execute_experiment_design(
     _ablations = _normalize_plan_field(plan.get("ablations", []))
     _total = len(_baselines) + len(_proposed) + len(_ablations)
 
-    if _total > _max_conditions:
+    if _total > _max_conditions and _protocol is None:
         logger.warning(
             "Stage 9: Plan has %d conditions (limit %d for %ds budget). "
             "Trimming to fit.",
@@ -692,6 +704,14 @@ def _execute_experiment_design(
             json.dumps(frozen_contract, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
+    if _input_contract is not None:
+        # Reapply after HITL rewrites as well as automatic plan generation.
+        plan["datasets"] = [d["manifest"]["dataset"] for d in _input_contract["datasets"]]
+        plan["data_contract_version"] = _input_contract["version"]
+        plan["dataset_metrics"] = {d["manifest"]["dataset"]: d["manifest"]["metric"]
+                                   for d in _input_contract["datasets"]}
+    if _protocol is not None:
+        apply_protocol_to_plan(plan, _protocol)
     (stage_dir / "exp_plan.yaml").write_text(
         yaml.dump(plan, default_flow_style=False, allow_unicode=True),
         encoding="utf-8",

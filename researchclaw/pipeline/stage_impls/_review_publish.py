@@ -277,6 +277,24 @@ def _execute_peer_review(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    if (run_dir / "manuscript_ir.json").is_file():
+        from researchclaw.pipeline.manuscript import review_manuscript
+        from researchclaw.literature.evidence import write_json
+        from researchclaw.llm import build_reviewer_llm
+        try:
+            result = review_manuscript(run_dir,
+                reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+                max_calls=config.research.manuscript_max_calls)
+            write_json(stage_dir / "manuscript_peer_review.json", result)
+            lines = ["# Full manuscript peer review", f"Manuscript: {result['ir_version']}", result["independence"]]
+            for section in result["sections"]:
+                lines.extend(["## " + section["id"], *section["issues"],
+                              json.dumps(section["quality_review"]["verdict"], ensure_ascii=False)])
+            (stage_dir / "reviews.md").write_text("\n\n".join(lines), encoding="utf-8")
+            return StageResult(stage=Stage.PEER_REVIEW, status=StageStatus.DONE,
+                               artifacts=("reviews.md", "manuscript_peer_review.json"), decision=result["status"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return StageResult(stage=Stage.PEER_REVIEW, status=StageStatus.PAUSED, artifacts=(), error=str(exc))
     draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
     experiment_evidence = _collect_experiment_evidence(run_dir)
 
@@ -381,6 +399,10 @@ def _execute_paper_revision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    if (run_dir / "manuscript_ir.json").is_file():
+        from researchclaw.pipeline.manuscript import execute_writing_stage
+        return execute_writing_stage(stage_dir, run_dir, config, llm=llm, revision=True,
+                                     feedback=_read_prior_artifact(run_dir, "reviews.md") or "")
     draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
     reviews = _read_prior_artifact(run_dir, "reviews.md") or ""
     draft_word_count = len(draft.split())
@@ -563,6 +585,23 @@ def _execute_quality_gate(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    if (run_dir / "manuscript_ir.json").is_file():
+        from researchclaw.pipeline.manuscript import quality_report, render_manuscript
+        from researchclaw.literature.evidence import write_json
+        report = quality_report(run_dir, config.research.quality_threshold)
+        if report["verdict"] == "proceed":
+            ir = json.loads((run_dir / "manuscript_ir.json").read_text(encoding="utf-8"))
+            expected, _ = render_manuscript(run_dir, ir)
+            actual = (_read_prior_artifact(run_dir, "paper_revised.md")
+                      or _read_prior_artifact(run_dir, "paper_draft.md") or "")
+            if actual != expected["paper_final.md"]:
+                report["verdict"] = "reject"
+                report["weaknesses"].append("Reviewed text differs from ManuscriptIR")
+        write_json(stage_dir / "quality_report.json", report)
+        return StageResult(stage=Stage.QUALITY_GATE,
+            status=StageStatus.DONE if report["verdict"] == "proceed" else StageStatus.FAILED,
+            artifacts=("quality_report.json",), decision=report["verdict"],
+            error="; ".join(report["weaknesses"]))
     # Do not use the generic reverse-glob helper for resumed medical runs.
     # It can select a paper from an earlier Stage 19 version.
     _medical_profile = config.project.profile == "medical_llm_audit"
@@ -741,6 +780,8 @@ def _execute_quality_gate(
             score = float(score)
         except (TypeError, ValueError):
             score = 0
+    if isinstance(score, bool) or not math.isfinite(score):
+        score = 0
     verdict = report.get("verdict", "proceed")
     threshold = config.research.quality_threshold or 5.0
 
@@ -821,7 +862,8 @@ def _execute_quality_gate(
     )
 
     if isinstance(score, (int, float)) and score < threshold:
-        if config.research.graceful_degradation:
+        if (config.research.graceful_degradation
+                and config.research.target_status == "exploratory"):
             logger.warning(
                 "Quality gate DEGRADED: score %.1f < threshold %.1f — "
                 "continuing with sanitization (graceful_degradation=True)",
@@ -858,6 +900,7 @@ def _execute_quality_gate(
                   f"Paper needs revision before export.",
         )
 
+    (run_dir / "degradation_signal.json").unlink(missing_ok=True)
     logger.info(
         "Quality gate PASSED: score %.1f >= threshold %.1f",
         score, threshold,
@@ -1664,6 +1707,19 @@ def _execute_export_publish(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    if (run_dir / "manuscript_ir.json").is_file():
+        from researchclaw.pipeline.manuscript import export_manuscript
+        try:
+            if config.export.template_path:
+                from researchclaw.templates.bundle import freeze_template
+                freeze_template(run_dir, Path(config.export.template_path), authors=config.export.authors)
+            exported = export_manuscript(run_dir, stage_dir)
+            (stage_dir / "references.bib").write_text(
+                _read_prior_artifact(run_dir, "references.bib") or "", encoding="utf-8")
+            return StageResult(stage=Stage.EXPORT_PUBLISH, status=StageStatus.DONE,
+                artifacts=("paper_final.md", "paper.tex", "references.bib", "numeric_claims.json", "manuscript_bindings.json", *exported["auxiliary_hashes"]))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return StageResult(stage=Stage.EXPORT_PUBLISH, status=StageStatus.FAILED, artifacts=(), error=str(exc))
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
 
     # --- Detect domain once for export-stage formatting decisions ---
@@ -2933,9 +2989,11 @@ def _execute_citation_verify(
                 "suspicious": 0,
                 "hallucinated": 0,
                 "skipped": 0,
-                "integrity_score": 1.0,
+                "integrity_score": None,
             },
             "results": [],
+            "status": "missing",
+            "claim_support_status": "unavailable",
             "note": "No references.bib found — nothing to verify.",
         }
         (stage_dir / "verification_report.json").write_text(
@@ -2952,7 +3010,8 @@ def _execute_citation_verify(
             )
         return StageResult(
             stage=Stage.CITATION_VERIFY,
-            status=StageStatus.DONE,
+            status=(StageStatus.DONE if config.research.target_status == "exploratory"
+                    else StageStatus.FAILED),
             artifacts=("verification_report.json", "references_verified.bib"),
             evidence_refs=(
                 "stage-23/verification_report.json",
@@ -2970,14 +3029,16 @@ def _execute_citation_verify(
         _n_entries,
     )
     report = verify_citations(bib_text, s2_api_key=s2_api_key)
+    integrity_display = (f"{report.integrity_score:.1%}"
+                         if report.integrity_score is not None else "unavailable")
     logger.info(
         "[citation-verify] Done: %d verified, %d suspicious, "
-        "%d hallucinated, %d skipped (integrity: %.0f%%)",
+        "%d hallucinated, %d skipped (integrity: %s)",
         report.verified,
         report.suspicious,
         report.hallucinated,
         report.skipped,
-        report.integrity_score * 100,
+        integrity_display,
     )
 
     # --- Relevance check: assess topical relevance of verified citations ---
@@ -2992,7 +3053,7 @@ def _execute_citation_verify(
 
     # FIX-5: Filter low-relevance citations and enforce hard cap
     RELEVANCE_THRESHOLD = 0.5
-    MAX_CITATIONS = 60
+    MAX_CITATIONS = config.export.max_citations
     low_relevance_keys: set[str] = set()
     for cr in report.results:
         if cr.relevance_score is not None and cr.relevance_score < RELEVANCE_THRESHOLD:
@@ -3008,7 +3069,7 @@ def _execute_citation_verify(
         if cr.cite_key not in low_relevance_keys
         and cr.status != VerifyStatus.HALLUCINATED
     ]
-    if len(remaining) > MAX_CITATIONS:
+    if MAX_CITATIONS is not None and len(remaining) > MAX_CITATIONS:
         remaining.sort(
             key=lambda c: c.relevance_score if c.relevance_score is not None else _DEFAULT_RELEVANCE,
         )
@@ -3022,15 +3083,27 @@ def _execute_citation_verify(
 
     if low_relevance_keys:
         logger.info(
-            "Stage 23: Filtering %d low-relevance citations (threshold=%.1f, cap=%d): %s",
+            "Stage 23: Filtering %d low-relevance citations (threshold=%.1f, cap=%s): %s",
             len(low_relevance_keys),
             RELEVANCE_THRESHOLD,
             MAX_CITATIONS,
             ", ".join(sorted(list(low_relevance_keys)[:20])),
         )
 
+    report_data = report.to_dict()
+    report_data["status"] = (
+        "contradicted" if report.hallucinated else
+        "verified" if report.total > 0 and report.verified == report.total else
+        "unavailable"
+    )
+    # Metadata verification does not establish that a paper supports a claim.
+    report_data["claim_support_status"] = "unavailable"
+    report_data["removed_citation_keys"] = sorted(low_relevance_keys | {
+        cr.cite_key for cr in report.results if cr.status == VerifyStatus.HALLUCINATED
+    })
+    report_data["requires_claim_review"] = bool(report_data["removed_citation_keys"])
     (stage_dir / "verification_report.json").write_text(
-        json.dumps(report.to_dict(), indent=2), encoding="utf-8"
+        json.dumps(report_data, indent=2), encoding="utf-8"
     )
 
     verified_bib = filter_verified_bibtex(bib_text, report, include_suspicious=True)
@@ -3048,7 +3121,11 @@ def _execute_citation_verify(
             "Keeping original bib to avoid breaking references.",
             original_count, verified_count,
         )
-        verified_bib = bib_text
+        # Preserve unresolved entries, but never resurrect known hallucinations.
+        verified_bib = _remove_bibtex_entries(bib_text, {
+            cr.cite_key for cr in report.results
+            if cr.status == VerifyStatus.HALLUCINATED
+        } | low_relevance_keys)
 
     # IMP-1: Also prune uncited entries from verified bib
     # BUG-182: Also scan LaTeX paper.tex (not just Markdown) for \cite{} keys.
@@ -3101,23 +3178,52 @@ def _execute_citation_verify(
         # Remove \cite{} and [cite_key] references for low-relevance entries
         if low_relevance_keys:
             annotated = _remove_citations_from_text(annotated, low_relevance_keys)
+        if (run_dir / "manuscript_ir.json").is_file():
+            # Unsupported references are repair issues; changing scientific claims
+            # outside the shared source would invalidate every section review.
+            annotated = paper_text
         (stage_dir / "paper_final_verified.md").write_text(annotated, encoding="utf-8")
         artifacts.append("paper_final_verified.md")
 
+    if (run_dir / "literature_evidence.json").is_file():
+        from researchclaw.literature.evidence import build_citation_support
+        from researchclaw.llm import build_reviewer_llm
+        try:
+            support = build_citation_support(run_dir,
+                reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+                max_calls=config.literature_search.citation_support_max_calls,
+                manuscript_paths={"paper_final.md": stage_dir / "paper_final_verified.md",
+                                  "paper.tex": run_dir / "stage-22" / "paper.tex"})
+            report_data["claim_support_status"] = support["status"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # A stale successful support report must not survive a failed rerun.
+            (run_dir / "citation_support.json").write_text("{}", encoding="utf-8")
+            report_data["claim_support_status"] = "unavailable"
+            report_data["claim_support_error"] = str(exc)
+        (stage_dir / "verification_report.json").write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+
     logger.info(
         "Stage 23 citation verify: %d total, %d verified, %d suspicious, "
-        "%d hallucinated, %d skipped (integrity=%.1f%%)",
+        "%d hallucinated, %d skipped (integrity=%s)",
         report.total,
         report.verified,
         report.suspicious,
         report.hallucinated,
         report.skipped,
-        report.integrity_score * 100,
+        integrity_display,
     )
 
     return StageResult(
         stage=Stage.CITATION_VERIFY,
-        status=StageStatus.DONE,
+        status=(StageStatus.DONE if config.research.target_status == "exploratory"
+                or (report_data["status"] == "verified" and (
+                    not (run_dir / "literature_evidence.json").is_file()
+                    or report_data["claim_support_status"] == "verified")) else StageStatus.FAILED),
         artifacts=tuple(artifacts),
         evidence_refs=tuple(f"stage-23/{a}" for a in artifacts),
+        error=("Citation metadata or claim support verification incomplete"
+               if config.research.target_status != "exploratory"
+               and (report_data["status"] != "verified" or (
+                   (run_dir / "literature_evidence.json").is_file()
+                   and report_data["claim_support_status"] != "verified")) else ""),
     )

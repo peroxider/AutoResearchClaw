@@ -40,6 +40,86 @@ def _execute_result_analysis(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    # An optional frozen evaluation contract permits host-side recomputation.
+    # Missing contracts remain legacy/exploratory evidence at final acceptance.
+    evaluation_manifest = run_dir / "trusted_evaluation.json"
+    if evaluation_manifest.is_file():
+        from researchclaw.pipeline.independent_evaluator import evaluate_manifest
+        try:
+            evidence = evaluate_manifest(run_dir, json.loads(evaluation_manifest.read_text(encoding="utf-8")))
+            (run_dir / "evidence_store.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+            from researchclaw.pipeline.evidence_store import EvidenceStore
+            store = EvidenceStore.from_dict(evidence)
+            for suffix, latex in (("md", False), ("tex", True)):
+                (stage_dir / f"evidence_results.{suffix}").write_text(
+                    store.render_table(list(store.records), run_dir, latex=latex), encoding="utf-8"
+                )
+            evaluation_report = {"status": "verified", "evidence_version": evidence["version"]}
+        except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+            # Invalidate any old store: failed reruns must not inherit success.
+            (run_dir / "evidence_store.json").write_text("{}", encoding="utf-8")
+            evaluation_report = {"status": "failed", "reason": str(exc)}
+        (stage_dir / "independent_evaluation.json").write_text(
+            json.dumps(evaluation_report, indent=2), encoding="utf-8"
+        )
+        if evaluation_report["status"] == "failed" and config.research.target_status != "exploratory":
+            return StageResult(stage=Stage.RESULT_ANALYSIS, status=StageStatus.FAILED,
+                               artifacts=("independent_evaluation.json",),
+                               error="Independent evaluation failed: " + evaluation_report["reason"])
+    # Coverage is recomputed, including when no prediction manifest was supplied.
+    from researchclaw.pipeline.experiment_protocol import load_protocol, audit_coverage
+    protocol = load_protocol(run_dir)
+    if protocol is not None:
+        from researchclaw.pipeline.evidence_store import EvidenceStore
+        try:
+            store = EvidenceStore.from_dict(json.loads(
+                (run_dir / "evidence_store.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, KeyError):
+            store = EvidenceStore()
+        coverage = audit_coverage(run_dir, protocol, store)
+        (run_dir / "experiment_coverage.json").write_text(
+            json.dumps(coverage, indent=2), encoding="utf-8")
+        if coverage["status"] != "complete" and config.research.target_status != "exploratory":
+            return StageResult(stage=Stage.RESULT_ANALYSIS, status=StageStatus.FAILED,
+                               artifacts=(), error="Required experiment matrix is incomplete; see experiment_coverage.json",
+                               decision="experiment_matrix_incomplete")
+    if (run_dir / "literature_evidence.json").is_file():
+        from researchclaw.literature.positioning import contribution_ledger
+        # Missing/stale positioning must not silently inherit a previous contribution ledger.
+        try:
+            contribution_ledger(run_dir)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            (run_dir / "contribution_ledger.json").write_text(json.dumps({
+                "status": "unavailable", "reason": str(exc), "entries": [],
+            }, indent=2), encoding="utf-8")
+    if protocol is not None:
+        # A frozen study must not acquire unplanned tests or FigureAgent plots
+        # from the legacy free-form metric summaries below. Interpretation is
+        # performed later by the bounded ManuscriptIR writing/review tasks.
+        from researchclaw.pipeline.analysis_spec import prepare_analysis
+        from researchclaw.pipeline.publication_assets import prepare_assets
+        from researchclaw.literature.evidence import write_json
+        try:
+            analysis_spec = prepare_analysis(run_dir)
+            assets = prepare_assets(run_dir)
+            write_json(stage_dir / "analysis_spec.json", analysis_spec)
+            write_json(stage_dir / "experiment_summary.json", {
+                "schema_version": 1, "metrics_source": "independent_evidence_store",
+                "analysis_spec_version": analysis_spec["version"], "protocol_coverage": coverage,
+                "analyses": analysis_spec["analyses"], "publication_assets_version": assets["version"],
+            })
+            lines = ["# Frozen protocol analysis", "", analysis_spec["scope"], ""]
+            for item in analysis_spec["analyses"]:
+                lines.extend(["## " + item["question"] + " / " + item["dataset"], "",
+                              "```json", json.dumps(item, ensure_ascii=False, indent=2), "```", ""])
+            (stage_dir / "analysis.md").write_text("\n".join(lines), encoding="utf-8")
+            artifacts = ("analysis.md", "experiment_summary.json", "analysis_spec.json")
+            return StageResult(stage=Stage.RESULT_ANALYSIS, status=StageStatus.DONE, artifacts=artifacts,
+                               evidence_refs=tuple(f"stage-14/{name}" for name in artifacts))
+        except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+            write_json(stage_dir / "analysis_failure.json", {"status": "failed", "reason": str(exc)})
+            return StageResult(stage=Stage.RESULT_ANALYSIS, status=StageStatus.FAILED,
+                               artifacts=("analysis_failure.json",), error="Frozen analysis failed: " + str(exc))
     # Contract-template studies emit nested condition metrics in Stage 12.
     # Persist an explicit provenance registry before any LLM analysis/writing.
     if config.project.profile == "medical_llm_audit":
@@ -259,7 +339,9 @@ def _execute_result_analysis(
     for _mk, _mv in _best_metrics.items():
         parts = _mk.split("/")
         if len(parts) >= 2:
-            cond = parts[0]
+            cond = "/".join(parts[:-1])
+            if len(parts) >= 3 and parts[-2].removeprefix("seed_").removeprefix("seed").isdigit():
+                continue
             metric_name = parts[-1]
             if cond not in _condition_summaries:
                 _condition_summaries[cond] = {"metrics": {}}
@@ -276,7 +358,9 @@ def _execute_result_analysis(
         for _mk, _mv in _ms.items():
             parts = _mk.split("/")
             if len(parts) >= 2:
-                cond = parts[0]
+                cond = "/".join(parts[:-1])
+                if len(parts) >= 3 and parts[-2].removeprefix("seed_").removeprefix("seed").isdigit():
+                    continue
                 metric_name = parts[-1]
                 if cond not in _condition_summaries:
                     _condition_summaries[cond] = {"metrics": {}}
@@ -315,7 +399,7 @@ def _execute_result_analysis(
     if not _condition_summaries and _best_metrics:
         _default_metrics: dict[str, float] = {}
         for _mk, _mv in _best_metrics.items():
-            if isinstance(_mv, (int, float)):
+            if isinstance(_mv, (int, float)) and "/" not in _mk:
                 _default_metrics[_mk.split("/")[-1]] = float(_mv)
         if _default_metrics:
             _condition_summaries["default_condition"] = {
@@ -326,129 +410,24 @@ def _execute_result_analysis(
                          "to avoid cond_count=0 correctness penalty.",
             }
 
-    # R33: Build per-seed data structure (needed for CIs and paired tests below)
-    _seed_data: dict[str, dict[int, float]] = {}  # {condition: {seed: value}}
-    for _mk, _mv in _best_metrics.items():
-        parts = _mk.split("/")
-        # Pattern: condition/regime/seed_id/primary_metric
-        if len(parts) >= 4 and parts[-1] == config.experiment.metric_key:
-            cond = parts[0]
-            try:
-                seed_id = int(parts[2])
-                val = float(_mv)
-                _seed_data.setdefault(cond, {})[seed_id] = val
-            except (ValueError, TypeError):
-                pass
-
-    # Enrich condition summaries with seed counts, success rates, and CIs
-    for _ck, _cv in _condition_summaries.items():
-        # Look for success_rate in metrics
-        sr_key = f"{_ck}/success_rate"
-        if sr_key in _best_metrics:
-            try:
-                _cv["success_rate"] = float(_best_metrics[sr_key])
-            except (ValueError, TypeError):
-                pass
-        # Count seed-level entries to estimate n_seeds
-        _seed_count = 0
-        for _mk in _best_metrics:
-            if _mk.startswith(f"{_ck}/") and "seed" in _mk.lower():
-                _seed_count += 1
-        if _seed_count > 0:
-            _cv["n_seed_metrics"] = _seed_count
-
-        # R33: Compute mean ± std and bootstrap 95% CI from per-seed data
-        if _ck in _seed_data and len(_seed_data[_ck]) >= 3:
-            _vals = list(_seed_data[_ck].values())
-            import statistics as _stats_mod
-            _mean = _stats_mod.mean(_vals)
-            _std = _stats_mod.stdev(_vals)
-            _cv["metrics"][f"{config.experiment.metric_key}_mean"] = round(_mean, 6)
-            _cv["metrics"][f"{config.experiment.metric_key}_std"] = round(_std, 6)
-            _cv["n_seeds"] = len(_vals)
-            # Bootstrap 95% CI (use local RNG to avoid corrupting global state)
-            import random as _rng_mod
-            _rng_local = _rng_mod.Random(42)
-            _boot_means = []
-            for _ in range(1000):
-                _sample = [_rng_local.choice(_vals) for _ in range(len(_vals))]
-                _boot_means.append(_stats_mod.mean(_sample))
-            _boot_means.sort()
-            _ci_low = round(_boot_means[int(0.025 * len(_boot_means))], 6)
-            _ci_high = round(_boot_means[int(0.975 * len(_boot_means))], 6)
-            # IMP-16: Sanity check — CI must contain the mean
-            if _ci_low > _mean or _ci_high < _mean:
-                logger.warning(
-                    "Bootstrap CI [%.4f, %.4f] does not contain mean %.4f "
-                    "for condition %s — replacing CI with mean ± 1.96*SE",
-                    _ci_low, _ci_high, _mean, _ck,
-                )
-                _se = _std / (len(_vals) ** 0.5)
-                _ci_low = round(_mean - 1.96 * _se, 6)
-                _ci_high = round(_mean + 1.96 * _se, 6)
-            _cv["ci95_low"] = _ci_low
-            _cv["ci95_high"] = _ci_high
-
-    # Count totals
-    _total_conditions = len(_condition_summaries) if _condition_summaries else None
-    _total_metrics = len(_best_metrics) if _best_metrics else None
-
-    # --- R33: Pipeline-level paired computation as fallback ---
-    # If the experiment code's PAIRED lines are sparse or suspicious (e.g.,
-    # all identical t-stats), compute fresh paired tests from per-seed data.
-    # (_seed_data was built above before condition summary enrichment)
-    if len(_seed_data) >= 2:
-        # Find common seeds across conditions
-        _all_seeds_sets = [set(v.keys()) for v in _seed_data.values()]
-        _common_seeds = set.intersection(*_all_seeds_sets) if _all_seeds_sets else set()
-
-        if len(_common_seeds) >= 3:
-            _cond_names_sorted = sorted(_seed_data.keys())
-            _pipeline_paired: list[dict[str, object]] = []
-            # Compare each condition against the first baseline (alphabetically)
-            _baseline_cond = _cond_names_sorted[0]
-            for _other_cond in _cond_names_sorted[1:]:
-                _diffs = []
-                for _sid in sorted(_common_seeds):
-                    _diffs.append(
-                        _seed_data[_other_cond][_sid] - _seed_data[_baseline_cond][_sid]
-                    )
-                if _diffs:
-                    import statistics
-                    _n = len(_diffs)
-                    _mean_d = statistics.mean(_diffs)
-                    _std_d = statistics.stdev(_diffs) if _n > 1 else 0.0
-                    _t = (_mean_d / (_std_d / (_n ** 0.5))) if _std_d > 0 else 0.0
-                    _df = _n - 1
-                    # Two-tailed p-value using t-distribution
-                    import math
-                    try:
-                        from scipy.stats import t as _t_dist
-                        _p = float(2 * _t_dist.sf(abs(_t), _df))
-                    except ImportError:
-                        _p = 2 * (1 - 0.5 * (1 + math.erf(abs(_t) / (2 ** 0.5))))
-                        if _df < 30:
-                            _p = min(1.0, _p * (1 + 2.5 / max(_df, 1)))
-                    _pipeline_paired.append({
-                        "method": _other_cond,
-                        "baseline": _baseline_cond,
-                        "mean_diff": round(_mean_d, 6),
-                        "std_diff": round(_std_d, 6),
-                        "t_stat": round(_t, 4),
-                        "p_value": round(_p, 6),
-                        "n_seeds": _n,
-                        "source": "pipeline_computed",
-                    })
-
-            # Use pipeline-computed if experiment code's are suspicious
-            _exp_t_stats = {round(p.get("t_stat", 0), 4) for p in _all_paired}
-            _all_identical = len(_exp_t_stats) <= 1 and len(_all_paired) > 1
-            if _pipeline_paired and (_all_identical or len(_all_paired) < len(_pipeline_paired)):
-                logger.info(
-                    "R33: Using %d pipeline-computed paired tests (experiment code had %d, identical=%s)",
-                    len(_pipeline_paired), len(_all_paired), _all_identical,
-                )
-                _all_paired = _pipeline_paired
+    # Preserve every stratum and compare only against a declared baseline.
+    from researchclaw.pipeline.statistical_evidence import (
+        seed_groups, summarize_seeds, paired_comparisons,
+    )
+    _seed_data = seed_groups(_best_metrics, config.experiment.metric_key)
+    for _ck, _seeds in _seed_data.items():
+        _stats = summarize_seeds(_seeds)
+        _cv = _condition_summaries.setdefault(_ck, {"metrics": {}})
+        _cv["metrics"][config.experiment.metric_key] = _stats["mean"]
+        _cv["metrics"][f"{config.experiment.metric_key}_mean"] = _stats["mean"]
+        if _stats["std"] is not None:
+            _cv["metrics"][f"{config.experiment.metric_key}_std"] = _stats["std"]
+        _cv.update({k: v for k, v in _stats.items() if k not in ("mean", "std")})
+    _total_conditions = len(_condition_summaries) or None
+    _total_metrics = len(_best_metrics) or None
+    # Experiment-produced tests remain raw records, not trusted inference.
+    _reported_paired = _all_paired
+    _all_paired = paired_comparisons(_seed_data, config.experiment.comparison_baseline)
 
     # --- P8: Detect identical conditions (broken ablations) ---
     _ablation_warnings: list[str] = []
@@ -478,10 +457,10 @@ def _execute_result_analysis(
                         break
                 if _all_equal and _shared_keys:
                     _warn = (
-                        f"ABLATION FAILURE: Conditions '{_c1}' and '{_c2}' produce "
+                        f"ABLATION OBSERVATION: Conditions '{_c1}' and '{_c2}' produce "
                         f"identical outputs across all {len(_shared_keys)} metrics. "
-                        f"The ablation is invalid — the differentiating parameter "
-                        f"is likely not used in the code."
+                        f"This may be a valid null result. Inspect component execution traces "
+                        f"before diagnosing an implementation defect."
                     )
                     _ablation_warnings.append(_warn)
                     logger.warning("P8: %s", _warn)
@@ -504,7 +483,7 @@ def _execute_result_analysis(
                         _warn = (
                             f"ABLATION WARNING: Conditions '{_c1}' and '{_c2}' produce "
                             f"near-identical outputs (<1% relative difference) across "
-                            f"all {len(_shared_keys)} metrics. The ablation may be trivial."
+                            f"all {len(_shared_keys)} metrics. Report the weak effect and verify component execution traces."
                         )
                         _ablation_warnings.append(_warn)
                         logger.warning("P8: %s", _warn)
@@ -516,7 +495,7 @@ def _execute_result_analysis(
         if 0 < _n_seeds < 3:
             _warn = (
                 f"SEED_INSUFFICIENCY: Condition '{_sc_name}' has only "
-                f"{_n_seeds} seed(s) (minimum 3 required for statistical validity)"
+                f"{_n_seeds} seed(s) (too few for the configured bootstrap summary; seeds quantify training randomness only)"
             )
             _seed_insufficiency_warnings.append(_warn)
             logger.warning("B: %s", _warn)
@@ -553,13 +532,17 @@ def _execute_result_analysis(
             _zv_warn = (
                 f"ZERO VARIANCE: All {len(_primary_vals)} conditions have "
                 f"identical primary_metric ({_primary_vals[0]}). "
-                f"Experiment condition wiring is likely broken."
+                f"A null result alone does not establish a wiring defect."
             )
             _ablation_warnings.append(_zv_warn)
             logger.warning("R13-1: %s", _zv_warn)
 
     if _ablation_warnings:
         summary_payload["ablation_warnings"] = _ablation_warnings
+    summary_payload["comparison_baseline"] = config.experiment.comparison_baseline
+    if protocol is not None:
+        summary_payload["protocol_coverage"] = coverage
+    summary_payload["reported_paired_comparisons"] = _reported_paired
     if _all_paired:
         summary_payload["paired_comparisons"] = _all_paired
     if _condition_summaries:
@@ -604,14 +587,20 @@ def _execute_result_analysis(
             f"```json\n{structured_text}\n```"
         )
 
+    if protocol is not None:
+        data_context += ("\n\n## Independently evaluated protocol coverage and comparisons\n"
+                         "Use these bound comparisons for the declared research questions. "
+                         "Other script-reported metrics are exploratory. Differences are candidate minus baseline; "
+                         "lower is better for mse/mae. Missing cells remain missing.\n"
+                         + json.dumps(coverage, ensure_ascii=False, indent=2))
     # P8: Inject ablation warnings into data context
     if _ablation_warnings:
-        data_context += "\n\nCRITICAL ABLATION WARNINGS:\n"
+        data_context += "\n\nABLATION OBSERVATIONS:\n"
         for _aw in _ablation_warnings:
             data_context += f"- {_aw}\n"
         data_context += (
             "\nYou MUST address these in your analysis. Identical conditions "
-            "mean the ablation design is broken and the comparison is meaningless.\n"
+            "may be valid null results; only implementation or execution evidence can establish a broken ablation.\n"
         )
 
     if llm is not None:
@@ -669,6 +658,10 @@ Generated: {_utcnow_iso()}
     (stage_dir / "analysis.md").write_text(analysis, encoding="utf-8")
 
     artifacts = ["analysis.md", "experiment_summary.json"]
+    if evaluation_manifest.is_file():
+        artifacts.append("independent_evaluation.json")
+        artifacts.extend(f"evidence_results.{suffix}" for suffix in ("md", "tex")
+                         if (stage_dir / f"evidence_results.{suffix}").is_file())
     if (stage_dir / "results_table.tex").exists():
         artifacts.append("results_table.tex")
 
@@ -1123,6 +1116,10 @@ def _agent_requirements_decision(
     else:
         decision = "proceed"
 
+    exhausted = verdict.get("verdict") == "reject" and not rerun_triggered
+    if exhausted and config.research.target_status != "exploratory":
+        decision = "blocked"
+
     decision_md = _format_agent_decision_md(verdict, decision, retry_count, rerun_triggered)
     (stage_dir / "decision.md").write_text(decision_md, encoding="utf-8")
     decision_payload = {
@@ -1148,10 +1145,12 @@ def _agent_requirements_decision(
     )
     return StageResult(
         stage=Stage.RESEARCH_DECISION,
-        status=StageStatus.DONE,
+        status=(StageStatus.PAUSED if decision == "blocked" else StageStatus.DONE),
         artifacts=("decision.md", "decision_structured.json"),
         evidence_refs=("stage-15/decision.md",),
         decision=decision,
+        error=("Required evidence remains missing after retry budget exhaustion"
+               if decision == "blocked" else ""),
     )
 
 
@@ -1249,17 +1248,13 @@ def _execute_research_decision(
             _abl_exp = json.loads(_exp_sum_path.read_text(encoding="utf-8"))
             _abl_warnings = _check_ablation_effectiveness(_abl_exp, threshold=0.02)
             if _abl_warnings:
-                _trivial_count = sum(1 for w in _abl_warnings if "ineffective" in w.lower() or "trivial" in w.lower())
-                _total_abl = max(1, len(_abl_warnings))
-                if _trivial_count / _total_abl > 0.5:
-                    _ablation_refine_hint = (
-                        "\n\n## ABLATION QUALITY ASSESSMENT (CRITICAL)\n"
-                        f"STRONG RECOMMENDATION: Choose REFINE.\n"
-                        f"{_trivial_count}/{_total_abl} ablations show <2% difference from baseline "
-                        f"(trivially similar). This means the ablation design is broken.\n"
-                        "Warnings:\n" + "\n".join(f"- {w}" for w in _abl_warnings) + "\n"
-                    )
-                    logger.warning("C: %d/%d ablations trivial → recommending REFINE", _trivial_count, _total_abl)
+                _ablation_refine_hint = (
+                    "\n\n## ABLATION OBSERVATIONS\n"
+                    "Weak or zero effects are valid findings. Do not REFINE solely "
+                    "to obtain a larger effect. Inspect implementation and execution "
+                    "traces to verify component removal; report uncertainty.\n"
+                    + "\n".join(f"- {w}" for w in _abl_warnings) + "\n"
+                )
         except Exception:  # noqa: BLE001
             pass
 
