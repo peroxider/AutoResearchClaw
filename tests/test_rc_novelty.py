@@ -166,10 +166,10 @@ class TestBuildNoveltyQueries:
 
 
 class TestAssessNovelty:
-    def test_no_similar_papers_is_high(self) -> None:
+    def test_no_similar_papers_is_unknown(self) -> None:
         score, assessment = _assess_novelty([], 0.25)
-        assert score == 1.0
-        assert assessment == "high"
+        assert score is None
+        assert assessment == "unknown"
 
     def test_moderate_similarity(self) -> None:
         papers = [{"similarity": 0.35, "citation_count": 10}]
@@ -218,15 +218,15 @@ class TestCheckNovelty:
 
     @patch("researchclaw.literature.search.search_papers_multi_query")
     def test_basic_flow(self, mock_search: MagicMock) -> None:
-        """Smoke test: no similar papers found → high novelty."""
+        """Smoke test: no similar papers found → unknown novelty."""
         mock_search.return_value = []
         result = check_novelty(
             topic="Novel quantum-inspired optimization",
             hypotheses_text="## H1: Quantum tunneling improves escape from local minima\n",
         )
         assert isinstance(result, dict)
-        assert result["novelty_score"] == 1.0
-        assert result["assessment"] in ("high", "insufficient_data")
+        assert result["novelty_score"] is None
+        assert result["assessment"] == "unknown"
         assert result["recommendation"] in ("proceed", "proceed_with_caution")
         assert result["topic"] == "Novel quantum-inspired optimization"
         assert "generated" in result
@@ -310,6 +310,7 @@ class TestCheckNovelty:
             "recommendation",
             "similarity_threshold",
             "search_coverage",
+            "search_status",
             "total_papers_retrieved",
             "generated",
         }
@@ -416,7 +417,7 @@ class TestHypothesisGenNoveltyIntegration:
         # novelty_report.json should be written (API mocked as returning empty)
         assert (stage_dir / "novelty_report.json").exists()
         report = json.loads((stage_dir / "novelty_report.json").read_text())
-        assert report["novelty_score"] == 1.0  # no similar papers → max novelty
+        assert report["novelty_score"] is None  # no comparison evidence
         assert "novelty_report.json" in result.artifacts
 
     def test_novelty_failure_does_not_block(self, tmp_path: Path) -> None:

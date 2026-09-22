@@ -397,7 +397,7 @@ class TestVerifyCitations:
     def test_empty_bib(self) -> None:
         report = verify_citations("")
         assert report.total == 0
-        assert report.integrity_score == 1.0
+        assert report.integrity_score is None
 
     def test_no_title_entry_skipped(self) -> None:
         bib = textwrap.dedent("""\
@@ -428,7 +428,7 @@ class TestVerificationReport:
         report = VerificationReport(
             total=3, verified=0, suspicious=0, hallucinated=0, skipped=3
         )
-        assert report.integrity_score == 1.0
+        assert report.integrity_score is None
 
     def test_to_dict(self) -> None:
         report = VerificationReport(total=2, verified=1, hallucinated=1)
