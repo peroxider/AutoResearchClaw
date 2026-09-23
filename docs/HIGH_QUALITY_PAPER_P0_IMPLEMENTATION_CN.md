@@ -100,6 +100,16 @@ Stage 14 生成 run 根目录的 `evidence_store.json`，以及 `stage-14/indepe
 
 后续改写任一交付文件会使 seal 失效。修改 TeX、Bib、图像后需要重新编译和重新审核；该验收命令不会自动重新编译。MD/TeX 的核心内容是否语义一致、所有数字是否被 claim 清单覆盖，由绑定完整文件版本的审核负责，不能仅凭数值字符串相同宣称完成一致性证明。
 
+### 运行级资源账本
+
+验收在评估时构建并写出 `resource_ledger.json`：把各冻结产物已记录的调用预算聚合为一份可验证视图。覆盖 `literature_evidence.json`、`citation_support.json`、`manuscript_ir.json`（`review_budget` 与逐节 `attempts` 的 writing_attempts）、`novelty_matrix.json`（仅 `review_calls`）、`stage-18/manuscript_peer_review.json`（顶层 `calls/limit`）、`search_meta.json`（逐查询/提供方账本的 status 与 cache_only 计数）、`method_validation.json`（探针调用）与 `llm_call_ledger.json`（kind `llm_chat`：调用数、失败数与 token 总量经 `validate_call_ledger` 失败关闭重derive）。来源未记录的字段保持 null，绝不推断；来源不可解析时该来源进入 `errors` 而不是被静默跳过。
+
+`llm_call_ledger.json` 由执行管线在打包前写出：每个注册客户端的 `chat` 调用逐条记录服务端报告的实际模型 ID（绝不默认等于请求的显示名称）、实际请求端点（各适配器的真实端点：openai `/chat/completions`，anthropic `/v1/messages`）、适配器、请求参数、token 用量（服务端未报告 usage 块即诚实 null，绝不以 0 冒充）、逐次回退失败链与耗时；链耗尽记为 failed。ACP 代理调用记录代理身份与端点，用量不可观测即诚实 null。账本自带 totals 重derive 与版本哈希校验；注册表只强引用客户端的记录列表而不延长网络客户端/会话生命周期，并以 512 组记录为界，逐出后其调用停止计数，写盘成功才清空记录（写盘失败不丢失），零记录不写文件（不暗示零成本）。
+
+校验按整包重算：存储账本必须与从冻结产物重新构建的结果逐字一致，且版本哈希匹配，否则拒绝。`ledger_issues` 输出两类验收级问题：`unreadable_resource_source:<source>` 与 `budget_exceeded:<source>`（calls 为整数且大于整数 limit）。两者进入 `resources` 维度并使 `research_ok` 失败关闭——超预算或账本不可审计的运行不能宣布 research_complete。
+
+账本属派生数据，被排除在验收输入清单之外，写出它不会移动 `input_version` 或使既有审核绑定失效；seal 的 manifest 显式收录其文件哈希。注意范围：这是流水线能证明的审计下界，不是整个运行的 API 成本账本——这些产物之外的阶段调用不被计数。
+
 ## 5. 回归验证与后续范围
 
 新增测试覆盖方法/数据集/版本/split/metric/seed/config/regime 错配、百分比与百分点、失败运行、原始文件篡改、常量差值、跨 regime 复用 seed、显式基线、独立指标复算、空引用、虚构引用复活、无全局引用上限、预算耗尽 checkpoint、关键实验缺失、未决证明、缺图、占位符以及审核后文件变化。

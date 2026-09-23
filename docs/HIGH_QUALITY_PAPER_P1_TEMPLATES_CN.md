@@ -20,16 +20,23 @@ export:
   "name": "my-journal",
   "entrypoint": "main.tex",
   "engine": "pdflatex",
+  "bibliography_backend": "bibtex",
   "anonymous": true,
   "columns": 2,
   "max_pages": 16,
   "max_main_pages": 10,
+  "max_title_characters": 180,
+  "max_abstract_characters": 2000,
+  "max_figures": 8,
+  "max_tables": 6,
   "appendix_roles": ["theory", "results"],
   "highlights_required": true
 }
 ```
 
-引擎支持 `pdflatex` 和 `xelatex`；需要相应可执行文件已安装。单/双栏可由明确的文档类选项推断，样式包内部决定栏数时应显式声明。页数约束为正整数或 null；匿名和 highlights 字段必须为布尔值。正文页数指附录前的物理 PDF 页，包含出现在该区域的参考文献，不自动推断某个期刊对字数、参考文献和附录的特殊豁免。
+引擎支持 `pdflatex` 和 `xelatex`；书目后端支持 `bibtex` 和显式 `biber`，需要相应可执行文件已安装。单/双栏可由明确的文档类选项推断，样式包内部决定栏数时应显式声明。页数、标题/摘要字符数和图表数量上限为正整数或 null；匿名和 highlights 字段必须为布尔值。正文页数指附录前的物理 PDF 页，包含出现在该区域的参考文献，不自动推断某个期刊对字数、参考文献和附录的特殊豁免。
+
+标题字符上限在生成 TeX 框架前检查；摘要字符数从权威 ManuscriptIR 的 abstract blocks 重算；图和表的数量从最终 `paper.tex` 中的 `figure/figure*`、`table/table*/longtable` 环境重算，普通注释中的伪环境不计数。这些实际值进入 `template_constraints.json`，最终验收和 submission.zip 准备都会复核。字符数是 Unicode code point 数，不等同于任意期刊的自然语言词数；需要词数、彩页、补充材料或参考文献豁免等规则时仍须增加对应的显式检查器。
 
 这些规则来自用户模板包的声明，不把默认值当成已经查证的期刊政策。支持的附录角色是 methods、theory、experiments、results、related_work、discussion；abstract、introduction、conclusion 保留在正文。
 
@@ -51,7 +58,7 @@ export:
 \end{document}
 ```
 
-正文与书目必须位于文档环境内且顺序明确；包声明必须位于前导区。已有 `bibliographystyle` 会被提取并由书目标记统一输出。BibLaTeX/Biber 模板当前明确报不支持，不静默替换为 BibTeX。复杂会议模板若没有标准标题宏，需要使用标记入口；当前不声称能自动转换任意宏语言。
+正文与书目必须位于文档环境内且顺序明确；包声明必须位于前导区。BibTeX 模板已有 `bibliographystyle` 会被提取并由书目标记统一输出。BibLaTeX 模板必须在 `template.json` 显式声明 `bibliography_backend: biber` 并加载 `biblatex`；导入器移除样例 `addbibresource`/`printbibliography`，在前导区统一写入 `\addbibresource{references.bib}`，在正文书目位置写入 `\printbibliography`。声明与源码不一致会拒绝，绝不静默换成 BibTeX。模板可携带 `.bbx/.cbx/.lbx` 资源，其内容摘要、物化副本和编译输入均进入现有校验。复杂会议模板若没有标准标题宏，需要使用标记入口；当前不声称能自动转换任意宏语言。
 
 ## 版本与资源
 
@@ -67,10 +74,10 @@ export:
 
 匿名模式替换作者参数，拒绝入口中残留的已识别身份字段。编译后另检查 PDF author 元数据。正文中的自引、机构、数据集路径或样式宏间接泄漏身份仍属于完整内容审查，不能由作者字段为空推断已完全匿名。模板原始快照仍保存在私有审计目录；新增的 [submission.zip 筛选与匿名审核门禁](HIGH_QUALITY_PAPER_P1_SUBMISSION_CN.md) 避免一并投稿这些快照，完整内容匿名审核仍为独立要求。
 
-`template_constraints.json` 来自实际 PDF：总页数直接读取，附录前页数根据可提取且唯一的 `Appendix` 起始标题定位。标题缺失、重复或无法定位时为未知/失败，不能靠 `.aux` 页码计数器猜测。最终验收再次读取 PDF 并比较约束报告，拒绝过期报告和超限文件。
+`template_constraints.json` 来自实际 PDF、权威 ManuscriptIR 和最终 TeX：总页数直接读取，附录前页数根据可提取且唯一的 `Appendix` 起始标题定位；标题/摘要字符数和图表数量按上述固定规则重算。标题缺失、重复或无法定位时为未知/失败，不能靠 `.aux` 页码计数器猜测。最终验收再次读取全部来源并比较约束报告，拒绝过期报告和超限文件。
 
 ## 验证边界
 
 测试使用真实生成的多页 PDF 检查物理页数、附录定位、重复标题及作者元数据；另覆盖导入、版本失效、特殊入口、双栏资源、数值跨度、highlights 和编译命令。它们验证解析和门禁，不等于真实期刊样式的版面验收。
 
-第十轮已用临时 MiKTeX Portable 运行 pdflatex/xelatex × 单/双栏真实整稿工程样例，并用 Poppler 渲染全部页面检查。通用 DiagramSpec 与矢量后备已接入；图像模型评审路线、生产论文的完整 PDF 内容/视觉审查、专业图表和期刊特有格式要求仍是持续目标的一部分。测试样稿及 fixture 评审不等于科学有效性证明。
+第十轮已用临时 MiKTeX Portable 运行 pdflatex/xelatex × 单/双栏真实整稿工程样例，并用 Poppler 渲染全部页面检查。第三十五轮增加 Biber 路由、统一资源绑定和模板资源校验；当前主机未安装可调用的 Biber/TeX，因此只用可控编译替身验证后端选择、禁止 BibTeX 替换和 `.bbl` 必需产物，尚未完成真实 Biber 整稿编译。通用 DiagramSpec 与矢量后备已接入；图像模型评审路线、生产论文的完整 PDF 内容/视觉审查、专业图表和期刊特有格式要求仍是持续目标的一部分。测试样稿及 fixture 评审不等于科学有效性证明。

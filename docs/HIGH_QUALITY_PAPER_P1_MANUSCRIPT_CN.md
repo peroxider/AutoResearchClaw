@@ -45,10 +45,18 @@ research:
 
 结构化打包复制已完成阶段的准确文件，绕过旧的再生成、自动润色和引用替换步骤。编译器新增 `allow_repairs=False`，用于该路径时不进行 Unicode/BibTeX 清洗或 TeX 自动修复；编译问题需回到源产物修复，不能在已评审稿之外悄悄改字。
 
+### 精确 issue 定向修订
+
+第三十二轮将 Stage 18 的完整逐段审核转换为稳定的结构化 issue ledger。每条 issue 绑定 `ir_version`、section ID、可选 block 索引、检查器、原始理由、repair owner 和该段证据 ID；`issue_id` 由这些字段确定性生成。Stage 19 不再把 `reviews.md` 当作全局自由文本 feedback 触发整稿重写：没有 issue 时保持 ManuscriptIR 版本不变；段落 issue 只允许返回一个替换 block，section contract issue 只展开到该 section 的现有 blocks。未被选中的 section 必须在修订前后保持内容哈希相同。
+
+每个替换 block 仍受原 task evidence 白名单、数字声明禁令和长度/结构规则约束；返回原段落不变会被当作 no-op 拒绝。修改后先重新运行段落 support checker，再重新运行整个 section contract checker。只有审核 trace 可重放且分别得到 `supported` 与通过的 section verdict，issue 才写入 `manuscript_revision.json` 的 closure；作者模型输出中声称“已解决”没有关闭效力。记录钉住修订前历史工件、修订前后 IR 版本、原 peer review 哈希、每个 block 前后哈希、writer/reviewer trace、选中 issue 全覆盖和所有未触及 section 哈希。最终验收会重放这些绑定；未关闭 issue、peer/revision 缺一、重摘要篡改或无审核支持的 closure 都使 quality 失败。
+
+该闭环保证修改范围与审核证据可审计，但同一底层模型充当作者和审核者时仍不等于独立专家评审；报告继续保留 reviewer independence 边界。
+
 ## 验证与边界
 
 测试覆盖全结果导出及精确数值位置、错引用/漏证据、评审矛盾、预算恢复、证据变更后的缓存失效、重新摘要后的文本/证据/标题篡改、八万字符以上长稿尾部评审、单节低分、阶段集成、打包一致性和禁止编译改写。测试中的语义模型是可控假实现，只证明流程和拒绝条件，不能证明实际模型判断准确率。
 
-当前默认导出通用 journal 稿件，也支持 [本地模板导入](HIGH_QUALITY_PAPER_P1_TEMPLATES_CN.md)、附录角色和按需 highlights；复杂模板/Biber 与期刊特有规则仍未全部支持。MethodSpec 公式/算法步骤、TheoryBundle 证明记录及配对结果图见 [出版资产说明](HIGH_QUALITY_PAPER_P1_ASSETS_CN.md)。算法分支/循环和通用 DiagramSpec 已有基础实现，见 [图说明](HIGH_QUALITY_PAPER_P1_DIAGRAMS_CN.md)；专业统计图表、复杂图分页及精确 issue 定向修订仍待开发。
+当前默认导出通用 journal 稿件，也支持 [本地模板导入](HIGH_QUALITY_PAPER_P1_TEMPLATES_CN.md)、附录角色和按需 highlights；复杂模板/Biber 与期刊特有规则仍未全部支持。MethodSpec 公式/算法步骤、TheoryBundle 证明记录及配对结果图见 [出版资产说明](HIGH_QUALITY_PAPER_P1_ASSETS_CN.md)。算法分支/循环和通用 DiagramSpec 已有基础实现，见 [图说明](HIGH_QUALITY_PAPER_P1_DIAGRAMS_CN.md)；方法/结果统计图已有共源实现，复杂图分页仍待开发。
 
 后续已安装临时便携 TeX，完成 pdflatex/xelatex 的单/双栏工程样稿编译、最小投稿包解压重建和整稿页面检查，见 [投稿与编译说明](HIGH_QUALITY_PAPER_P1_SUBMISSION_CN.md)。最终验收继续保留未知/失败的实际稿件排版与图像维度，不将工程 fixture 或文本一致性通过视为完整投稿候选稿。未运行真实付费模型整篇论文生成。

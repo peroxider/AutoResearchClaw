@@ -50,12 +50,25 @@ request schemas. A base URL ending in `/v1` is accepted and normalized.
    (maximum 0.15), and placed below the authoritative semantic layer.
 5. If the API or reference format fails, the pipeline publishes the pure
    deterministic skeleton rather than losing the figure.
-6. The manifest records hashes and explicit semantic locks, but never the key.
+6. The exact API-facing prompt is saved as `framework_diagram_image_prompt.txt`;
+   the manifest binds its hash, every provider attempt, the selected provider
+   and model, the unmodified visual candidate hash, the skeleton hash, and the
+   final image hash. Credentials and exception messages are never persisted.
 
 `strict_academic` deliberately prohibits gradients, shadows, glow, 3D,
 cinematic lighting, cartoons, decorative illustration, and marketing styling.
 Hybrid is the default render mode when the field is omitted. Set
 `render_mode: direct` only when a deliberately generative bitmap is required.
+Direct mode preserves the returned bytes separately as
+`framework_diagram_model_original.png`; the final file and original are both
+hashed in the schema-v2 generation manifest. This provenance does not verify
+that generated labels or arrows match a DiagramSpec, so direct output still
+requires an independent semantic visual review before formal publication.
+The generator immediately reopens this manifest through
+`verify_framework_diagram_artifacts`; final acceptance repeats the same check
+whenever `charts/framework_diagram.png` or its manifest exists. Prompt, model
+original/candidate, skeleton, final image, provider identity, semantic locks,
+and attempt-ledger schema all fail closed on modification.
 
 Use `provider: auto` to try configured GRSAI, OpenAI-compatible, and Gemini
 providers in order. Use `provider: matplotlib` for a fully local run.

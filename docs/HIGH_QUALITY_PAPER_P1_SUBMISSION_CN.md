@@ -4,7 +4,7 @@
 
 ## 投稿 ZIP 的内容
 
-固定包含当前 `paper.tex`、`paper.pdf`、`references.bib`、编译后的 `paper.bbl`，按模板要求添加 `highlights.md`。图表、文档类、样式等从当前已校验的资产/模板中选择，只有被本次 TeX 编译实际读取的本地资源才能进入包；自定义 `.bst` 由已解析的 bibliography style 补入，因为它由 BibTeX 单独读取。
+固定包含当前 `paper.tex`、`paper.pdf`、`references.bib`、编译后的 `paper.bbl`，按模板要求添加 `highlights.md`。图表、文档类、样式等从当前已校验的资产/模板中选择，只有被本次 TeX 编译实际读取的本地资源才能进入包；自定义 `.bst` 由已解析的 bibliography style 补入，因为它由 BibTeX 单独读取。显式 Biber 模板的本地 `.bbx/.cbx/.lbx` 由模板清单与编译 recorder 共同筛选，Biber 生成的 `.bbl` 仍是提交包中的固定书目产物。
 
 编译使用 `-recorder` 生成 `paper.fls`，并把其 SHA-256 绑定到 `compilation.json`。ZIP 不包含 `.fls`、`.aux`、日志、原始模板入口、未使用的模板样例、研究数据和历史快照。安装在外部目录的 TeX 包及字体是运行环境依赖，其机器路径不会进入投稿 ZIP。相对路径越界和未列入当前契约的本地输入会使打包失败。
 
