@@ -2221,6 +2221,99 @@ class TestLiteratureCollectConfiguration:
         assert candidates[0]["paper_id"] == "openalex-W123"
         assert not any(row.get("is_placeholder") for row in candidates)
 
+    def test_search_meta_records_per_query_provider_ledger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        run_dir: Path,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls._literature import (
+            _execute_literature_collect,
+        )
+
+        stage_dir = self._prepare_stage(run_dir, year_min=2019)
+        captured: dict[str, object] = {}
+
+        from researchclaw.literature.models import Paper
+
+        def fake_search(queries: list[str], **kwargs: object) -> list[Paper]:
+            captured.update(kwargs)
+            # Mirror the real search_papers_multi_query contract: outcomes
+            # land in the ledger the stage handed in.
+            ledger = cast(list[dict[str, object]] | None, kwargs.get("ledger"))
+            if ledger is not None:
+                for query in queries:
+                    ledger.append({
+                        "query": query,
+                        "provider": "openalex",
+                        "status": "results_found",
+                        "candidate_count": 1,
+                        "cache_only": False,
+                        "error": "",
+                    })
+            return [
+                Paper(
+                    paper_id="openalex-W123",
+                    title="A Real Literature Search Result",
+                    year=2025,
+                    url="https://openalex.org/W123",
+                    source="openalex",
+                )
+            ]
+
+        monkeypatch.setattr(
+            "researchclaw.literature.search.search_papers_multi_query",
+            fake_search,
+        )
+        monkeypatch.setattr(
+            "researchclaw.data.load_seminal_papers",
+            lambda _topic: [],
+        )
+
+        config = replace(
+            rc_config,
+            literature_search=replace(
+                rc_config.literature_search,
+                sources=("openalex",),
+            ),
+            web_search=replace(rc_config.web_search, enabled=False),
+        )
+
+        result = _execute_literature_collect(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=None,
+        )
+
+        assert result.status == StageStatus.DONE
+        assert isinstance(captured["ledger"], list)
+
+        search_meta = json.loads(
+            (stage_dir / "search_meta.json").read_text(encoding="utf-8")
+        )
+        assert search_meta["schema_version"] == 2
+        assert search_meta["status"] == "results_found"
+        assert search_meta["observation_scope"] == "per_query_per_provider_outcomes"
+        # Every expanded query got an openalex outcome, in order, with the
+        # exact ledger entry shape.
+        assert search_meta["query_ledger"] == [
+            {
+                "query": query,
+                "provider": "openalex",
+                "status": "results_found",
+                "candidate_count": 1,
+                "cache_only": False,
+                "error": "",
+            }
+            for query in search_meta["expanded_queries"]
+        ]
+        assert "test-driven science" in search_meta["queries_used"]
+        assert "test-driven science" in search_meta["expanded_queries"]
+        assert search_meta["web_ledger"] == []
+
     def test_web_search_uses_config_and_writes_context_artifacts(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2411,6 +2504,19 @@ class TestLiteratureCollectConfiguration:
         )
         assert search_meta["real_search"] is False
         assert search_meta["bibtex_entries"] == 0
+        # The outage aborted the search before any provider attempt, so the
+        # v2 ledger is empty — and the Stage-6 evidence path must read that
+        # document as an aggregate observation instead of rejecting it.
+        assert search_meta["query_ledger"] == []
+        assert search_meta["status"] == "empty_or_unavailable"
+        assert search_meta["observation_scope"] == "aggregate_backend_results"
+        from researchclaw.literature.evidence import coverage_report
+
+        report = coverage_report({
+            "schema_version": 1, "sources": [], "cards": [], "errors": [],
+            "unprocessed_papers": [], "version": "x", "search_log": search_meta,
+        })
+        assert report["retrieval_scope"] == "aggregate_backend_results"
 
 
 # R4-1: Experiment Budget Guard Tests

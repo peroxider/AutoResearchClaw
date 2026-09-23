@@ -403,6 +403,10 @@ def _execute_literature_collect(
     bibtex_entries: list[str] = []
     real_search_succeeded = False
     expanded_queries = list(queries)
+    # Per-(query, provider) retrieval outcomes survive even if the search call
+    # raises midway; partial progress must stay visible in search_meta.json.
+    query_ledger: list[dict[str, Any]] = []
+    web_ledger: list[dict[str, Any]] = []
     from researchclaw.literature.evidence import read_local_sources
     for local_paper in read_local_sources(run_dir):
         candidates.append({k: v for k, v in local_paper.items() if k not in {"_local_path", "path"}})
@@ -441,6 +445,7 @@ def _execute_literature_collect(
             openalex_email=literature_config.openalex_email,
             openalex_api_key=openalex_api_key,
             inter_query_delay=literature_config.inter_query_delay_sec,
+            ledger=query_ledger,
         )
         if papers:
             real_search_succeeded = True
@@ -527,6 +532,7 @@ def _execute_literature_collect(
             web_result = web_agent.search_and_extract(
                 topic, search_queries=queries,
             )
+            web_ledger = [dict(entry) for entry in getattr(web_result, "provider_log", [])]
             from researchclaw.literature.evidence import write_json
             write_json(stage_dir / "literature_fulltext.json", {
                 "schema_version": 1, "documents": [asdict(pdf) for pdf in getattr(web_result, "pdf_extractions", []) if is_dataclass(pdf)],
@@ -569,6 +575,10 @@ def _execute_literature_collect(
                 "[web-search] Web search augmentation failed — continuing with academic APIs only",
                 exc_info=True,
             )
+            if not web_ledger:
+                web_ledger.append({"provider": "web_search", "status": "failed",
+                                   "candidate_count": 0, "queries": len(queries),
+                                   "error": "web search augmentation failed"})
 
     # --- Ultimate fallback: placeholder data ---
     # BUG-L2: Do NOT overwrite real_search_succeeded here — it was already
@@ -657,16 +667,28 @@ def _execute_literature_collect(
             "Stage 4: Wrote %d BibTeX entries to references.bib", len(bibtex_entries)
         )
 
-    # Write search metadata
+    # Write search metadata. The aggregate status is derived from the
+    # per-(query, provider) ledger so one provider's success cannot mask
+    # queries that only answered from cache or failed outright.
+    try:
+        from researchclaw.literature.search import summarize_query_ledger
+        derived_status = summarize_query_ledger(query_ledger)["status"] if query_ledger else (
+            "results_found" if real_search_succeeded else "empty_or_unavailable")
+    except Exception:  # noqa: BLE001
+        derived_status = "results_found" if real_search_succeeded else "empty_or_unavailable"
     (stage_dir / "search_meta.json").write_text(
         json.dumps(
             {
+                "schema_version": 2,
                 "real_search": real_search_succeeded,
                 "queries_used": queries,
                 "expanded_queries": expanded_queries,
                 "providers_requested": list(config.literature_search.sources),
-                "status": "results_found" if real_search_succeeded else "empty_or_unavailable",
-                "observation_scope": "aggregate_backend_results_not_per_query_success",
+                "query_ledger": query_ledger,
+                "web_ledger": web_ledger,
+                "status": derived_status,
+                "observation_scope": "per_query_per_provider_outcomes" if query_ledger
+                else "aggregate_backend_results",
                 "year_min": year_min,
                 "total_candidates": len(candidates),
                 "bibtex_entries": len(bibtex_entries),
@@ -876,6 +898,155 @@ def _execute_literature_screen(
     )
 
 
+# ---------------------------------------------------------------------------
+# Stage 6: bounded supplemental search (formal targets only)
+# ---------------------------------------------------------------------------
+
+# Gap-filling queries are the primary query plus per-category hints, capped per
+# round so a coverage gap cannot open an unbounded search.
+_SUPPLEMENT_QUERY_HINTS = {
+    "topic": ("survey", "review"),
+    "foundational": ("seminal", "foundational"),
+    "direct_competitors": ("comparison", "benchmark"),
+    "recent": ("recent advances",),
+    "dataset_protocol": ("dataset", "protocol"),
+}
+_MAX_SUPPLEMENT_ROUNDS = 2
+_MAX_SUPPLEMENT_QUERIES = 3
+_MAX_SUPPLEMENT_PDFS = 3
+
+
+def _supplement_cite_key(paper: dict, index: int) -> str:
+    """Stable supplement cite_key: identity fields first, content hash last."""
+    from researchclaw.pipeline.evidence_store import content_hash
+    base = str(paper.get("arxiv_id") or paper.get("doi") or paper.get("paper_id") or "").strip()
+    if not base:
+        base = content_hash({"title": paper.get("title", ""), "url": paper.get("url", "")})[:12]
+    key = "supp-" + re.sub(r"[^A-Za-z0-9_:+.-]+", "-", base)[:64].strip("-")
+    return key or f"supp-paper-{index}"
+
+
+def _supplement_pdf_url(paper: dict) -> str:
+    pdf = str(paper.get("pdf_url") or "").strip()
+    if pdf:
+        return pdf
+    arxiv = str(paper.get("arxiv_id") or "").strip()
+    if arxiv:
+        return f"https://arxiv.org/pdf/{arxiv}"
+    url = str(paper.get("url") or "").strip()
+    return url if url.lower().endswith(".pdf") else ""
+
+
+def _supplement_literature_evidence(run_dir: Path, bundle: dict, coverage: dict, config: RCConfig,
+                                    llm, reviewer, fulltexts: list[dict], search_log: Any,
+                                    settings: Any) -> tuple[dict, dict]:
+    """Bounded gap-filling loop for formal targets: query uncovered categories,
+    fetch a few full texts and extend the evidence bundle incrementally.
+
+    Stops when coverage turns review_ready, when no untried query remains, or
+    after a fixed number of rounds. A round that adds nothing new does not
+    stop the loop; the next round rotates to different category hints. The
+    loop never marks coverage ready itself; only the recomputed coverage
+    report decides, and every retrieval attempt — including whole-call
+    failures — lands in the ledger.
+    """
+    from researchclaw.literature.evidence import _url_key, coverage_report, supplement_evidence, write_json
+    from researchclaw.literature.search import search_papers_multi_query, summarize_query_ledger
+    from researchclaw.web.pdf_extractor import PDFExtractor
+
+    base_log = search_log if isinstance(search_log, dict) else {}
+    base = next((str(q).strip() for q in (base_log.get("queries_used") or []) if str(q).strip()),
+                "") or str(config.research.topic)
+    year_min = _safe_json_loads(_read_prior_artifact(run_dir, "queries.json") or "{}", {}).get("year_min", 2020)
+    evidenced = {s["metadata"]["cite_key"] for s in bundle["sources"]}
+    have_texts = {_url_key(str(f.get("path", ""))) for f in fulltexts if isinstance(f, dict) and f.get("path")}
+    attempted_queries: set[str] = set()
+    attempted_keys: set[str] = set(evidenced)
+    rounds: list[dict] = []
+    for _ in range(_MAX_SUPPLEMENT_ROUNDS):
+        if coverage["status"] == "review_ready" or llm is None:
+            break
+        queries = []
+        for category, info in coverage["categories"].items():
+            if info["status"] in ("covered", "not_applicable"):
+                continue
+            for hint in _SUPPLEMENT_QUERY_HINTS.get(category, ()):
+                candidate = f"{base} {hint}".strip()
+                if candidate and candidate not in queries and candidate not in attempted_queries:
+                    queries.append(candidate)
+        queries = queries[:_MAX_SUPPLEMENT_QUERIES]
+        if not queries:
+            break
+        attempted_queries.update(queries)
+        ledger: list[dict] = []
+        try:
+            found = search_papers_multi_query(
+                queries,
+                limit_per_query=settings.max_results_per_query,
+                sources=settings.sources,
+                year_min=year_min,
+                s2_api_key=(settings.s2_api_key or config.llm.s2_api_key
+                            or os.environ.get(settings.s2_api_key_env, "")),
+                openalex_email=settings.openalex_email,
+                openalex_api_key=(settings.openalex_api_key
+                                  or os.environ.get(settings.openalex_api_key_env, "")),
+                inter_query_delay=settings.inter_query_delay_sec,
+                ledger=ledger,
+            )
+        except Exception as exc:  # noqa: BLE001
+            found = []
+            recorded = {str(entry.get("query")) for entry in ledger}
+            ledger.extend({"query": query, "provider": "search", "status": "failed",
+                           "candidate_count": 0, "cache_only": False, "error": str(exc)}
+                          for query in queries if query not in recorded)
+        rows = []
+        for paper in found:
+            row = paper.to_dict()
+            key = str(row.get("cite_key") or "") or _supplement_cite_key(row, len(rows))
+            row["cite_key"] = key
+            if key in attempted_keys:
+                continue
+            attempted_keys.add(key)
+            rows.append(row)
+        fetch_records = []
+        new_fulltexts = list(fulltexts)
+        for row in rows:
+            if len(fetch_records) >= _MAX_SUPPLEMENT_PDFS:
+                break
+            url = _supplement_pdf_url(row)
+            if not url or _url_key(url) in have_texts:
+                continue
+            try:
+                extracted = asdict(PDFExtractor().extract_from_url(url))
+                if extracted.get("success"):
+                    fetch_records.append({"url": url, "status": "success"})
+                    new_fulltexts.append(extracted)
+                    have_texts.add(_url_key(url))
+                else:
+                    fetch_records.append({"url": url, "status": "failed",
+                                          "error": str(extracted.get("error", ""))})
+            except Exception as exc:  # noqa: BLE001
+                fetch_records.append({"url": url, "status": "failed", "error": str(exc)})
+                logger.warning("Stage 6: supplemental PDF fetch failed for %s (%s)", url, exc)
+        version_before = bundle["version"]
+        bundle = supplement_evidence(
+            run_dir, rows, bundle=bundle, llm=llm, reviewer=reviewer,
+            fulltexts=new_fulltexts,
+            search_log={"status": summarize_query_ledger(ledger)["status"], "query_ledger": ledger},
+            max_papers=settings.evidence_max_papers, max_calls=settings.evidence_max_calls,
+            max_chars=settings.evidence_max_chars, not_applicable=list(settings.not_applicable))
+        coverage = coverage_report(bundle)
+        rounds.append({"queries": queries, "retrieval": summarize_query_ledger(ledger),
+                       "ledger": ledger, "new_papers": len(rows), "pdf_fetches": fetch_records,
+                       "evidence_version_before": version_before,
+                       "evidence_version_after": bundle["version"],
+                       "coverage_status": coverage["status"]})
+    write_json(run_dir / "literature_supplement.json",
+               {"schema_version": 1, "rounds": rounds, "stopped_at": coverage["status"],
+                "exhaustive": False})
+    return bundle, coverage
+
+
 def _execute_knowledge_extract(
     stage_dir: Path,
     run_dir: Path,
@@ -950,12 +1121,16 @@ def _execute_knowledge_extract(
         authoritative.update({p["cite_key"]: p for p in read_local_sources(run_dir)})
         rows = [authoritative.get(row.get("cite_key"), row) for row in rows]
         search_log = _safe_json_loads(_read_prior_artifact(run_dir, "search_meta.json") or "{}", {})
-        bundle = build_evidence(run_dir, rows, llm=llm,
-                                reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+        reviewer = (build_reviewer_llm(config) or llm) if llm is not None else None
+        bundle = build_evidence(run_dir, rows, llm=llm, reviewer=reviewer,
                                 fulltexts=fulltexts, search_log=search_log,
                                 max_papers=settings.evidence_max_papers, max_calls=settings.evidence_max_calls,
-                                max_chars=settings.evidence_max_chars)
+                                max_chars=settings.evidence_max_chars,
+                                not_applicable=list(settings.not_applicable))
         coverage = coverage_report(bundle)
+        if coverage["status"] != "review_ready" and config.research.target_status != "exploratory":
+            bundle, coverage = _supplement_literature_evidence(
+                run_dir, bundle, coverage, config, llm, reviewer, fulltexts, search_log, settings)
         cards_dir = stage_dir / "cards"
         cards_dir.mkdir(parents=True, exist_ok=True)
         parts = ["# Source-grounded evidence cards", f"Evidence version: {bundle['version']}", ""]

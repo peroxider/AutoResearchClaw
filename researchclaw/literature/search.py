@@ -39,6 +39,38 @@ _DEFAULT_SOURCES = ("openalex", "semantic_scholar", "arxiv")
 CacheGet = Callable[[str, str, int], list[dict[str, object]] | None]
 CachePut = Callable[[str, str, int, list[dict[str, object]]], None]
 
+# Per-(query, provider) retrieval outcomes. A cache fallback is recorded as
+# cache_only and never counts as a live provider result.
+QUERY_STATUSES = ("results_found", "no_results", "cache_only", "failed", "unknown_provider")
+
+
+def _ledger_entry(query: str, provider: str, status: str, count: int, *, cache_only: bool = False,
+                  error: str = "") -> dict[str, object]:
+    return {"query": query, "provider": provider, "status": status, "candidate_count": count,
+            "cache_only": cache_only, "error": error}
+
+
+def summarize_query_ledger(ledger: Sequence[dict[str, object]] | None) -> dict[str, object]:
+    """Derive the aggregate retrieval status from per-query outcomes.
+
+    results_found requires at least one live provider result; cache-only hits
+    downgrade the aggregate so stale cache cannot pose as a successful search.
+    """
+    entries = list(ledger or [])
+    statuses = [str(e.get("status")) for e in entries]
+    if "results_found" in statuses:
+        aggregate = "results_found"
+    elif "cache_only" in statuses:
+        aggregate = "cache_only"
+    else:
+        aggregate = "empty_or_unavailable"
+    return {"status": aggregate,
+            "queries": len({str(e.get("query")) for e in entries}),
+            "providers": sorted({str(e.get("provider")) for e in entries}),
+            "live_query_count": sum(1 for s in statuses if s == "results_found"),
+            "cache_only_query_count": sum(1 for s in statuses if s == "cache_only"),
+            "failed_query_count": sum(1 for s in statuses if s in {"failed", "no_results", "unknown_provider"})}
+
 
 def _cache_api() -> tuple[CacheGet, CachePut]:
     cache_mod = importlib.import_module("researchclaw.literature.cache")
@@ -111,6 +143,7 @@ def search_papers(
     s2_api_key: str = "",
     openalex_email: str = "",
     openalex_api_key: str = "",
+    ledger: list[dict[str, object]] | None = None,
 ) -> list[Paper]:
     """Search multiple academic sources and return deduplicated results.
 
@@ -132,6 +165,9 @@ def search_papers(
         Optional OpenAlex mailto value.
     openalex_api_key:
         Optional OpenAlex API key.
+    ledger:
+        Optional list that receives one outcome entry per (query, provider)
+        attempt, including cache-only fallbacks and failures.
 
     Returns
     -------
@@ -146,11 +182,19 @@ def search_papers(
     source_stats: dict[str, int] = {}  # track per-source counts
     cache_hits = 0
 
+    def record(provider: str, status: str, count: int, *, cache_only: bool = False, error: str = "") -> None:
+        if ledger is not None:
+            ledger.append(_ledger_entry(query, provider, status, count, cache_only=cache_only, error=error))
+
     for src in sources:
         src_lower = src.lower().replace("-", "_").replace(" ", "_")
         cache_source = (
             "semantic_scholar" if src_lower in ("semantic_scholar", "s2") else src_lower
         )
+        if src_lower not in ("openalex", "semantic_scholar", "s2", "arxiv"):
+            logger.warning("Unknown literature source: %s (skipped)", src)
+            record(cache_source, "unknown_provider", 0)
+            continue
         try:
             if src_lower == "openalex":
                 openalex_kwargs: dict[str, object] = {
@@ -168,6 +212,7 @@ def search_papers(
                 all_papers.extend(papers)
                 cache_put(query, "openalex", limit, _papers_to_dicts(papers))
                 source_stats["openalex"] = len(papers)
+                record("openalex", "results_found" if papers else "no_results", len(papers))
                 logger.info(
                     "OpenAlex returned %d papers for %r", len(papers), query
                 )
@@ -183,6 +228,7 @@ def search_papers(
                 all_papers.extend(papers)
                 cache_put(query, "semantic_scholar", limit, _papers_to_dicts(papers))
                 source_stats["semantic_scholar"] = len(papers)
+                record("semantic_scholar", "results_found" if papers else "no_results", len(papers))
                 logger.info(
                     "Semantic Scholar returned %d papers for %r", len(papers), query
                 )
@@ -194,10 +240,9 @@ def search_papers(
                 all_papers.extend(papers)
                 cache_put(query, "arxiv", limit, _papers_to_dicts(papers))
                 source_stats["arxiv"] = len(papers)
+                record("arxiv", "results_found" if papers else "no_results", len(papers))
                 logger.info("arXiv returned %d papers for %r", len(papers), query)
 
-            else:
-                logger.warning("Unknown literature source: %s (skipped)", src)
         except (
             OSError,
             RuntimeError,
@@ -205,7 +250,7 @@ def search_papers(
             ValueError,
             urllib.error.HTTPError,
             urllib.error.URLError,
-        ):
+        ) as exc:
             logger.warning(
                 "[rate-limit] Source %s failed for %r — trying cache", src, query
             )
@@ -214,10 +259,12 @@ def search_papers(
                 papers = _dicts_to_papers(cached)
                 all_papers.extend(papers)
                 cache_hits += len(papers)
+                record(cache_source, "cache_only", len(papers), cache_only=True, error=str(exc))
                 logger.info(
                     "[cache] HIT: %d papers for %s/%r", len(papers), src, query
                 )
             else:
+                record(cache_source, "failed", 0, error=str(exc))
                 logger.warning(
                     "No cache available for %s/%r — skipping", src, query
                 )
@@ -253,10 +300,12 @@ def search_papers_multi_query(
     openalex_email: str = "",
     openalex_api_key: str = "",
     inter_query_delay: float = 1.5,
+    ledger: list[dict[str, object]] | None = None,
 ) -> list[Paper]:
     """Run multiple queries and return deduplicated union.
 
-    Adds a delay between queries to respect rate limits.
+    Adds a delay between queries to respect rate limits. When ``ledger`` is
+    given, every (query, provider) outcome is appended to it in order.
     """
     all_papers: list[Paper] = []
 
@@ -272,6 +321,7 @@ def search_papers_multi_query(
             openalex_email=openalex_email,
             openalex_api_key=openalex_api_key,
             deduplicate=False,  # we dedup globally below
+            ledger=ledger,
         )
         all_papers.extend(results)
         logger.info("Query %d/%d %r → %d papers", i + 1, len(queries), q, len(results))

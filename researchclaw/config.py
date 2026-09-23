@@ -252,6 +252,7 @@ class LiteratureSearchConfig:
     evidence_max_calls: int = 32
     evidence_max_chars: int = 12000
     citation_support_max_calls: int = 128
+    not_applicable: tuple[dict[str, str], ...] = ()  # user-declared {category, reason} coverage exclusions
 
 
 @dataclass(frozen=True)
@@ -1454,6 +1455,27 @@ def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchCon
     if evidence_mode not in {"auto", "on", "off"}:
         raise ValueError("literature_search.evidence_mode must be auto, on or off")
 
+    from researchclaw.literature.evidence import CATEGORIES
+    not_applicable_raw = data.get("not_applicable") or ()
+    if not isinstance(not_applicable_raw, (list, tuple)):
+        raise ValueError("literature_search.not_applicable must be a list of {category, reason} entries")
+    declarations: list[dict[str, str]] = []
+    seen_categories: set[str] = set()
+    for entry in not_applicable_raw:
+        if not isinstance(entry, dict) or set(entry) != {"category", "reason"}:
+            raise ValueError("each literature_search.not_applicable entry needs exactly category and reason")
+        if not isinstance(entry["category"], str) or not isinstance(entry["reason"], str):
+            raise ValueError("literature_search.not_applicable category and reason must be strings")
+        category, reason = entry["category"], entry["reason"].strip()
+        if category not in CATEGORIES:
+            raise ValueError("literature_search.not_applicable.category must be one of: " + ", ".join(CATEGORIES))
+        if not reason:
+            raise ValueError("literature_search.not_applicable entries need a non-empty reason")
+        if category in seen_categories:
+            raise ValueError("duplicate literature_search.not_applicable category: " + category)
+        seen_categories.add(category)
+        declarations.append({"category": category, "reason": reason})
+
     sources_raw = data.get("sources", LiteratureSearchConfig.sources)
     if isinstance(sources_raw, str):
         sources = tuple(
@@ -1472,6 +1494,7 @@ def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchCon
         evidence_max_calls=max(1, _safe_int(data.get("evidence_max_calls"), 32)),
         evidence_max_chars=max(1000, _safe_int(data.get("evidence_max_chars"), 12000)),
         citation_support_max_calls=max(1, _safe_int(data.get("citation_support_max_calls"), 128)),
+        not_applicable=tuple(declarations),
         sources=sources,
         max_results_per_query=max(
             1,

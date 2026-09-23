@@ -444,3 +444,20 @@ def test_load_uses_file_parent_as_default_project_root(tmp_path: Path):
 
     assert config.project.name == "demo"
     assert config.knowledge_base.root == "docs/kb"
+
+
+def test_rcconfig_parses_and_validates_not_applicable_declarations(tmp_path: Path):
+    reason = "Synthetic benchmark data; no external dataset protocol applies."
+    data = _valid_config_data()
+    data["literature_search"] = {"not_applicable": [{"category": "dataset_protocol", "reason": reason}]}
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+    assert config.literature_search.not_applicable == ({"category": "dataset_protocol", "reason": reason},)
+
+    for bad in (["unknown_category"], [{"category": "topic"}], [{"category": "topic", "reason": "   "}],
+                [{"category": "topic", "reason": "x"}, {"category": "topic", "reason": "y"}],
+                [{"category": "topic", "reason": None}], [{"category": "topic", "reason": 7}],
+                [{"category": 5, "reason": "x"}]):
+        broken = _valid_config_data()
+        broken["literature_search"] = {"not_applicable": bad}
+        with pytest.raises(ValueError):
+            RCConfig.from_dict(broken, project_root=tmp_path, check_paths=False)
