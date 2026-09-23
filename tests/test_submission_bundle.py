@@ -91,6 +91,22 @@ def test_recorder_cannot_publish_private_evidence_even_with_new_hash(submission)
     assert report["status"] == "failed" and "unapproved" in report["issues"][0]
 
 
+def test_biblatex_backend_handoff_is_not_a_publication_input(submission):
+    # biblatex re-opens paper.run.xml (its biber hand-off) within the recorded
+    # pass; the derived file must not block preparation nor enter the archive.
+    root = submission
+    (root / "paper.run.xml").write_text(
+        "<biblatex>Biber hand-off derived from paper.tex and references.bib</biblatex>")
+    with (root / "paper.fls").open("a") as stream:
+        stream.write("\nINPUT paper.run.xml\nOUTPUT paper.run.xml\n")
+    bind_compilation(root)
+    report = prepare_submission(root)
+    assert report["status"] == "prepared", report
+    assert verify_submission(root) == report
+    with zipfile.ZipFile(root / "submission.zip") as archive:
+        assert "paper.run.xml" not in archive.namelist()
+
+
 def test_rehashed_archive_cannot_smuggle_extra_files(submission):
     root = submission
     report = prepare_submission(root)

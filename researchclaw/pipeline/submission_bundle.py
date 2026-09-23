@@ -55,7 +55,9 @@ def payload_files(root: Path) -> dict[str, str]:
                     if name not in {policy["entrypoint"], "template.json"}
                     and Path(name).suffix.lower() not in {".md", ".txt", ".json"})
     # TeX outputs read by later passes are not publication sources.
-    generated = {"paper.aux", "paper.out", "paper.toc", "paper.lof", "paper.lot"}
+    # paper.run.xml is biblatex's hand-off to biber: derived from paper.tex and
+    # references.bib, re-opened by the recorder pass, never a public input.
+    generated = {"paper.aux", "paper.out", "paper.toc", "paper.lof", "paper.lot", "paper.run.xml"}
     selected, read_local = {"paper.pdf", "paper.tex", "references.bib"}, set()
     # BibTeX's style is read by a separate process, so it is absent from .fls.
     style = template["compiled"]["bibliography_style"] + ".bst"

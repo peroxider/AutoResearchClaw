@@ -25,14 +25,34 @@ from tests.test_manuscript import study, Writer
 from tests.test_template_bundle import bundle
 
 
-@pytest.mark.parametrize("engine,columns", [("pdflatex", 1), ("pdflatex", 2), ("xelatex", 1), ("xelatex", 2)])
-def test_real_template_diagrams_math_bibliography_and_minimal_archive(study, method, engine, columns):
-    if os.environ.get("ARC_RUN_TEX_INTEGRATION") != "1" or not shutil.which(engine) or not shutil.which("bibtex"):
-        pytest.skip("Opt-in real TeX compilation requires pdflatex/xelatex and bibtex")
+@pytest.mark.parametrize("engine,columns,backend", [
+    (engine, columns, backend)
+    for engine in ("pdflatex", "xelatex") for columns in (1, 2) for backend in ("bibtex", "biber")])
+def test_real_template_diagrams_math_bibliography_and_minimal_archive(study, method, engine, columns, backend):
+    if os.environ.get("ARC_RUN_TEX_INTEGRATION") != "1" or not shutil.which(engine):
+        pytest.skip("Opt-in real TeX compilation requires pdflatex/xelatex")
+    if not shutil.which(backend):
+        pytest.skip(f"Opt-in real TeX compilation requires the {backend} backend executable")
     import fitz
     root, cfg = study
-    source = bundle(root, engine=engine, columns=columns, appendix_roles=["theory"], highlights_required=True)
+    source = bundle(root, engine=engine, columns=columns, appendix_roles=["theory"], highlights_required=True,
+                    bibliography_backend=backend)
     entry = source / "main.tex"
+    if backend == "biber":
+        # Biber policy and BibLaTeX declarations are selected together: the
+        # source entrypoint must load biblatex and declare its own resource.
+        entry.write_text(r"""\documentclass[twocolumn]{article}
+\usepackage{localstyle}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{sample.bib}
+\title{A sample title}
+\author{Real Person\thanks{An identifying grant}}
+\begin{document}
+\maketitle
+EXAMPLE PAPER CONTENT MUST NOT SURVIVE
+\printbibliography
+\end{document}
+""", encoding="utf-8")
     if columns == 1:
         entry.write_text(entry.read_text(encoding="utf-8").replace("[twocolumn]", ""), encoding="utf-8")
     freeze_template(root, source)
