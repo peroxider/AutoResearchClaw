@@ -96,10 +96,16 @@ def compile_latex(
     old_pdf = (pdf_path.stat().st_mtime_ns, pdf_path.stat().st_size) if pdf_path.is_file() else None
 
     # Pre-flight: sanitize .bib file (escape bare & in field values)
-    # Find bib filename from \bibliography{...} in the tex source
+    # Find the bibliography source and backend from the reviewed TeX.
     _tex_src = tex_path.read_text(encoding="utf-8", errors="replace")
     _bib_match = re.search(r"\\bibliography\{([^}]+)\}", _tex_src)
-    _bib_name = _bib_match.group(1) if _bib_match else bib_stem
+    _biber_match = re.search(r"\\addbibresource(?:\[[^\]]*\])?\{([^}]+)\}", _tex_src)
+    if _bib_match and _biber_match:
+        raise ValueError("TeX source mixes BibTeX and Biber bibliography declarations")
+    _bibliography_backend = "biber" if _biber_match else "bibtex"
+    _bib_name = (_biber_match or _bib_match).group(1) if (_biber_match or _bib_match) else bib_stem
+    if _bib_name.lower().endswith(".bib"):
+        _bib_name = _bib_name[:-4]
     if allow_repairs:
         _sanitize_bib_file(work_dir / f"{_bib_name}.bib")
 
@@ -123,10 +129,12 @@ def compile_latex(
             result.errors.append(f"pdflatex failed on pass 1 (attempt {attempt})")
             break
 
-        # BibTeX: always run after pass 1 — it only needs .aux + .bib.
+        # Run the backend after pass 1: BibTeX consumes .aux, Biber consumes
+        # biblatex's .bcf. Neither backend is silently substituted.
         # Previously gated behind pass1 success, which meant citations were
         # always [?] when the first pass had non-fatal errors.
-        bib_ok = _run_bibtex(work_dir, bib_stem, timeout=60)
+        bib_ok = (_run_biber(work_dir, bib_stem, timeout=60)
+                  if _bibliography_backend == "biber" else _run_bibtex(work_dir, bib_stem, timeout=60))
 
         # Passes 2-3: resolve cross-references and bibliography
         for _pass in (2, 3):
@@ -145,7 +153,7 @@ def compile_latex(
         fatal = [e for e in errors if _is_fatal_error(e)]
         if not final_pass_ok or pass_log is None:
             fatal.append("Final LaTeX pass failed or timed out")
-        if _bib_match and not bib_ok:
+        if (_bib_match or _biber_match) and not bib_ok:
             fatal.append("Bibliography compilation failed")
         if (not pdf_path.is_file() or not pdf_path.read_bytes().startswith(b"%PDF-")
                 or (pdf_path.stat().st_mtime_ns, pdf_path.stat().st_size) == old_pdf):
@@ -892,6 +900,32 @@ def _run_bibtex(work_dir: Path, stem: str, timeout: int = 60) -> bool:
         return True
     except subprocess.TimeoutExpired:
         logger.warning("bibtex timed out after %ds", timeout)
+        return False
+    except FileNotFoundError:
+        return False
+
+
+def _run_biber(work_dir: Path, stem: str, timeout: int = 60) -> bool:
+    """Run Biber without shell escape and require a newly available .bbl."""
+    if not shutil.which("biber"):
+        logger.warning("biber not found on PATH — biblatex citations cannot be resolved")
+        return False
+    try:
+        proc = subprocess.run(
+            ["biber", stem], cwd=work_dir, capture_output=True, timeout=timeout)
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            logger.warning("biber returned %d: %s", proc.returncode, (stdout + stderr).strip()[:500])
+            return False
+        if stdout.strip():
+            logger.debug("biber output: %s", stdout.strip()[:300])
+        if not (work_dir / f"{stem}.bbl").is_file():
+            logger.warning("biber ran but %s.bbl was not generated", stem)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning("biber timed out after %ds", timeout)
         return False
     except FileNotFoundError:
         return False

@@ -23,11 +23,14 @@ class TemplateError(ValueError):
 
 MARKERS = ("ARC_TITLE", "ARC_AUTHORS", "ARC_PACKAGES", "ARC_CONTENT", "ARC_BIBLIOGRAPHY")
 ROLE_NAMES = {"methods", "theory", "experiments", "results", "related_work", "discussion"}
-ALLOWED = {".tex", ".cls", ".sty", ".bst", ".bib", ".def", ".clo", ".cfg", ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".txt", ".md", ".json"}
+ALLOWED = {".tex", ".cls", ".sty", ".bst", ".bbx", ".cbx", ".lbx", ".bib", ".def", ".clo", ".cfg", ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".txt", ".md", ".json"}
 DEFAULT = {
     "schema_version": 1, "name": "generic-journal", "entrypoint": "main.tex", "engine": "pdflatex",
     "anonymous": True, "max_pages": None, "max_main_pages": None, "appendix_roles": [],
     "highlights_required": False,
+    "bibliography_backend": "bibtex",
+    "max_title_characters": None, "max_abstract_characters": None,
+    "max_figures": None, "max_tables": None,
     "columns": None,
 }
 GENERIC = r"""\documentclass[11pt]{article}
@@ -101,12 +104,15 @@ def _policy(data: dict) -> dict:
     _name(result["entrypoint"])
     if result["engine"] not in {"pdflatex", "xelatex"}:
         raise TemplateError("Only pdflatex/xelatex compilation is supported")
+    if result["bibliography_backend"] not in {"bibtex", "biber"}:
+        raise TemplateError("bibliography_backend must be bibtex or biber")
     if result["columns"] is not None and (type(result["columns"]) is not int or result["columns"] not in {1, 2}):
         raise TemplateError("columns must be 1, 2 or null for class-based inference")
     for key in ("anonymous", "highlights_required"):
         if type(result[key]) is not bool:
             raise TemplateError(f"{key} must be boolean")
-    for key in ("max_pages", "max_main_pages"):
+    for key in ("max_pages", "max_main_pages", "max_title_characters", "max_abstract_characters",
+                "max_figures", "max_tables"):
         if result[key] is not None and (type(result[key]) is not int or result[key] < 1):
             raise TemplateError(f"{key} must be a positive integer or null")
     roles = result["appendix_roles"]
@@ -165,8 +171,12 @@ def _compile(files: dict[str, bytes], policy: dict) -> dict:
     bibliography_style = styles[0] if styles else "plainnat"
     if ".." in PurePosixPath(bibliography_style).parts or bibliography_style.startswith("/"):
         raise TemplateError("Bibliography style escapes the bundle")
-    if re.search(r"\\(?:addbibresource|printbibliography)\b|\{biblatex\}", raw):
-        raise TemplateError("BibLaTeX templates require a Biber backend; no silent BibTeX substitution")
+    biblatex = bool(re.search(r"\\(?:addbibresource|printbibliography)\b|\{biblatex\}", raw))
+    if biblatex != (policy["bibliography_backend"] == "biber"):
+        raise TemplateError("BibLaTeX declarations and the Biber policy must be selected together")
+    if biblatex and not re.search(
+            r"\\(?:usepackage|RequirePackage)(?:\[[^\]]*\])?\{[^}]*\bbiblatex\b[^}]*\}", raw):
+        raise TemplateError("Biber templates must load biblatex explicitly")
     if any("{{" + marker + "}}" in raw for marker in MARKERS):
         skeleton = raw
     else:
@@ -182,6 +192,7 @@ def _compile(files: dict[str, bytes], policy: dict) -> dict:
     if any(skeleton.count("{{" + marker + "}}") != 1 for marker in MARKERS):
         raise TemplateError("Each ARC template marker must appear exactly once")
     skeleton = re.sub(r"\\bibliographystyle\{[^}]+\}|\\bibliography\{[^}]+\}", "", skeleton)
+    skeleton = re.sub(r"\\addbibresource(?:\[[^\]]*\])?\{[^}]+\}|\\printbibliography(?:\[[^\]]*\])?", "", skeleton)
     if skeleton.count(r"\begin{document}") != 1 or skeleton.count(r"\end{document}") != 1:
         raise TemplateError("Template document boundaries are ambiguous")
     if skeleton.index("{{ARC_PACKAGES}}") > skeleton.index(r"\begin{document}"):
@@ -283,10 +294,16 @@ def render_frame(root: Path, title: str) -> tuple[str, str, dict]:
     from researchclaw.pipeline.manuscript import _tex
     record = verify_template(root)
     compiled, authors = record["compiled"], record["authors"]
+    title_limit = compiled["policy"]["max_title_characters"]
+    if title_limit is not None and len(title) > title_limit:
+        raise TemplateError("Manuscript title exceeds the declared template character limit")
     skeleton = compiled["skeleton"]
     packages = []
     present = {p.strip() for group in re.findall(r"\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}", skeleton) for p in group.split(",")}
-    for package in ("longtable", "natbib", "amsmath", "amssymb", "graphicx", "placeins"):
+    required = ("longtable", "amsmath", "amssymb", "graphicx", "placeins")
+    if compiled["policy"]["bibliography_backend"] == "bibtex":
+        required = ("natbib", *required)
+    for package in required:
         if package not in present:
             packages.append("\\usepackage{" + package + "}")
     if compiled["policy"]["engine"] == "pdflatex":
@@ -296,7 +313,11 @@ def render_frame(root: Path, title: str) -> tuple[str, str, dict]:
     for operator in ("argmax", "argmin"):
         if not re.search(r"\\(?:DeclareMathOperator\*?|newcommand)\s*\{\\" + operator + r"\}", skeleton):
             packages.append("\\ifdefined\\" + operator + "\\else\\DeclareMathOperator*{\\" + operator + "}{arg\\," + operator[3:] + "}\\fi")
-    bibliography = "\\bibliographystyle{" + compiled["bibliography_style"] + "}\n\\bibliography{references}"
+    if compiled["policy"]["bibliography_backend"] == "biber":
+        packages.append("\\addbibresource{references.bib}")
+        bibliography = "\\printbibliography"
+    else:
+        bibliography = "\\bibliographystyle{" + compiled["bibliography_style"] + "}\n\\bibliography{references}"
     skeleton = skeleton.replace("{{ARC_TITLE}}", _tex(title)).replace("{{ARC_AUTHORS}}", _tex(authors))
     skeleton = skeleton.replace("{{ARC_PACKAGES}}", "\n".join(packages)).replace("{{ARC_BIBLIOGRAPHY}}", bibliography)
     prefix, suffix = skeleton.split("{{ARC_CONTENT}}")
@@ -308,6 +329,7 @@ def inspect_constraints(root: Path) -> dict:
     record = verify_template(root)
     policy = record["compiled"]["policy"]
     issues, pages, main_pages, appendix_pages = [], None, None, []
+    title_characters = abstract_characters = figures = tables = None
     pdf = root / "paper.pdf"
     if pdf.is_file():
         try:
@@ -334,6 +356,28 @@ def inspect_constraints(root: Path) -> dict:
     for field, actual in (("max_pages", pages), ("max_main_pages", main_pages)):
         if policy[field] is not None and (actual is None or actual > policy[field]):
             issues.append(field + "_unavailable_or_exceeded")
+    manuscript = root / "manuscript_ir.json"
+    if manuscript.is_file():
+        try:
+            ir = json.loads(manuscript.read_text(encoding="utf-8"))
+            title_characters = len(ir["title"])
+            abstract = next(section for section in ir["sections"] if section["task"]["role"] == "abstract")
+            abstract_characters = sum(len(block["text"]) for block in abstract["blocks"])
+        except (OSError, ValueError, TypeError, KeyError, StopIteration):
+            pass
+    tex = root / "paper.tex"
+    if tex.is_file():
+        source = tex.read_text(encoding="utf-8", errors="replace")
+        source = re.sub(r"(?m)(?<!\\)%.*$", "", source)
+        figures = len(re.findall(r"\\begin\{figure\*?\}", source))
+        tables = len(re.findall(r"\\begin\{(?:table\*?|longtable)\}", source))
+    for field, actual in (("max_title_characters", title_characters),
+                          ("max_abstract_characters", abstract_characters),
+                          ("max_figures", figures), ("max_tables", tables)):
+        if policy[field] is not None and (actual is None or actual > policy[field]):
+            issues.append(field + "_unavailable_or_exceeded")
     return {"template_version": record["version"], "pdf_sha256": file_hash(pdf) if pdf.is_file() else None,
-            "pages": pages, "main_pages": main_pages, "status": "passed" if not issues else "failed", "issues": issues,
+            "pages": pages, "main_pages": main_pages, "title_characters": title_characters,
+            "abstract_characters": abstract_characters, "figures": figures, "tables": tables,
+            "status": "passed" if not issues else "failed", "issues": issues,
             "scope": "page limits and PDF author metadata; content anonymity and visual layout require full review"}

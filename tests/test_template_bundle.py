@@ -89,6 +89,8 @@ def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
 
 @pytest.mark.parametrize("change", [
     {"max_pages": 0}, {"max_pages": True}, {"engine": "sh"}, {"columns": 3},
+    {"max_title_characters": 0}, {"max_abstract_characters": True}, {"max_figures": -1},
+    {"max_tables": 1.5},
     {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
 ])
 def test_invalid_policy_fields_are_not_silently_ignored(tmp_path, change):
@@ -105,6 +107,57 @@ def test_unsupported_bibliography_and_identifying_metadata_fail(tmp_path):
     path.write_text(GENERIC.replace("{{ARC_PACKAGES}}", r"\hypersetup{pdfauthor={Private Name}}" + "\n{{ARC_PACKAGES}}"))
     with pytest.raises(TemplateError, match="identifying metadata"):
         freeze_template(tmp_path / "run", source)
+
+
+def test_biber_template_is_explicitly_normalized_without_bibtex_substitution(tmp_path):
+    source = bundle(tmp_path, bibliography_backend="biber")
+    (source / "main.tex").write_text(r"""\documentclass{article}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{sample.bib}
+\title{Sample}\author{Example}
+\begin{document}\maketitle SAMPLE BODY \printbibliography\end{document}
+""", encoding="utf-8")
+    (source / "localstyle.sty").unlink()
+    (source / "localstyle.bbx").write_text(r"\ProvidesFile{localstyle.bbx}", encoding="utf-8")
+    root = tmp_path / "run"
+    report = freeze_template(root, source)
+    assert report["compiled"]["policy"]["bibliography_backend"] == "biber"
+    prefix, suffix, _ = render_frame(root, "Biber fixture")
+    assert r"\usepackage[backend=biber,style=authoryear]{biblatex}" in prefix
+    assert r"\addbibresource{references.bib}" in prefix
+    assert r"\printbibliography" in suffix
+    assert "sample.bib" not in prefix + suffix and r"\bibliographystyle" not in suffix
+    assert r"\usepackage{natbib}" not in prefix
+    copy_template_resources(root, root)
+    assert (root / "localstyle.bbx").is_file()
+
+
+def test_biber_policy_and_biblatex_declarations_cannot_disagree(tmp_path):
+    with pytest.raises(TemplateError, match="selected together"):
+        freeze_template(tmp_path / "run", bundle(tmp_path, bibliography_backend="biber"))
+
+
+def test_compiler_routes_biblatex_to_biber_and_requires_its_output(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from researchclaw.templates import compiler
+    tex = tmp_path / "paper.tex"
+    tex.write_text(r"""\documentclass{article}\usepackage[backend=biber]{biblatex}
+\addbibresource{references.bib}\begin{document}Text\printbibliography\end{document}""")
+    (tmp_path / "references.bib").write_text("@article{x,title={X}}")
+    calls = []
+    monkeypatch.setattr(compiler.shutil, "which", lambda name: name)
+    def latex(*args, **kwargs):
+        (tmp_path / "paper.pdf").write_bytes(b"%PDF-fixture")
+        return "", True
+    monkeypatch.setattr(compiler, "_run_pdflatex", latex)
+    def biber(work_dir, stem, timeout=60):
+        calls.append((work_dir, stem))
+        (work_dir / f"{stem}.bbl").write_text("fixture")
+        return True
+    monkeypatch.setattr(compiler, "_run_biber", biber)
+    monkeypatch.setattr(compiler, "_run_bibtex", lambda *a, **k: pytest.fail("BibTeX substitution"))
+    result = compiler.compile_latex(tex, max_attempts=1, allow_repairs=False)
+    assert result.success and calls == [(tmp_path, "paper")]
 
 
 def test_page_limits_use_physical_pdf_pages_not_tex_counters(tmp_path):
@@ -222,6 +275,29 @@ def test_pdf_total_limit_is_enforced_even_without_appendix(tmp_path):
         pdf.save(root / "paper.pdf")
     result = inspect_constraints(root)
     assert result["pages"] == 2 and "max_pages_unavailable_or_exceeded" in result["issues"]
+
+
+def test_declared_title_abstract_figure_and_table_limits_are_recomputed(tmp_path):
+    import fitz
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, max_title_characters=5, max_abstract_characters=5,
+                                 max_figures=1, max_tables=1))
+    with pytest.raises(TemplateError, match="title exceeds"):
+        render_frame(root, "Six chars")
+    write_json(root / "manuscript_ir.json", {"title": "Title", "sections": [
+        {"task": {"role": "abstract"}, "blocks": [{"text": "123456"}]}]})
+    (root / "paper.tex").write_text(
+        r"\begin{figure}\end{figure}\begin{figure*}\end{figure*}"
+        r"\begin{table}\end{table}\begin{longtable}{l}\end{longtable}"
+        "% \\begin{figure} ignored comment\n", encoding="utf-8")
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    result = inspect_constraints(root)
+    assert result["title_characters"] == 5 and result["abstract_characters"] == 6
+    assert result["figures"] == 2 and result["tables"] == 2
+    assert {"max_abstract_characters_unavailable_or_exceeded", "max_figures_unavailable_or_exceeded",
+            "max_tables_unavailable_or_exceeded"} <= set(result["issues"])
 
 
 def test_export_refresh_detects_external_template_change(study):
