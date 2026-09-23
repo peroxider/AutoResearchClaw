@@ -105,11 +105,11 @@ class TestSentinelScript:
     def test_sentinel_script_is_valid_bash(self) -> None:
         script = Path(__file__).parent.parent / "sentinel.sh"
         result = subprocess.run(
-            ["bash", "-n", str(script)],
+            ["bash", "-n"],
             capture_output=True,
-            text=True,
+            input=script.read_bytes(),
         )
-        assert result.returncode == 0, f"Bash syntax error: {result.stderr}"
+        assert result.returncode == 0, f"Bash syntax error: {result.stderr!r}"
 
     def test_sentinel_script_is_executable(self) -> None:
         script = Path(__file__).parent.parent / "sentinel.sh"
@@ -123,9 +123,9 @@ class TestSentinelScript:
     def test_sentinel_prints_usage_on_no_args(self) -> None:
         script = Path(__file__).parent.parent / "sentinel.sh"
         result = subprocess.run(
-            ["bash", str(script)],
+            ["bash", "-s"],
             capture_output=True,
-            text=True,
+            input=script.read_bytes(),
         )
         # Should fail because no run_dir argument provided
         assert result.returncode != 0

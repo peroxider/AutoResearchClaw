@@ -6,7 +6,7 @@ import pytest
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.experiment.protocol_runner import (
-    _append, _lock, ledger_usage, read_ledger, run_matrix, verify_execution_bundle,
+    _append, _lock, ledger_usage, read_ledger, read_tuning_trials, run_matrix, verify_execution_bundle,
 )
 from researchclaw.experiment.sandbox import SandboxResult
 from researchclaw.pipeline.evidence_store import EvidenceStore, file_hash
@@ -21,6 +21,8 @@ from collections import Counter
 from pathlib import Path
 request = json.loads(os.environ["ARC_PROTOCOL_REQUEST"])
 assert request["phase"] == "frozen_test"
+Path(request["tuning"]["output"]).write_text(json.dumps({"schema_version": 1,
+    "metric": request["tuning"]["metric"], "trials": [], "selected_trial_id": None}))
 data = request["dataset"]
 train = list(csv.DictReader(Path(data["paths"]["train"]).open()))
 test = list(csv.DictReader(Path(data["paths"]["test_features"]).open()))
@@ -63,6 +65,44 @@ def test_real_host_matrix_evaluates_and_resume_never_reruns_success(inputs, spec
     assert file_hash(root / "protocol_execution.jsonl") == before
 
 
+def test_validation_tuning_trials_are_counted_and_bind_the_selected_configuration(inputs, spec):
+    disclosure = '''Path(request["tuning"]["output"]).write_text(json.dumps({
+    "schema_version": 1, "metric": request["tuning"]["metric"],
+    "trials": [
+        {"trial_id": "trial-1", "parameters": {"lr": 999}, "validation_metric": 0.25},
+        {"trial_id": "trial-2", "parameters": request["tuning"]["selected_parameters"], "validation_metric": 0.5}],
+    "selected_trial_id": "trial-2"}))
+data = request["dataset"]'''
+    script = SCRIPT.replace('data = request["dataset"]', disclosure)
+    root, project, protocol, cfg = setup(inputs, spec, script)
+    budget = run_matrix(root, project, cfg.experiment)
+    assert budget["tuning_trials"] == 16 and budget["tuning_trial_limit"] == 16
+    assert set(budget["per_cell_tuning_trials"].values()) == {2}
+    usage = verify_execution_bundle(root, protocol)
+    assert usage["tuning_trials"] == 16
+    receipt = json.loads((root / "evidence_artifacts/protocol_runs/attempt-000001/execution.json").read_text())
+    assert receipt["tuning_trial_count"] == 2
+
+
+@pytest.mark.parametrize("report", [
+    {"schema_version": 1, "metric": "accuracy", "trials": [], "selected_trial_id": "ghost"},
+    {"schema_version": 1, "metric": "accuracy", "trials": [
+        {"trial_id": "same", "parameters": {}, "validation_metric": 1},
+        {"trial_id": "same", "parameters": {}, "validation_metric": 2}], "selected_trial_id": "same"},
+    {"schema_version": 1, "metric": "accuracy", "trials": [
+        {"trial_id": "trial-1", "parameters": {}, "validation_metric": float("nan")}],
+     "selected_trial_id": "trial-1"},
+    {"schema_version": 1, "metric": "accuracy", "trials": [
+        {"trial_id": "trial-1", "parameters": {"lr": 2}, "validation_metric": 1}],
+     "selected_trial_id": "trial-1"},
+])
+def test_tuning_trial_disclosure_fails_closed(tmp_path, report):
+    path = tmp_path / "tuning.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ProtocolError):
+        read_tuning_trials(path, max_trials=2, metric="accuracy", selected_parameters={"lr": 1})
+
+
 def test_failure_history_preserved_and_no_test_metrics_released(inputs, spec):
     script = SCRIPT.replace('assert request["phase"] == "frozen_test"',
                             'assert request["key"]["seed"] != "42", "transient fixture failure"')
@@ -101,12 +141,13 @@ def test_interrupted_attempt_charges_reserved_time(inputs, spec):
     assert usage["used_seconds"] == 10 and usage["interrupted_attempts"] == ["attempt-000001"]
 
 
-@pytest.mark.parametrize("target", ["source", "predictions", "receipt", "ledger", "budget", "log"])
+@pytest.mark.parametrize("target", ["source", "predictions", "tuning", "receipt", "ledger", "budget", "log"])
 def test_delivery_rejects_tampered_host_artifacts(inputs, spec, target):
     root, project, protocol, cfg = setup(inputs, spec)
     run_matrix(root, project, cfg.experiment)
     names = {"source": "evidence_artifacts/protocol_source/main.py",
              "predictions": "evidence_artifacts/protocol_runs/attempt-000001/predictions.csv",
+             "tuning": "evidence_artifacts/protocol_runs/attempt-000001/tuning_trials.json",
              "receipt": "evidence_artifacts/protocol_runs/attempt-000001/execution.json",
              "ledger": "protocol_execution.jsonl", "budget": "protocol_budget.json",
              "log": "evidence_artifacts/protocol_runs/attempt-000001/stdout.txt"}
@@ -153,13 +194,28 @@ def test_stage12_and_stage13_use_frozen_host_execution(inputs, spec):
 
 
 def test_docker_does_not_silently_change_execution_backend(inputs, spec, monkeypatch):
+    from researchclaw.experiment.docker_sandbox import DockerSandbox
     root, project, _, cfg = setup(inputs, spec)
     class HostFallback:
         pass
+    # A docker run now pins its image digest before any execution; only with
+    # the digest frozen does the no-fallback guard get its say.
+    monkeypatch.setattr(DockerSandbox, "inspect_image_digest",
+                        lambda image: "researchclaw/experiment@sha256:" + "a" * 64)
     monkeypatch.setattr("researchclaw.experiment.factory.create_sandbox", lambda *args: HostFallback())
     with pytest.raises(ProtocolError, match="cannot fall back"):
-        run_matrix(root, project, replace(cfg.experiment, mode="docker"))
+        docker = replace(cfg.experiment.docker, network_policy="none")
+        run_matrix(root, project, replace(cfg.experiment, mode="docker", docker=docker))
     assert not (root / "protocol_execution.jsonl").exists()
+
+
+def test_formal_docker_rejects_network_before_freezing_or_running(inputs, spec, monkeypatch):
+    from researchclaw.experiment.docker_sandbox import DockerSandbox
+    root, project, _, cfg = setup(inputs, spec)
+    monkeypatch.setattr(DockerSandbox, "inspect_image_digest", lambda image: pytest.fail("must fail before inspect"))
+    with pytest.raises(ProtocolError, match="network_policy=none"):
+        run_matrix(root, project, replace(cfg.experiment, mode="docker"))
+    assert not (root / "protocol_code.json").exists()
 
 
 def test_stale_metrics_invalidated_before_retry(inputs, spec):

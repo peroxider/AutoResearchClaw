@@ -359,11 +359,15 @@ class ExperimentSandbox:
         timeout_sec: int = 300,
         args: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        guarded: bool = False,
     ) -> SandboxResult:
         """Run a multi-file experiment project in the sandbox.
 
         Copies all ``.py`` files from *project_dir* into the sandbox work
-        directory and executes *entry_point*.
+        directory and executes *entry_point*. With ``guarded=True`` the
+        process runs in isolated mode behind the in-process execution guard
+        (no network, no subprocesses, writes confined to the staging
+        directory and the system temp directory).
         """
         import shutil
 
@@ -384,6 +388,8 @@ class ExperimentSandbox:
 
         # R5-4: Inject immutable experiment harness before copying project files
         self._inject_harness(sandbox_project)
+        if guarded:
+            self._inject_guard(sandbox_project)
 
         # Copy all project files (will NOT overwrite harness — harness name is unique)
         from researchclaw.research_inputs import bind_project_data
@@ -391,9 +397,9 @@ class ExperimentSandbox:
         for src_file in project_dir.iterdir():
             if src_file.is_file():
                 dest = sandbox_project / src_file.name
-                # Do not allow project to overwrite the harness
-                if dest.name == "experiment_harness.py":
-                    logger.warning("Project contains experiment_harness.py — skipping (immutable)")
+                # Do not allow project to overwrite the harness or the guard
+                if dest.name in ("experiment_harness.py", "execution_guard.py"):
+                    logger.warning("Project contains %s — skipping (immutable)", dest.name)
                     continue
                 dest.write_bytes(src_file.read_bytes())
             elif src_file.is_dir() and not src_file.name.startswith("."):
@@ -420,7 +426,9 @@ class ExperimentSandbox:
             )
 
         start = time.monotonic()
-        command = self._build_command(entry, args=args)
+        command = self._build_command(
+            entry, args=args,
+            wrapper=sandbox_project / "execution_guard.py" if guarded else None)
         logger.debug("Running project sandbox command: %s (cwd=%s)", command, sandbox_project)
 
         result: SandboxResult
@@ -464,6 +472,13 @@ class ExperimentSandbox:
         else:
             logger.warning("Harness template not found at %s", harness_src)
 
+    @staticmethod
+    def _inject_guard(target_dir: Path) -> None:
+        """Copy the immutable execution guard next to the entry point."""
+        guard_src = Path(__file__).parent / "execution_guard.py"
+        (target_dir / "execution_guard.py").write_text(
+            guard_src.read_text(encoding="utf-8"), encoding="utf-8")
+
     def _next_script_path(self) -> Path:
         self._run_counter += 1
         return self.workdir / f"_experiment_{self._run_counter}.py"
@@ -477,6 +492,7 @@ class ExperimentSandbox:
         script_path: Path,
         *,
         args: list[str] | None = None,
+        wrapper: Path | None = None,
     ) -> list[str]:
         # Convert relative python_path to absolute WITHOUT resolving symlinks.
         # Using .resolve() would follow venv symlinks to the system Python binary,
@@ -486,7 +502,14 @@ class ExperimentSandbox:
         if not python_path.is_absolute() and python != "python":
             python_path = Path.cwd() / python_path
         # -u: unbuffered stdout/stderr so subprocess.run captures all output
-        command = [str(python_path), "-u", str(script_path)]
+        command = [str(python_path)]
+        if wrapper is not None:
+            # -I isolates the interpreter (no ambient PYTHON* env influence,
+            # no user site, no implicit script-dir path); the guard wrapper
+            # re-adds the staging directory explicitly.
+            command += ["-I", "-u", str(wrapper), str(script_path)]
+        else:
+            command += ["-u", str(script_path)]
         if args:
             command.extend(args)
         return command

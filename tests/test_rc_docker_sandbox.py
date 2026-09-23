@@ -57,6 +57,30 @@ def test_build_run_command_network_none(tmp_path: Path):
         assert "--user" in cmd
 
 
+def test_formal_command_drops_privileges_and_does_not_mount_host_caches(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "must-not-enter-formal-container")
+    cfg = DockerSandboxConfig(network_policy="none", keep_containers=False)
+    sandbox = DockerSandbox(cfg, tmp_path / "work")
+    staging = tmp_path / "staging"
+    cmd = sandbox._build_run_command(staging, entry_point="main.py", container_name="formal",
+                                     formal_isolation=True)
+    assert {"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--pids-limit=256", "--network", "none"} <= set(cmd)
+    assert "/tmp:rw,noexec,nosuid,nodev,size=256m" in cmd
+    volumes = [cmd[index + 1] for index, token in enumerate(cmd) if token == "-v"]
+    assert volumes == [f"{staging}:/workspace"]
+    assert not any("HF_TOKEN=" in token or "HF_HUB_CACHE=" in token for token in cmd)
+
+
+@pytest.mark.parametrize("cfg", [DockerSandboxConfig(network_policy="full"),
+                                  DockerSandboxConfig(network_policy="none", keep_containers=True)])
+def test_formal_command_rejects_network_or_persistent_container(tmp_path: Path, cfg):
+    sandbox = DockerSandbox(cfg, tmp_path / "work")
+    with pytest.raises(ValueError, match="Formal Docker"):
+        sandbox._build_run_command(tmp_path / "staging", entry_point="main.py", container_name="formal",
+                                   formal_isolation=True)
+
+
 def test_build_run_command_setup_only(tmp_path: Path):
     """Default network_policy='setup_only' → RC_SETUP_ONLY_NETWORK=1, --cap-add."""
     cfg = DockerSandboxConfig()  # default is setup_only

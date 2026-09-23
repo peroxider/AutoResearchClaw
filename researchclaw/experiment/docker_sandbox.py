@@ -140,6 +140,7 @@ class DockerSandbox:
         timeout_sec: int = 300,
         args: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        formal_isolation: bool = False,
     ) -> SandboxResult:
         """Run a multi-file experiment project inside a container."""
         self._run_counter += 1
@@ -199,6 +200,7 @@ class DockerSandbox:
             timeout_sec=timeout_sec,
             entry_args=args,
             env_overrides=env_overrides,
+            formal_isolation=formal_isolation,
         )
 
     # ------------------------------------------------------------------
@@ -250,6 +252,32 @@ class DockerSandbox:
             return False
 
     @staticmethod
+    def inspect_image_digest(image: str) -> str | None:
+        """Content digest pinning the exact local image, or None.
+
+        Prefers a repository digest (name@sha256:...) and falls back to the
+        image ID for locally built images that were never pushed; both are
+        content identifiers of the image this run executed against.
+        """
+        try:
+            cp = subprocess.run(
+                ["docker", "image", "inspect", image],
+                capture_output=True, text=True, encoding="utf-8",
+                timeout=10, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if cp.returncode != 0:
+            return None
+        try:
+            info = json.loads(cp.stdout)[0]
+            digests = info.get("RepoDigests") or []
+            digest = digests[0] if digests else info.get("Id")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            return None
+        return digest if isinstance(digest, str) and digest else None
+
+    @staticmethod
     def _inject_harness(target_dir: Path) -> None:
         harness_src = Path(__file__).parent / "harness_template.py"
         if harness_src.exists():
@@ -271,6 +299,7 @@ class DockerSandbox:
         timeout_sec: int,
         entry_args: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        formal_isolation: bool = False,
     ) -> SandboxResult:
         """Core execution: single container, three-phase via entrypoint.sh."""
         cfg = self.config
@@ -287,6 +316,7 @@ class DockerSandbox:
             container_name=container_name,
             entry_args=entry_args,
             env_overrides=env_overrides,
+            formal_isolation=formal_isolation,
         )
 
         start = time.monotonic()
@@ -372,6 +402,7 @@ class DockerSandbox:
         container_name: str,
         entry_args: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        formal_isolation: bool = False,
     ) -> list[str]:
         """Build the ``docker run`` command list.
 
@@ -392,6 +423,11 @@ class DockerSandbox:
             f"--memory={cfg.memory_limit_mb}m",
             f"--shm-size={cfg.shm_size_mb}m",
         ]
+        if formal_isolation:
+            if cfg.network_policy != "none" or cfg.keep_containers:
+                raise ValueError("Formal Docker execution requires network_policy=none and automatic cleanup")
+            cmd.extend(["--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                        "--pids-limit=256", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m"])
 
         # --- Network policy ---
         # On POSIX, run the container as the host user so that files
@@ -400,7 +436,7 @@ class DockerSandbox:
         # to running as the default container user (usually root).
         def _user_flag() -> list[str]:
             if sys.platform == "win32":
-                return []
+                return ["--user", "65534:65534"] if formal_isolation else []
             return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
         if cfg.network_policy == "none":
@@ -424,7 +460,9 @@ class DockerSandbox:
         # Priority: /opt/datasets (system) > ~/.cache/datasets (user)
         datasets_host = Path("/opt/datasets")
         user_datasets = Path.home() / ".cache" / "datasets"
-        if datasets_host.is_dir():
+        if formal_isolation:
+            pass
+        elif datasets_host.is_dir():
             cmd.extend(["-v", f"{datasets_host}:/workspace/data:ro"])
         elif user_datasets.is_dir():
             cmd.extend(["-v", f"{user_datasets}:/workspace/data:rw"])
@@ -438,7 +476,7 @@ class DockerSandbox:
         # transformers library writes token/telemetry files under HF_HOME.
         # Instead, use HF_HUB_CACHE for read-only model access and let
         # HF_HOME default to a writable location inside the container.
-        hf_mounted = False
+        hf_mounted = formal_isolation
         _hf_hub_cache = "/home/researcher/.cache/huggingface/hub"
         hf_home_env = os.environ.get("HF_HOME", "").strip()
         if hf_home_env:
@@ -464,7 +502,7 @@ class DockerSandbox:
         cmd.extend(["-e", "HOME=/workspace/.home"])
 
         # Pass HF token if available (for gated model downloads)
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        hf_token = None if formal_isolation else (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
         if hf_token:
             cmd.extend(["-e", f"HF_TOKEN={hf_token}"])
 

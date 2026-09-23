@@ -152,7 +152,20 @@ def compile_protocol(spec: dict, datasets: list[dict], *, max_cell_seconds: int)
             raise ProtocolError("Question references undeclared dataset")
         if "analysis_plan" in question and question["analysis_plan"]["interval"]["method"] != "none":
             from researchclaw.pipeline.analysis_spec import MAX_RESAMPLING_DRAWS
-            analysis_draws += len(seeds) * len(names) * (len(mids) - 1) * question["analysis_plan"]["interval"]["replicates"]
+            interval = question["analysis_plan"]["interval"]
+            if interval["method"] == "cluster_percentile_bootstrap" and any(
+                    not available[name]["manifest"].get("group_column") for name in names):
+                raise ProtocolError("Cluster bootstrap requires group_column on every question dataset")
+            if interval["method"] == "moving_block_percentile_bootstrap":
+                if any(not available[name]["manifest"].get("time_column") for name in names):
+                    raise ProtocolError("Moving-block bootstrap requires time_column on every question dataset")
+                if any(interval["block_length"] > available[name]["card"]["analysis_units"]["test_time_count"]
+                       for name in names):
+                    raise ProtocolError("Moving-block length exceeds a question dataset's frozen test time points")
+            sample_factor = (sum(available[name]["card"]["split_sizes"]["test"] for name in names)
+                             if interval["method"] in {"cluster_percentile_bootstrap",
+                                                       "moving_block_percentile_bootstrap"} else len(names))
+            analysis_draws += len(seeds) * sample_factor * (len(mids) - 1) * interval["replicates"]
             if analysis_draws > MAX_RESAMPLING_DRAWS:
                 raise ProtocolError("Frozen analysis plans exceed the total resampling draw budget")
         used_methods.update(mids)
@@ -327,6 +340,8 @@ def protocol_context(protocol: dict) -> str:
             "Keep all failed attempts; never select the best test seed. "
             "main.py must handle ARC_PROTOCOL_REQUEST (a JSON environment variable): execute only its "
             "method/dataset/seed, use request.dataset.paths, and write request.output as id,prediction CSV. "
+            "When request.learning_curve is present, also write its output path as exact step,value CSV using "
+            "strictly increasing nonnegative integer steps, no more than max_points rows, and the declared split/metric. "
             "The host runs every cell and writes execution receipts; do not fabricate receipts or run the "
             "whole matrix inside one invocation. If this environment variable is absent during a code "
             "generation trial, use validation only, never export formal test results. "
