@@ -154,6 +154,29 @@ def materialize_fetch(declaration, cache_dir, expected_name: str | None = None) 
     if hashlib.sha256(raw).hexdigest() != sha:
         raise DataAcquisitionError("Fetched external data does not match its pinned sha256; nothing was cached")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Provenance becomes visible before the payload. A concurrent reader that
+    # finds the payload must never miss its provenance record, so the
+    # sidecar-first ordering is what makes the cache fast path atomic: the
+    # reverse order exposed a window where the payload was already readable
+    # and the fast path failed with a missing provenance record.
+    record = {"adapter": PROVENANCE_ADAPTER, "sha256": sha, "size": len(raw), "url": declaration["url"]}
+    staging = cache_dir / f"{sha}.{os.getpid()}.{threading.get_ident()}.provenance.staging"
+    try:
+        staging.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        try:
+            staging.replace(sidecar)
+        except OSError:
+            # The record is deterministic; a concurrent writer's copy is
+            # equivalent. An absent sidecar is rechecked briefly for the same
+            # rename-window reason as the payload.
+            for _ in range(_RETRY_ATTEMPTS):
+                if sidecar.is_file():
+                    break
+                time.sleep(_RETRY_PAUSE)
+            else:
+                raise
+    finally:
+        staging.unlink(missing_ok=True)
     # Staging names are unique per writer: shared names would let one
     # writer's cleanup unlink the file another writer is about to replace.
     # Every writer to one content address carries the same verified bytes,
@@ -175,24 +198,6 @@ def materialize_fetch(declaration, cache_dir, expected_name: str | None = None) 
                     break
                 time.sleep(_RETRY_PAUSE)
             if not accepted:
-                raise
-    finally:
-        staging.unlink(missing_ok=True)
-    record = {"adapter": PROVENANCE_ADAPTER, "sha256": sha, "size": len(raw), "url": declaration["url"]}
-    staging = cache_dir / f"{sha}.{os.getpid()}.{threading.get_ident()}.provenance.staging"
-    try:
-        staging.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        try:
-            staging.replace(sidecar)
-        except OSError:
-            # The record is deterministic; a concurrent writer's copy is
-            # equivalent. An absent sidecar is rechecked briefly for the same
-            # rename-window reason as the payload.
-            for _ in range(_RETRY_ATTEMPTS):
-                if sidecar.is_file():
-                    break
-                time.sleep(_RETRY_PAUSE)
-            else:
                 raise
     finally:
         staging.unlink(missing_ok=True)
