@@ -13,7 +13,10 @@ to paste into DALL-E. This module wires the actual generation:
 - :func:`generate_framework_diagram_artifacts` — orchestrator helper used by
   Stage 22 and by tests. Tries providers in configured order, falls back to
   :func:`_render_traditional_framework_diagram` (matplotlib boxes-and-arrows)
-  when no provider is available or all providers fail.
+  when no provider is available or all providers fail. Every provider image
+  must pass the raster publication review (``model_image_review``) before it
+  is embedded: rejected images are skipped in favor of the next provider or
+  the deterministic fallback, and a degenerate fallback render ships nothing.
 
 The ``framework_diagram_prompt.md`` artifact is still always written so users
 can re-render manually if they prefer.
@@ -30,11 +33,14 @@ import logging
 import os
 import re
 import textwrap
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, ClassVar
+
+from researchclaw.agents.figure_agent.model_image_review import review_model_image
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +121,14 @@ class OpenAICompatibleProvider(ImageGenProvider):
         self._api_key = api_key
         self._model = model
         self._timeout_sec = timeout_sec
+        # Usage block (if any) the endpoint reported on the latest call, for
+        # the run-level image call ledger. Never contains credentials.
+        self.last_usage: dict | None = None
+
+    def describe(self) -> dict[str, Any]:
+        """Serving identity for the run-level image call ledger."""
+        return {"provider": self.name, "model": self._model,
+                "endpoint": f"{self._base_url}/images/generations"}
 
     def generate(
         self,
@@ -123,6 +137,9 @@ class OpenAICompatibleProvider(ImageGenProvider):
         aspect_ratio: str,
         size: str,
     ) -> bytes:
+        # Each attempt reports only its own endpoint usage; a failed call must
+        # not inherit the previous attempt's block.
+        self.last_usage = None
         url = f"{self._base_url}/images/generations"
         payload = {
             "model": self._model,
@@ -149,6 +166,8 @@ class OpenAICompatibleProvider(ImageGenProvider):
                 f"OpenAI-compatible endpoint returned non-JSON body: "
                 f"{body[:200]}"
             ) from exc
+        usage = parsed.get("usage")
+        self.last_usage = usage if isinstance(usage, dict) else None
 
         items = parsed.get("data") or []
         if not items:
@@ -214,6 +233,15 @@ class GrsaiGPTImagesProvider(ImageGenProvider):
         self._api_style = api_style
         self._quality = quality
         self._timeout_sec = timeout_sec
+        # Usage block (if any) the endpoint reported on the latest call, for
+        # the run-level image call ledger. Never contains credentials.
+        self.last_usage: dict | None = None
+
+    def describe(self) -> dict[str, Any]:
+        """Serving identity for the run-level image call ledger."""
+        suffix = "images/generations" if self._api_style == "openai" else "api/generate"
+        return {"provider": self.name, "model": self._model,
+                "endpoint": self._endpoint(suffix)}
 
     def _endpoint(self, suffix: str) -> str:
         root = self._base_url
@@ -244,6 +272,9 @@ class GrsaiGPTImagesProvider(ImageGenProvider):
         size: str,
         reference_image: bytes | None = None,
     ) -> bytes:
+        # Each attempt reports only its own endpoint usage; a failed call must
+        # not inherit the previous attempt's block.
+        self.last_usage = None
         styled_prompt = self._diagram_prompt(prompt, aspect_ratio)
         references: list[str] = []
         if reference_image:
@@ -288,6 +319,8 @@ class GrsaiGPTImagesProvider(ImageGenProvider):
             parsed = json.loads(body)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"GRSAI returned non-JSON body: {body[:200]}") from exc
+        usage = parsed.get("usage")
+        self.last_usage = usage if isinstance(usage, dict) else None
 
         items = (
             parsed.get("data") if self._api_style == "openai"
@@ -375,6 +408,15 @@ class GeminiProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio,
                 use_sdk=use_sdk,
             )
+
+    def describe(self) -> dict[str, Any]:
+        """Serving identity for the run-level image call ledger."""
+        model = getattr(self._agent, "_model", None)
+        if getattr(self._agent, "_use_sdk", False):
+            endpoint = "google-genai-sdk"
+        else:
+            endpoint = "generativelanguage.googleapis.com/v1beta"
+        return {"provider": self.name, "model": model, "endpoint": endpoint}
 
     def generate(
         self,
@@ -1243,13 +1285,13 @@ def verify_framework_diagram_artifacts(output_dir: Path) -> dict:
         raise FrameworkDiagramVerificationError("Missing or invalid framework diagram manifest") from exc
     common = {"schema_version", "artifact", "render_mode", "provider", "generation_attempts", "model",
               "size", "aspect_ratio", "prompt_sha256", "prompt_artifact", "original_output_sha256",
-              "image_sha256"}
+              "image_sha256", "image_review"}
     hybrid = {"semantic_source", "semantic_nodes", "visual_candidate", "professional_style",
               "visual_influence", "semantic_lock", "skeleton_sha256"}
     direct = {"original_output"}
     mode = manifest.get("render_mode")
     expected_fields = common | (hybrid if mode == "hybrid" else direct if mode == "direct" else set())
-    if set(manifest) != expected_fields or manifest.get("schema_version") != 2:
+    if set(manifest) != expected_fields or manifest.get("schema_version") != 3:
         raise FrameworkDiagramVerificationError("Invalid framework diagram manifest schema")
 
     def payload(name, expected_name, digest_field, *, image=False):
@@ -1271,7 +1313,16 @@ def verify_framework_diagram_artifacts(output_dir: Path) -> dict:
         prompt.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise FrameworkDiagramVerificationError("Framework diagram prompt is not UTF-8") from exc
-    payload(manifest["artifact"], "framework_diagram.png", "image_sha256", image=True)
+    artifact_data = payload(manifest["artifact"], "framework_diagram.png", "image_sha256", image=True)
+    # The raster publication review is re-derived from the frozen artifact
+    # bytes: the manifest must record exactly what the embedded image measures,
+    # and that image must have passed.
+    if manifest["image_review"] != review_model_image(artifact_data):
+        raise FrameworkDiagramVerificationError(
+            "Framework diagram image review differs from the frozen artifact")
+    if manifest["image_review"]["status"] != "passed":
+        raise FrameworkDiagramVerificationError(
+            "Embedded framework diagram failed the raster publication review")
     attempts = manifest["generation_attempts"]
     if not isinstance(attempts, list) or len(attempts) > 16:
         raise FrameworkDiagramVerificationError("Invalid framework diagram attempt ledger")
@@ -1307,6 +1358,51 @@ def verify_framework_diagram_artifacts(output_dir: Path) -> dict:
                                          "module_boundaries": True}:
             raise FrameworkDiagramVerificationError("Hybrid semantic lock is incomplete")
     return manifest
+
+
+def _record_image_attempt(
+    provider: Any,
+    mode: str,
+    started: float,
+    image_bytes: bytes | None,
+    exc: Exception | None,
+) -> dict[str, Any]:
+    """Append one provider attempt to the run-level image call ledger and
+    return the stage-manifest attempt entry (unchanged schema). Every
+    manifest attempt lands in the ledger; a stage retry leaves earlier
+    attempts as extra ledger records, so acceptance checks containment of
+    the manifest attempts inside the ledger, not equality."""
+    from researchclaw.llm.image_call_ledger import record_image_call
+
+    duration_ms = max(0, int((time.monotonic() - started) * 1000))
+    error_type = type(exc).__name__ if exc is not None else None
+    identity: dict[str, Any] | None = None
+    describe = getattr(provider, "describe", None)
+    if callable(describe):
+        try:
+            identity = describe()
+        except Exception:  # noqa: BLE001
+            identity = None
+    if not isinstance(identity, dict) or not identity.get("provider"):
+        identity = {"provider": getattr(provider, "name", None),
+                    "model": None, "endpoint": None}
+    usage = getattr(provider, "last_usage", None)
+    record_image_call({
+        "provider": identity["provider"],
+        "model": identity.get("model"),
+        "endpoint": identity.get("endpoint"),
+        "mode": mode,
+        "status": "failed" if exc is not None else "succeeded",
+        "error_type": error_type,
+        "duration_ms": duration_ms,
+        "image_bytes": len(image_bytes) if image_bytes else None,
+        "usage": usage if isinstance(usage, dict) else None,
+    })
+    entry: dict[str, Any] = {"provider": provider.name, "mode": mode,
+                             "status": "failed" if exc is not None else "succeeded"}
+    if exc is not None:
+        entry["error_type"] = error_type
+    return entry
 
 
 def generate_framework_diagram_artifacts(
@@ -1406,28 +1502,36 @@ def generate_framework_diagram_artifacts(
             + image_prompt
         )
         for provider in providers:
-            try:
-                reference_generate = getattr(
-                    provider, "generate_with_reference", None
-                )
-                if reference_generate is not None:
+            reference_generate = getattr(
+                provider, "generate_with_reference", None
+            )
+            candidate_ok = False
+            if reference_generate is not None:
+                started = time.monotonic()
+                try:
+                    candidate_bytes = reference_generate(
+                        enhancement_prompt,
+                        reference_bytes,
+                        aspect_ratio=framework_cfg.aspect_ratio,
+                        size=framework_cfg.size,
+                    )
+                    generation_attempts.append(
+                        _record_image_attempt(provider, "reference", started,
+                                              candidate_bytes, None))
+                    candidate_ok = True
+                except Exception as reference_exc:  # noqa: BLE001
+                    generation_attempts.append(
+                        _record_image_attempt(provider, "reference", started,
+                                              None, reference_exc))
+                    logger.warning(
+                        "framework_diagram: provider %s rejected the "
+                        "skeleton reference (%s); retrying a non-semantic "
+                        "visual candidate",
+                        provider.name,
+                        reference_exc,
+                    )
+                    started = time.monotonic()
                     try:
-                        candidate_bytes = reference_generate(
-                            enhancement_prompt,
-                            reference_bytes,
-                            aspect_ratio=framework_cfg.aspect_ratio,
-                            size=framework_cfg.size,
-                        )
-                        generation_attempts.append({"provider": provider.name, "mode": "reference",
-                                                    "status": "succeeded"})
-                    except Exception as reference_exc:  # noqa: BLE001
-                        logger.warning(
-                            "framework_diagram: provider %s rejected the "
-                            "skeleton reference (%s); retrying a non-semantic "
-                            "visual candidate",
-                            provider.name,
-                            reference_exc,
-                        )
                         candidate_bytes = provider.generate(
                             "Generate only a restrained, abstract, text-free "
                             "clinical-journal background using flat muted "
@@ -1438,29 +1542,44 @@ def generate_framework_diagram_artifacts(
                             aspect_ratio=framework_cfg.aspect_ratio,
                             size=framework_cfg.size,
                         )
-                        generation_attempts.append({"provider": provider.name, "mode": "reference",
-                                                    "status": "failed",
-                                                    "error_type": type(reference_exc).__name__})
-                        generation_attempts.append({"provider": provider.name, "mode": "text_free",
-                                                    "status": "succeeded"})
-                else:
+                        generation_attempts.append(
+                            _record_image_attempt(provider, "text_free",
+                                                  started, candidate_bytes,
+                                                  None))
+                        candidate_ok = True
+                    except Exception as text_free_exc:  # noqa: BLE001
+                        generation_attempts.append(
+                            _record_image_attempt(provider, "provider",
+                                                  started, None, text_free_exc))
+                        logger.warning(
+                            "framework_diagram: hybrid candidate provider %s failed (%s)",
+                            provider.name,
+                            text_free_exc,
+                        )
+            else:
+                started = time.monotonic()
+                try:
                     candidate_bytes = provider.generate(
                         enhancement_prompt,
                         aspect_ratio=framework_cfg.aspect_ratio,
                         size=framework_cfg.size,
                     )
-                    generation_attempts.append({"provider": provider.name, "mode": "prompt",
-                                                "status": "succeeded"})
+                    generation_attempts.append(
+                        _record_image_attempt(provider, "prompt", started,
+                                              candidate_bytes, None))
+                    candidate_ok = True
+                except Exception as exc:  # noqa: BLE001
+                    generation_attempts.append(
+                        _record_image_attempt(provider, "provider", started,
+                                              None, exc))
+                    logger.warning(
+                        "framework_diagram: hybrid candidate provider %s failed (%s)",
+                        provider.name,
+                        exc,
+                    )
+            if candidate_ok:
                 candidate_provider = provider.name
                 break
-            except Exception as exc:  # noqa: BLE001
-                generation_attempts.append({"provider": provider.name, "mode": "provider",
-                                            "status": "failed", "error_type": type(exc).__name__})
-                logger.warning(
-                    "framework_diagram: hybrid candidate provider %s failed (%s)",
-                    provider.name,
-                    exc,
-                )
         candidate_path = output_dir / "framework_diagram_visual_candidate.png"
         if candidate_bytes:
             candidate_path.write_bytes(candidate_bytes)
@@ -1473,6 +1592,16 @@ def generate_framework_diagram_artifacts(
             output_path=png_path,
             influence=getattr(framework_cfg, "visual_influence", 0.06),
         )
+        image_review = review_model_image(png_path.read_bytes())
+        if image_review["status"] != "passed":
+            # The composite is our own render over an authoritative semantic
+            # layer; a degenerate result means the semantic layer itself is
+            # unusable, so ship nothing rather than an unreadable figure.
+            logger.warning(
+                "framework_diagram: hybrid composite failed the raster "
+                "publication review — refusing to embed a degenerate diagram")
+            png_path.unlink(missing_ok=True)
+            return artifacts, None
         generated_via = (
             f"hybrid:{candidate_provider}"
             if candidate_provider
@@ -1481,11 +1610,12 @@ def generate_framework_diagram_artifacts(
         artifacts.append(png_path.name)
         manifest_path = output_dir / "framework_diagram_generation.json"
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact": png_path.name,
             "render_mode": "hybrid",
             "semantic_source": skeleton_svg.name,
             "semantic_nodes": nodes,
+            "image_review": image_review,
             "visual_candidate": (
                 candidate_path.name if candidate_bytes else None
             ),
@@ -1544,9 +1674,11 @@ def generate_framework_diagram_artifacts(
 
     png_path = output_dir / "framework_diagram.png"
     generated_via: str | None = None
+    image_review: dict[str, Any] | None = None
     generation_attempts: list[dict[str, Any]] = []
     original_path = output_dir / "framework_diagram_model_original.png"
     for provider in providers:
+        started = time.monotonic()
         try:
             image_bytes = provider.generate(
                 image_prompt,
@@ -1554,8 +1686,8 @@ def generate_framework_diagram_artifacts(
                 size=framework_cfg.size,
             )
         except Exception as exc:  # noqa: BLE001
-            generation_attempts.append({"provider": provider.name, "mode": "prompt", "status": "failed",
-                                        "error_type": type(exc).__name__})
+            generation_attempts.append(
+                _record_image_attempt(provider, "prompt", started, None, exc))
             logger.warning(
                 "framework_diagram: provider %s failed (%s)",
                 provider.name,
@@ -1563,10 +1695,22 @@ def generate_framework_diagram_artifacts(
             )
             continue
         if image_bytes:
+            generation_attempts.append(
+                _record_image_attempt(provider, "prompt", started, image_bytes, None))
+            review = review_model_image(image_bytes)
+            if review["status"] != "passed":
+                # The endpoint did return an image (the ledger keeps the
+                # succeeded attempt); it just is not publishable raster.
+                logger.warning(
+                    "framework_diagram: provider %s image failed the raster "
+                    "publication review (%s); trying the next provider",
+                    provider.name, ", ".join(review["issues"]),
+                )
+                continue
             original_path.write_bytes(image_bytes)
             png_path.write_bytes(image_bytes)
             generated_via = provider.name
-            generation_attempts.append({"provider": provider.name, "mode": "prompt", "status": "succeeded"})
+            image_review = review
             break
 
     # 3. Fall back to matplotlib
@@ -1579,13 +1723,26 @@ def generate_framework_diagram_artifacts(
                 dpi=getattr(framework_cfg, "dpi", None)
                 or getattr(figure_cfg, "dpi", 300),
             )
-            generated_via = "matplotlib"
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "framework_diagram: matplotlib fallback failed (%s) — "
                 "PNG missing; paper placeholder will be broken",
                 exc,
             )
+            # The paper embeds charts/framework_diagram.png by fixed path;
+            # never leave a partial render where the reference points.
+            png_path.unlink(missing_ok=True)
+            return artifacts, None
+        generated_via = "matplotlib"
+        image_review = review_model_image(png_path.read_bytes())
+        if image_review["status"] != "passed":
+            # Refuse to embed even our own render when it is degenerate;
+            # calibration keeps real renders well clear of the floor. Unlink
+            # so the fixed-path markdown reference ships nothing, not a blank.
+            logger.warning(
+                "framework_diagram: deterministic fallback failed the raster "
+                "publication review — refusing to embed a degenerate diagram")
+            png_path.unlink(missing_ok=True)
             return artifacts, None
 
     if png_path.exists() and png_path.stat().st_size > 0:
@@ -1594,11 +1751,12 @@ def generate_framework_diagram_artifacts(
         artifacts.append(png_path.name)
         manifest_path = output_dir / "framework_diagram_generation.json"
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact": png_path.name,
             "render_mode": "direct",
             "provider": generated_via,
             "generation_attempts": generation_attempts,
+            "image_review": image_review,
             "model": (
                 framework_cfg.grsai_model
                 if generated_via == "grsai_gpt_images"

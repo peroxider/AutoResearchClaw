@@ -388,7 +388,7 @@ def _diagram_render(diagram: dict, format: str, *, wrap_width: int) -> tuple[byt
         title_artist = ax.text(0.25, height - 0.2, textwrap.fill(title, 50), va="top", weight="bold")
         footer = (diagram.get("privacy_scope") or diagram.get("semantic_scope") or diagram.get("data_flow_scope") or
                   "Declared structure; implementation equivalence\nand termination remain unverified.")
-        footer_artist = ax.text(0.25, 0.12, footer, fontsize=10)
+        footer_artist = ax.text(0.25, 0.12, footer, fontsize=12)
         centers, y, texts, boxes = {}, height - 0.7, [], []
         for node in nodes:
             h = heights[node["id"]]
@@ -418,7 +418,7 @@ def _diagram_render(diagram: dict, format: str, *, wrap_width: int) -> tuple[byt
             ax.add_patch(FancyArrowPatch((5.18, ty), (5.08, ty), arrowstyle="-|>", mutation_scale=9, color=color))
             edge_texts.append(ax.text(lane + 0.025, (sy + ty) / 2,
                               edge["label"] + (" / loop" if edge["loop"] else ""),
-                              rotation=90, va="center", fontsize=10, color=color,
+                              rotation=90, va="center", fontsize=12, color=color,
                               bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.4}))
         try:
             fig.canvas.draw()

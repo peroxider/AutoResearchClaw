@@ -46,6 +46,51 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _reviewable_png() -> bytes:
+    """A provider-shaped PNG that passes the raster publication review.
+
+    ``_PNG_BYTES`` above is signature-valid but not PIL-decodable, so the
+    Stage-22 gate rejects it and the orchestrator falls back to matplotlib.
+    Orchestrator tests that need the provider's bytes to actually be embedded
+    use this 1024x640 diagram-like raster instead.
+    """
+    import io
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (1024, 640), "white")
+    draw = ImageDraw.Draw(image)
+    for index in range(80):
+        shade = index * 3
+        draw.rectangle(
+            [index * 12 % 984, index * 7 % 600,
+             index * 12 % 984 + 30, index * 7 % 600 + 20],
+            fill=(shade % 256, (shade * 7) % 256, (shade * 13) % 256))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+# Frozen once so byte-equality and sha256 assertions are stable across calls.
+_GOOD_PNG_BYTES = _reviewable_png()
+
+
+def _undersized_reviewable_png() -> bytes:
+    """The reviewable diagram shrunk below the resolution floor.
+
+    Content survives the shrink, so ``too_small`` is the only rejection
+    reason — orchestrator fall-through tests reject on size, not content.
+    """
+    import io
+
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(_GOOD_PNG_BYTES)).resize((200, 100))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def _minimal_yaml() -> dict[str, object]:
     """Bare-minimum YAML that constructs RCConfig — same shape as paper_2."""
     return yaml.safe_load("""
@@ -766,7 +811,7 @@ def test_orchestrator_falls_back_when_all_providers_fail(tmp_path: Path) -> None
     assert png_path.stat().st_size > 1024
     assert png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["original_output"] is None
     assert [item["status"] for item in manifest["generation_attempts"]] == ["failed", "failed"]
 
@@ -787,7 +832,7 @@ def test_orchestrator_uses_first_successful_provider(tmp_path: Path) -> None:
         name = "good"
 
         def generate(self, prompt, *, aspect_ratio, size):
-            return _PNG_BYTES
+            return _reviewable_png()
 
     cfg = _config_with_framework_diagram(
         provider="auto", render_mode="direct"
@@ -823,13 +868,14 @@ def test_orchestrator_uses_first_successful_provider(tmp_path: Path) -> None:
     assert "framework_diagram.png" in artifacts
     assert "framework_diagram_model_original.png" in artifacts
     assert png_path is not None
-    assert png_path.read_bytes() == _PNG_BYTES
+    assert png_path.read_bytes() == _GOOD_PNG_BYTES
     manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
     prompt_bytes = (tmp_path / manifest["prompt_artifact"]).read_bytes()
     assert prompt_bytes
     assert manifest["prompt_sha256"] == hashlib.sha256(prompt_bytes).hexdigest()
     assert manifest["original_output"] == "framework_diagram_model_original.png"
-    assert manifest["original_output_sha256"] == hashlib.sha256(_PNG_BYTES).hexdigest()
+    assert manifest["original_output_sha256"] == hashlib.sha256(_GOOD_PNG_BYTES).hexdigest()
+    assert manifest["image_review"]["status"] == "passed"
     assert manifest["generation_attempts"] == [
         {"provider": "failing", "mode": "prompt", "status": "failed", "error_type": "RuntimeError"},
         {"provider": "good", "mode": "prompt", "status": "succeeded"},
@@ -890,13 +936,52 @@ def test_orchestrator_hybrid_locks_semantics_and_records_candidate(
         (tmp_path / "framework_diagram_generation.json").read_text("utf-8")
     )
     assert manifest["render_mode"] == "hybrid"
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["image_review"]["status"] == "passed"
     assert all(manifest["semantic_lock"].values())
     assert manifest["visual_influence"] == 0.06
     assert manifest["original_output_sha256"] == hashlib.sha256(
         (tmp_path / "framework_diagram_visual_candidate.png").read_bytes()).hexdigest()
     assert manifest["generation_attempts"] == [
         {"provider": "grsai_gpt_images", "mode": "reference", "status": "succeeded"}]
+
+
+def test_orchestrator_hybrid_refuses_a_degenerate_composite(
+    tmp_path: Path,
+) -> None:
+    """A degenerate hybrid composite ships nothing: file unlinked, no manifest."""
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class _FailingHybridProvider:
+        name = "grsai_gpt_images"
+
+        def generate_with_reference(self, *args, **kwargs):
+            raise RuntimeError("reference rejected")
+
+    cfg = _config_with_framework_diagram(render_mode="hybrid")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(fd, "build_framework_diagram_providers",
+                            lambda **kw: [_FailingHybridProvider()])
+
+        def degenerate_composite(*args, output_path, **kwargs):
+            from PIL import Image
+            Image.new("RGB", (2000, 1000), "white").save(output_path, format="PNG")
+
+        monkeypatch.setattr(fd, "_compose_hybrid_framework", degenerate_composite)
+        artifacts, png_path = fd.generate_framework_diagram_artifacts(
+            paper_text="# Test\nInput data model output",
+            config=cfg,
+            output_dir=tmp_path,
+            llm=None,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert png_path is None
+    assert "framework_diagram.png" not in artifacts
+    assert not (tmp_path / "framework_diagram.png").exists()
+    assert not (tmp_path / "framework_diagram_generation.json").exists()
 
 
 def test_orchestrator_hybrid_survives_provider_failure(tmp_path: Path) -> None:
@@ -983,7 +1068,7 @@ def test_generation_evidence_verifier_rejects_artifact_and_ledger_tampering(tmp_
         name = "audited"
 
         def generate(self, prompt, *, aspect_ratio, size):
-            return _PNG_BYTES
+            return _GOOD_PNG_BYTES
 
     cfg = _config_with_framework_diagram(render_mode="direct")
     monkeypatch = pytest.MonkeyPatch()
@@ -1017,6 +1102,201 @@ def test_generation_evidence_verifier_rejects_artifact_and_ledger_tampering(tmp_
     manifest["original_output"] = "../outside.png"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(fd.FrameworkDiagramVerificationError):
+        fd.verify_framework_diagram_artifacts(tmp_path)
+
+
+def test_review_rejected_provider_falls_through_to_the_next_provider(
+    tmp_path: Path,
+) -> None:
+    """A returned-but-unpublishable raster stays a succeeded ledger attempt,
+    then the orchestrator moves on to the next provider."""
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+    from researchclaw.agents.figure_agent.model_image_review import review_model_image
+    from researchclaw.llm.image_call_ledger import collect_image_call_records
+
+    tiny = _undersized_reviewable_png()
+    assert review_model_image(tiny)["issues"] == ["too_small"]
+
+    class _TinyProvider:
+        name = "tiny"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return tiny
+
+    class _GoodProvider:
+        name = "good"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _GOOD_PNG_BYTES
+
+    cfg = _config_with_framework_diagram(provider="auto", render_mode="direct")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            fd, "_generate_framework_diagram_prompt",
+            lambda paper_text, config, llm: (
+                "# Framework Diagram Prompt\n## Image Generation Prompt\nX\n"),
+            raising=False,
+        )
+        monkeypatch.setattr(fd, "build_framework_diagram_providers",
+                            lambda **kw: [_TinyProvider(), _GoodProvider()])
+        artifacts, png_path = fd.generate_framework_diagram_artifacts(
+            paper_text="# Test\n", config=cfg, output_dir=tmp_path, llm=None)
+    finally:
+        monkeypatch.undo()
+
+    assert png_path is not None and png_path.read_bytes() == _GOOD_PNG_BYTES
+    assert "framework_diagram_model_original.png" in artifacts
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert manifest["provider"] == "good"
+    assert manifest["image_review"]["status"] == "passed"
+    assert [(item["provider"], item["status"])
+            for item in manifest["generation_attempts"]] == [
+        ("tiny", "succeeded"), ("good", "succeeded")]
+    # The run-level accumulator may already hold records from earlier tests
+    # in the same process; this run's two attempts are the tail.
+    records = collect_image_call_records()[-2:]
+    assert [(record["provider"], record["status"]) for record in records] == [
+        ("tiny", "succeeded"), ("good", "succeeded")]
+    assert records[0]["image_bytes"] == len(tiny)
+
+
+def test_all_provider_images_failing_review_fall_back_to_matplotlib(
+    tmp_path: Path,
+) -> None:
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class _TinyProvider:
+        name = "tiny"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _undersized_reviewable_png()
+
+    cfg = _config_with_framework_diagram(provider="auto", render_mode="direct")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            fd, "_generate_framework_diagram_prompt",
+            lambda paper_text, config, llm: (
+                "# Framework Diagram Prompt\n## Image Generation Prompt\nX\n"),
+            raising=False,
+        )
+        monkeypatch.setattr(fd, "build_framework_diagram_providers",
+                            lambda **kw: [_TinyProvider(), _TinyProvider()])
+        fd.generate_framework_diagram_artifacts(
+            paper_text="# Test\n", config=cfg, output_dir=tmp_path, llm=None)
+    finally:
+        monkeypatch.undo()
+
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert manifest["provider"] == "matplotlib"
+    assert manifest["original_output"] is None
+    assert manifest["original_output_sha256"] is None
+    assert manifest["image_review"]["status"] == "passed"
+    assert [item["status"] for item in manifest["generation_attempts"]] == [
+        "succeeded", "succeeded"]
+    assert fd.verify_framework_diagram_artifacts(tmp_path)["provider"] == "matplotlib"
+
+
+def test_fallback_refuses_a_degenerate_render(tmp_path: Path) -> None:
+    """A degenerate deterministic render ships nothing: no file at the
+    fixed-path markdown reference, no manifest, ``None`` returned."""
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class _StaleProvider:
+        name = "stale"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _undersized_reviewable_png()
+
+    cfg = _config_with_framework_diagram(provider="auto", render_mode="direct")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            fd, "_generate_framework_diagram_prompt",
+            lambda paper_text, config, llm: (
+                "# Framework Diagram Prompt\n## Image Generation Prompt\nX\n"),
+            raising=False,
+        )
+        monkeypatch.setattr(fd, "build_framework_diagram_providers",
+                            lambda **kw: [_StaleProvider()])
+
+        def degenerate_render(*args, output_path, **kwargs):
+            from PIL import Image
+            Image.new("RGB", (2000, 1000), "white").save(output_path, format="PNG")
+
+        monkeypatch.setattr(fd, "_render_traditional_framework_diagram",
+                            degenerate_render)
+        artifacts, png_path = fd.generate_framework_diagram_artifacts(
+            paper_text="# Test\n", config=cfg, output_dir=tmp_path, llm=None)
+    finally:
+        monkeypatch.undo()
+
+    assert png_path is None
+    assert "framework_diagram.png" not in artifacts
+    assert not (tmp_path / "framework_diagram.png").exists()
+    assert not (tmp_path / "framework_diagram_generation.json").exists()
+
+
+def test_verifier_rejects_review_tampering_and_unreviewable_embeddings(
+    tmp_path: Path,
+) -> None:
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+    from researchclaw.agents.figure_agent.model_image_review import review_model_image
+
+    class _Provider:
+        name = "audited"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _GOOD_PNG_BYTES
+
+    cfg = _config_with_framework_diagram(render_mode="direct")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(fd, "build_framework_diagram_providers",
+                            lambda **kw: [_Provider()])
+        fd.generate_framework_diagram_artifacts(
+            paper_text="# Audit\nInput model output", config=cfg,
+            output_dir=tmp_path, llm=None)
+    finally:
+        monkeypatch.undo()
+    manifest_path = tmp_path / "framework_diagram_generation.json"
+    original_manifest = manifest_path.read_text("utf-8")
+
+    # Inflated measurement: the recorded review must equal the re-derivation.
+    manifest = json.loads(original_manifest)
+    manifest["image_review"]["width"] = 2048
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(fd.FrameworkDiagramVerificationError, match="review differs"):
+        fd.verify_framework_diagram_artifacts(tmp_path)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    # Schema 3 requires the review block; removing it fails the schema gate.
+    manifest = json.loads(original_manifest)
+    del manifest["image_review"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(fd.FrameworkDiagramVerificationError, match="schema"):
+        fd.verify_framework_diagram_artifacts(tmp_path)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    # A degenerate raster with an honestly recorded failed review is still
+    # unpublishable: the second gate rejects the embedding itself.
+    import io
+
+    from PIL import Image
+    blank = io.BytesIO()
+    Image.new("RGB", (2000, 1000), "white").save(blank, format="PNG")
+    blank_bytes = blank.getvalue()
+    (tmp_path / "framework_diagram.png").write_bytes(blank_bytes)
+    manifest = json.loads(original_manifest)
+    manifest["provider"] = "matplotlib"
+    manifest["original_output"] = None
+    manifest["original_output_sha256"] = None
+    manifest["image_sha256"] = hashlib.sha256(blank_bytes).hexdigest()
+    manifest["image_review"] = review_model_image(blank_bytes)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(fd.FrameworkDiagramVerificationError,
+                       match="failed the raster publication review"):
         fd.verify_framework_diagram_artifacts(tmp_path)
 
 
