@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 from unittest import mock
@@ -758,11 +759,16 @@ def test_orchestrator_falls_back_when_all_providers_fail(tmp_path: Path) -> None
         monkeypatch.undo()
 
     assert "framework_diagram_prompt.md" in artifacts
+    assert "framework_diagram_image_prompt.txt" in artifacts
     assert "framework_diagram.png" in artifacts
     assert png_path is not None
     assert png_path.exists()
     assert png_path.stat().st_size > 1024
     assert png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["original_output"] is None
+    assert [item["status"] for item in manifest["generation_attempts"]] == ["failed", "failed"]
 
 
 def test_orchestrator_uses_first_successful_provider(tmp_path: Path) -> None:
@@ -815,8 +821,19 @@ def test_orchestrator_uses_first_successful_provider(tmp_path: Path) -> None:
         monkeypatch.undo()
 
     assert "framework_diagram.png" in artifacts
+    assert "framework_diagram_model_original.png" in artifacts
     assert png_path is not None
     assert png_path.read_bytes() == _PNG_BYTES
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    prompt_bytes = (tmp_path / manifest["prompt_artifact"]).read_bytes()
+    assert prompt_bytes
+    assert manifest["prompt_sha256"] == hashlib.sha256(prompt_bytes).hexdigest()
+    assert manifest["original_output"] == "framework_diagram_model_original.png"
+    assert manifest["original_output_sha256"] == hashlib.sha256(_PNG_BYTES).hexdigest()
+    assert manifest["generation_attempts"] == [
+        {"provider": "failing", "mode": "prompt", "status": "failed", "error_type": "RuntimeError"},
+        {"provider": "good", "mode": "prompt", "status": "succeeded"},
+    ]
 
 
 def test_orchestrator_hybrid_locks_semantics_and_records_candidate(
@@ -873,8 +890,13 @@ def test_orchestrator_hybrid_locks_semantics_and_records_candidate(
         (tmp_path / "framework_diagram_generation.json").read_text("utf-8")
     )
     assert manifest["render_mode"] == "hybrid"
+    assert manifest["schema_version"] == 2
     assert all(manifest["semantic_lock"].values())
     assert manifest["visual_influence"] == 0.06
+    assert manifest["original_output_sha256"] == hashlib.sha256(
+        (tmp_path / "framework_diagram_visual_candidate.png").read_bytes()).hexdigest()
+    assert manifest["generation_attempts"] == [
+        {"provider": "grsai_gpt_images", "mode": "reference", "status": "succeeded"}]
 
 
 def test_orchestrator_hybrid_survives_provider_failure(tmp_path: Path) -> None:
@@ -952,6 +974,50 @@ def test_orchestrator_hybrid_retries_text_free_candidate(
         monkeypatch.undo()
     assert png_path is not None and png_path.exists()
     assert "framework_diagram_visual_candidate.png" in artifacts
+
+
+def test_generation_evidence_verifier_rejects_artifact_and_ledger_tampering(tmp_path: Path) -> None:
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class _Provider:
+        name = "audited"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _PNG_BYTES
+
+    cfg = _config_with_framework_diagram(render_mode="direct")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(fd, "build_framework_diagram_providers", lambda **kw: [_Provider()])
+        fd.generate_framework_diagram_artifacts(
+            paper_text="# Audit\nInput model output", config=cfg, output_dir=tmp_path, llm=None)
+    finally:
+        monkeypatch.undo()
+    assert fd.verify_framework_diagram_artifacts(tmp_path)["provider"] == "audited"
+
+    for name in ("framework_diagram_image_prompt.txt", "framework_diagram_model_original.png",
+                 "framework_diagram.png"):
+        path = tmp_path / name
+        original = path.read_bytes()
+        path.write_bytes(original + b"tamper")
+        with pytest.raises(fd.FrameworkDiagramVerificationError):
+            fd.verify_framework_diagram_artifacts(tmp_path)
+        path.write_bytes(original)
+
+    manifest_path = tmp_path / "framework_diagram_generation.json"
+    original_manifest = manifest_path.read_text("utf-8")
+    manifest = json.loads(original_manifest)
+    manifest["generation_attempts"][0]["error_type"] = "Fabricated"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(fd.FrameworkDiagramVerificationError):
+        fd.verify_framework_diagram_artifacts(tmp_path)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    manifest = json.loads(original_manifest)
+    manifest["original_output"] = "../outside.png"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(fd.FrameworkDiagramVerificationError):
+        fd.verify_framework_diagram_artifacts(tmp_path)
 
 
 def test_orchestrator_disabled_returns_empty(tmp_path: Path) -> None:

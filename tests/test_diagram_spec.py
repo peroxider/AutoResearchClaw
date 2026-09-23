@@ -6,7 +6,7 @@ import pytest
 
 from researchclaw.literature.evidence import write_json
 from researchclaw.pipeline.diagram_spec import (
-    DiagramError, diagram_bytes, method_diagrams, validate_diagram,
+    DiagramError, diagram_bytes, diagram_visual_review, method_diagrams, paginate_diagram, validate_diagram,
 )
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 from researchclaw.pipeline.publication_assets import AssetError, prepare_assets, verify_assets
@@ -29,7 +29,7 @@ def looping(method):
 
 def test_source_has_exact_ports_equations_groups_without_domain_defaults(method):
     doc = compile_method(method)
-    diagram, = method_diagrams(doc)
+    diagram = next(item for item in method_diagrams(doc) if item["kind"] == "architecture")
     assert diagram["source_method_version"] == doc["version"]
     assert diagram["groups"] == [{"id": "inference", "nodes": ["predict"]}]
     assert diagram["nodes"][0]["ports"] == [
@@ -42,9 +42,24 @@ def test_source_has_exact_ports_equations_groups_without_domain_defaults(method)
     assert validate_diagram(diagram, doc) == diagram
 
 
+def test_data_flow_is_bipartite_declared_reads_and_writes_without_producer_guessing(method):
+    doc = compile_method(method)
+    diagram = next(item for item in method_diagrams(doc) if item["kind"] == "data_flow")
+    assert {node["id"] for node in diagram["nodes"]} == {"var-X", "var-W", "var-Y", "step-predict"}
+    assert {(edge["source"], edge["target"], edge["type"], edge["label"]) for edge in diagram["edges"]} == {
+        ("var-X", "step-predict", "declared_read", "X / read"),
+        ("var-W", "step-predict", "declared_read", "W / read"),
+        ("step-predict", "var-Y", "declared_write", "Y / write"),
+    }
+    assert diagram["data_flow_scope"].endswith("not observed runtime tensor flow")
+    assert validate_diagram(diagram, doc) == diagram
+
+
 def test_explicit_loop_keeps_true_false_stop_and_unknown_termination(method):
     doc = compile_method(looping(method))
-    architecture, flow = method_diagrams(doc)
+    diagrams = method_diagrams(doc)
+    architecture = next(item for item in diagrams if item["kind"] == "architecture")
+    flow = next(item for item in diagrams if item["kind"] == "execution")
     assert architecture["kind"] == "architecture" and architecture["edges"] == []
     assert flow["kind"] == "execution" and flow["entry"] == "run"
     assert flow["termination"] == "unproved"
@@ -96,7 +111,7 @@ def test_control_path_cannot_skip_a_required_dependency(method):
     ("equation_refs", []), ("ports", []), ("source_step", "other")])
 def test_rehashed_labels_or_ports_cannot_override_method(method, field, value):
     doc = compile_method(method)
-    diagram, = method_diagrams(doc)
+    diagram = next(item for item in method_diagrams(doc) if item["kind"] == "architecture")
     diagram["nodes"][0][field] = value
     diagram["id"] = "diagram-" + content_hash(diagram)[:24]
     with pytest.raises(DiagramError):
@@ -146,7 +161,7 @@ def test_source_change_invalidates_all_diagram_exports(tmp_path, method):
     with pytest.raises(AssetError, match="specification"):
         verify_assets(tmp_path)
     new = prepare_assets(tmp_path)
-    assert len(new["spec"]["diagrams"]) == 2
+    assert len(new["spec"]["diagrams"]) == 3
     assert not set(d["id"] for d in old["spec"]["diagrams"]) & set(d["id"] for d in new["spec"]["diagrams"])
     assert verify_assets(tmp_path) == new
 
@@ -159,10 +174,49 @@ def test_svg_escapes_untrusted_condition_and_does_not_run_tex(method):
 
 
 def test_large_label_fails_explicitly_instead_of_clipping(method):
-    diagram, = method_diagrams(compile_method(method))
+    diagram = next(item for item in method_diagrams(compile_method(method)) if item["kind"] == "architecture")
     diagram["nodes"][0]["label"] = "too long " * 500
     with pytest.raises(DiagramError, match="label budget"):
         diagram_bytes(diagram, "png")
+
+
+def test_large_graph_is_paginated_without_dropping_nodes_or_cross_page_edges():
+    nodes = [{"id": f"n{index}", "kind": "step", "label": f"step {index}", "phase": "train",
+              "source_step": f"n{index}", "equation_refs": [], "ports": []}
+             for index in range(18)]
+    edges = [{"source": f"n{index}", "target": f"n{index + 1}", "type": "dependency",
+              "label": "dependency", "loop": False} for index in range(17)]
+    full = {"schema_version": 1, "kind": "architecture", "source_method_version": "fixture",
+            "method_id": "large", "nodes": nodes, "edges": edges,
+            "groups": [{"id": "train", "nodes": [node["id"] for node in nodes]}],
+            "implementation_equivalence": "unresolved", "termination": "unproved"}
+    full["id"] = "diagram-" + content_hash(full)[:24]
+    pages = paginate_diagram(full)
+    assert [page["page"] for page in pages] == [1, 2, 3]
+    assert all(page["page_count"] == 3 and len(page["nodes"]) <= 8 for page in pages)
+    assert {node["id"] for page in pages for node in page["nodes"]} == {node["id"] for node in nodes}
+    cross = [edge for page in pages for edge in page["cross_page_edges"]]
+    assert len(cross) == 4  # n7→n8 and n15→n16 appear on both endpoint pages.
+    assert all(page["source_diagram_id"] == full["id"] for page in pages)
+    svg = diagram_bytes(pages[0], "svg")
+    assert b"continuation: to page 2: n8 [dependency]" in svg
+
+
+def test_method_diagrams_automatically_publish_every_large_method_page(monkeypatch):
+    steps = [{"id": f"s{index}", "phase": "train", "description": f"step {index}",
+              "inputs": ["X"], "outputs": ["Y"],
+              "equations": [], "depends_on": [] if index == 0 else [f"s{index - 1}"]}
+             for index in range(17)]
+    document = {"version": "fixture-version", "step_order": [step["id"] for step in steps],
+                "spec": {"method_id": "large_method", "steps": steps,
+                         "variables": {"X": {"shape": [1], "description": "input"},
+                                       "Y": {"shape": [1], "description": "output"}}}}
+    monkeypatch.setattr("researchclaw.pipeline.research_workbench.compile_method", lambda spec: document)
+    pages = method_diagrams(document)
+    architecture = [page for page in pages if page["kind"] == "architecture"]
+    assert len(architecture) == 3
+    assert sum(len(page["nodes"]) for page in architecture) == 17
+    assert all(validate_diagram(page, document) == page for page in pages)
 
 
 def test_missing_font_glyph_fails_instead_of_exporting_tofu(method):
@@ -187,9 +241,37 @@ def test_chinese_labels_are_rendered_or_explicitly_rejected(method):
 def test_rehashed_visual_review_cannot_claim_unperformed_check(tmp_path, method):
     write_json(tmp_path / "method_spec.json", compile_method(method))
     report = prepare_assets(tmp_path)
-    report["visual_review"] = "verified"
+    report["visual_review"] = "human_verified"
     report.pop("version")
     report["version"] = content_hash(report)
     write_json(tmp_path / "publication_assets.json", report)
     with pytest.raises(AssetError):
         verify_assets(tmp_path)
+
+
+def test_machine_geometry_review_is_bound_to_each_diagram(method):
+    diagram = next(item for item in method_diagrams(compile_method(method)) if item["kind"] == "data_flow")
+    review = diagram_visual_review(diagram)
+    assert review["status"] == "passed"
+    assert review["diagram_id"] == diagram["id"]
+    assert review["attempt"] <= review["max_attempts"] == 3
+    assert review["checks"] == ["node_labels_inside_boxes", "annotations_inside_canvas",
+                                "node_boxes_disjoint", "edge_lanes_outside_nodes", "all_declared_edges_rendered"]
+    assert review["scope"].startswith("Rendered geometry")
+
+
+def test_geometry_review_repairs_only_within_fixed_attempt_budget(monkeypatch, method):
+    import researchclaw.pipeline.diagram_spec as module
+    diagram = next(item for item in method_diagrams(compile_method(method)) if item["kind"] == "architecture")
+    original = module._diagram_render
+
+    def fail_widest_once(candidate, format, *, wrap_width):
+        if wrap_width == 46:
+            raise DiagramError("Node label does not fit; simplify or split the source method")
+        return original(candidate, format, wrap_width=wrap_width)
+
+    monkeypatch.setattr(module, "_diagram_render", fail_widest_once)
+    review = module.diagram_visual_review(diagram)
+    assert review["attempt"] == 2 and review["wrap_width"] == 40
+    assert review["repairs"] == [{"attempt": 1, "wrap_width": 46,
+                                  "issue": "Node label does not fit; simplify or split the source method"}]

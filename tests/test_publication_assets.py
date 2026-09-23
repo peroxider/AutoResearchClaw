@@ -40,7 +40,9 @@ def test_assets_retain_zero_effect_every_seed_and_complete_result_ids(study):
     root, _ = study
     report = prepare_assets(root)
     assert verify_assets(root) == report
-    assert report["visual_review"] == "unavailable"
+    assert report["visual_review"] == "machine_checked_geometry"
+    assert set(report["visual_reviews"]) == {item["id"] for item in report["spec"]["diagrams"]}
+    assert all(item["status"] == "passed" for item in report["visual_reviews"].values())
     figures = report["spec"]["figures"]
     assert len(figures) == 2 and all(f["mean_difference"] == 0 for f in figures)
     assert all({r["seed"] for r in f["rows"]} == {"7", "42"} for f in figures)
@@ -48,6 +50,44 @@ def test_assets_retain_zero_effect_every_seed_and_complete_result_ids(study):
     for figure in figures:
         assert (root / f"publication_assets/{figure['id']}.png").read_bytes().startswith(b"\x89PNG")
         assert (root / f"publication_assets/{figure['id']}.pdf").read_bytes().startswith(b"%PDF-")
+
+
+def test_frozen_dataset_split_diagram_preserves_counts_and_private_label_boundary(study):
+    root, _ = study
+    report = prepare_assets(root)
+    diagram = next(item for item in report["spec"]["diagrams"] if item["kind"] == "dataset_split")
+    assert diagram["dataset"] == "demo"
+    labels = {node["id"]: node["label"] for node in diagram["nodes"]}
+    assert "Train: 36 rows" in labels["train"]
+    assert "Validation: 12 rows" in labels["validation"]
+    assert "Test features: 12 rows" in labels["test_features"]
+    assert "Private test labels: 12 rows" in labels["test_labels"]
+    assert diagram["groups"][1] == {"id": "host_private", "nodes": ["test_labels"]}
+    sections = render_asset_sections(root)
+    assert "host-only evidence artifact" in sections["experiments"][0]
+    for extension, prefix in (("svg", b"<?xml"), ("png", b"\x89PNG"), ("pdf", b"%PDF-")):
+        assert (root / f"publication_assets/{diagram['id']}.{extension}").read_bytes().startswith(prefix)
+
+    diagram["nodes"][1]["label"] = "Train: 999 rows"
+    report.pop("version")
+    report["version"] = content_hash(report)
+    write_json(root / "publication_assets.json", report)
+    with pytest.raises(AssetError, match="specification"):
+        verify_assets(root)
+
+
+def test_research_overview_uses_frozen_protocol_without_causal_claims(study):
+    root, _ = study
+    report = prepare_assets(root)
+    overview = next(item for item in report["spec"]["diagrams"] if item["kind"] == "research_overview")
+    labels = {node["id"]: node["label"] for node in overview["nodes"]}
+    assert "demo" in labels["datasets"]
+    assert "Z_base (baseline)" in labels["methods"] and "A_full (proposed)" in labels["methods"]
+    assert "rq_main (main)" in labels["questions"] and "rq_ablation (ablation)" in labels["questions"]
+    assert overview["semantic_scope"].endswith("do not establish causality or scientific validity")
+    sections = render_asset_sections(root)
+    assert "do not establish causality" in sections["introduction"][0]
+    assert f"publication_assets/{overview['id']}.pdf" in sections["introduction"][1]
 
 
 def test_plots_are_deterministic_and_immune_to_global_style_changes(study):
@@ -110,6 +150,44 @@ def test_method_and_proof_assets_share_exact_source_and_keep_unresolved_status(s
         validate_manuscript(root, report)
 
 
+def test_auto_split_theory_parts_retain_part_level_source_in_assets(study):
+    root, _ = study
+    proof = {"schema_version": 1, "definitions": {}, "obligations": [{
+        "id": "compound", "required": True, "depends_on": [], "assumptions": [],
+        "statement": {"kind": "conjunction", "parts": [
+            {"kind": "polynomial_identity", "variables": ["x"], "left": "(x+1)**2", "right": "x**2+2*x+1"},
+            {"kind": "informal", "text": "A bounded informal subclaim", "proof_text": "Part-level proof attempt"},
+        ]}}]}
+    write_json(root / "theory_bundle.json", compile_theory(proof))
+    assets = content_spec(root)
+    indexed = {item["id"]: item for item in assets["proofs"]}
+    assert indexed["compound_part1"]["status"] == "machine_checked"
+    assert indexed["compound_part2"]["proof_text"] == "Part-level proof attempt"
+    assert indexed["compound"]["status"] == "unresolved"
+
+
+def test_informal_decomposition_parts_and_review_cap_reach_publication_assets(study):
+    from tests.test_research_workbench import decomposed
+    root, _ = study
+    proof = decomposed()
+    part = proof["obligations"][0]["statement"]["parts"][1]
+    part["statement"] = {"kind": "informal", "text": "A scoped descent lemma."}
+    part["proof_text"] = "Reviewed proof text retained at the generated child obligation."
+    part["review"] = {"checker": "named proof reviewer", "verdict": "accepted",
+                      "evidence": "Line-by-line scoped review."}
+    write_json(root / "theory_bundle.json", compile_theory(proof))
+    indexed = {item["id"]: item for item in content_spec(root)["proofs"]}
+    assert indexed["main_theorem__descent"]["proof_text"].startswith("Reviewed proof text")
+    assert indexed["main_theorem__descent"]["status"] == "reviewed_informal"
+    assert indexed["main_theorem"]["status"] == "reviewed_informal"
+    assert indexed["main_theorem"]["evidence"]["machine_status_cap"] == "reviewed_informal"
+    prepare_assets(root)
+    sections = render_asset_sections(root)
+    assert "Typed linear arithmetic implication" in sections["theory"][0]
+    assert "Under regularity condition R" in sections["theory"][0]
+    assert "Reviewed proof text retained" in sections["theory"][0]
+
+
 def test_label_and_direction_swaps_fail_even_after_rehash(study):
     root, _ = study
     report = prepare_assets(root)
@@ -160,12 +238,13 @@ def test_method_control_diagrams_are_part_of_exact_manuscript_exports(study, met
     verify_exports(root)
     report = verify_assets(root)
     diagrams = report["spec"]["diagrams"]
-    assert {d["kind"] for d in diagrams} == {"architecture", "execution"}
+    assert {d["kind"] for d in diagrams} == {
+        "architecture", "execution", "data_flow", "dataset_split", "research_overview"}
     md, tex = ((root / name).read_text(encoding="utf-8") for name in ("paper_final.md", "paper.tex"))
     for diagram in diagrams:
         assert f"publication_assets/{diagram['id']}.png" in md
         assert f"publication_assets/{diagram['id']}.pdf" in tex
-    path = root / f"publication_assets/{diagrams[1]['id']}.pdf"
+    path = root / f"publication_assets/{next(d for d in diagrams if d['kind'] == 'execution')['id']}.pdf"
     path.write_bytes(b"different diagram")
     with pytest.raises(AssetError, match="Diagram"):
         verify_exports(root)

@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -400,9 +401,42 @@ def _execute_paper_revision(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     if (run_dir / "manuscript_ir.json").is_file():
-        from researchclaw.pipeline.manuscript import execute_writing_stage
-        return execute_writing_stage(stage_dir, run_dir, config, llm=llm, revision=True,
-                                     feedback=_read_prior_artifact(run_dir, "reviews.md") or "")
+        from researchclaw.pipeline.manuscript import (
+            render_manuscript, revise_manuscript_issues, validate_manuscript, validate_peer_review,
+        )
+        from researchclaw.literature.evidence import write_json
+        from researchclaw.llm import build_reviewer_llm
+        try:
+            peer_path = _find_prior_file(run_dir, "manuscript_peer_review.json")
+            if peer_path is None:
+                raise ValueError("Structured manuscript peer review is missing")
+            peer = json.loads(peer_path.read_text(encoding="utf-8"))
+            validate_peer_review(run_dir, peer)
+            issue_ids = [item["issue_id"] for item in peer["issues"]]
+            if issue_ids:
+                report = revise_manuscript_issues(
+                    run_dir, peer, issue_ids, llm=llm,
+                    reviewer=(build_reviewer_llm(config) or llm) if llm is not None else None,
+                    max_calls=config.research.manuscript_max_calls)
+                artifacts = ["paper_revised.md", "manuscript_task_report.json", "manuscript_revision.json"]
+                shutil.copy2(run_dir / "manuscript_revision.json", stage_dir / "manuscript_revision.json")
+            else:
+                report = json.loads((run_dir / "manuscript_ir.json").read_text(encoding="utf-8"))
+                validate_manuscript(run_dir, report)
+                artifacts = ["paper_revised.md", "manuscript_task_report.json"]
+            text, _ = render_manuscript(run_dir, report)
+            (stage_dir / "paper_revised.md").write_text(text["paper_final.md"], encoding="utf-8", newline="")
+            write_json(stage_dir / "manuscript_task_report.json", {
+                "status": "reviewed", "ir_version": report["version"],
+                "peer_review_version": peer["version"], "closed_issue_ids": issue_ids})
+            return StageResult(stage=Stage.PAPER_REVISION, status=StageStatus.DONE,
+                               artifacts=tuple(artifacts), evidence_refs=("manuscript_ir.json",),
+                               decision="issues_closed" if issue_ids else "no_revision_required")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            write_json(stage_dir / "manuscript_task_report.json", {"status": "incomplete", "error": str(exc)})
+            return StageResult(stage=Stage.PAPER_REVISION, status=StageStatus.PAUSED,
+                               artifacts=("manuscript_task_report.json",),
+                               decision="manuscript_revision_incomplete", error=str(exc))
     draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
     reviews = _read_prior_artifact(run_dir, "reviews.md") or ""
     draft_word_count = len(draft.split())

@@ -10,7 +10,8 @@ from researchclaw.pipeline.evidence_store import content_hash
 from researchclaw.pipeline.manuscript import (
     CHECK_SYSTEM, SECTION_SYSTEM, WRITE_SYSTEM, ManuscriptError, build_manuscript,
     evidence_catalog, export_manuscript, package_manuscript, quality_report,
-    render_manuscript, review_manuscript, section_tasks, validate_manuscript, verify_exports,
+    render_manuscript, review_manuscript, revise_manuscript_issues, section_tasks,
+    validate_manuscript, validate_peer_review, verify_exports, verify_manuscript_revision,
 )
 from researchclaw.pipeline.stages import StageStatus
 from tests.test_research_inputs import inputs
@@ -269,6 +270,114 @@ def test_peer_review_uses_complete_sections_and_budget_absence_is_unknown(study)
     assert unknown["status"] == "needs_revision" and unknown["calls"] == 1
 
 
+class FindingReviewer(Writer):
+    def __init__(self):
+        super().__init__()
+        self.finding_emitted = False
+
+    def chat(self, messages, *, system, **kwargs):
+        response = super().chat(messages, system=system, **kwargs)
+        if system == CHECK_SYSTEM and not self.finding_emitted:
+            self.finding_emitted = True
+            response.content = json.dumps({"status": "contradicted",
+                                           "rationale": "The first paragraph needs a narrower evidence-bound claim."})
+        return response
+
+
+class RevisionWriter(Writer):
+    def chat(self, messages, *, system, **kwargs):
+        response = super().chat(messages, system=system, **kwargs)
+        if system == WRITE_SYSTEM:
+            data = json.loads(response.content)
+            data["blocks"][0]["text"] = (
+                "The evidence supports only the declared comparison and frozen conditions; "
+                "alternative mechanisms and broader populations remain untested.")
+            response.content = json.dumps(data)
+        return response
+
+
+class SectionFindingReviewer(Writer):
+    def __init__(self):
+        super().__init__()
+        self.finding_emitted = False
+
+    def chat(self, messages, *, system, **kwargs):
+        response = super().chat(messages, system=system, **kwargs)
+        if system == SECTION_SYSTEM and not self.finding_emitted:
+            self.finding_emitted = True
+            response.content = json.dumps({"status": "failed", "score": 3,
+                                           "issues": ["The section contract needs a narrower synthesis."]})
+        return response
+
+
+def test_issue_directed_revision_changes_only_targeted_section_and_requires_reviewer_closure(study):
+    root, _ = study
+    before = build(study)
+    peer = review_manuscript(root, reviewer=FindingReviewer())
+    validate_peer_review(root, peer)
+    assert peer["status"] == "needs_revision" and len(peer["issues"]) == 1
+    issue = peer["issues"][0]
+    assert issue["checker"] == "paragraph_support" and issue["repair_owner"] == "manuscript"
+    old_hashes = {section["task"]["id"]: content_hash(section) for section in before["sections"]}
+    revised = revise_manuscript_issues(root, peer, [issue["issue_id"]], llm=RevisionWriter())
+    validate_manuscript(root, revised)
+    record = verify_manuscript_revision(root)
+    assert record["status"] == "closed" and record["selected_issue_ids"] == [issue["issue_id"]]
+    for section in revised["sections"]:
+        sid = section["task"]["id"]
+        if sid == issue["section_id"]:
+            assert content_hash(section) != old_hashes[sid]
+        else:
+            assert content_hash(section) == old_hashes[sid]
+
+
+def test_targeted_revision_rejects_unknown_issue_and_unsupported_repair(study):
+    root, _ = study
+    original = build(study)
+    peer = review_manuscript(root, reviewer=FindingReviewer())
+    with pytest.raises(ManuscriptError, match="unknown"):
+        revise_manuscript_issues(root, peer, ["0" * 64], llm=RevisionWriter())
+    with pytest.raises(ManuscriptError, match="did not earn"):
+        revise_manuscript_issues(root, peer, [peer["issues"][0]["issue_id"]],
+                                 llm=Writer(unsupported=True))
+    assert json.loads((root / "manuscript_ir.json").read_text()) == original
+
+
+def test_targeted_revision_rejects_noop_and_expands_section_issue_only_within_section(study):
+    root, _ = study
+    before = build(study)
+    paragraph_peer = review_manuscript(root, reviewer=FindingReviewer())
+    with pytest.raises(ManuscriptError, match="unchanged paragraph"):
+        revise_manuscript_issues(root, paragraph_peer, [paragraph_peer["issues"][0]["issue_id"]], llm=Writer())
+    assert json.loads((root / "manuscript_ir.json").read_text()) == before
+
+    section_reviewer = SectionFindingReviewer()
+    peer = review_manuscript(root, reviewer=section_reviewer)
+    issue = peer["issues"][0]
+    assert issue["checker"] == "section_contract" and issue["block"] is None
+    old_hashes = {section["task"]["id"]: content_hash(section) for section in before["sections"]}
+    revised = revise_manuscript_issues(root, peer, [issue["issue_id"]], llm=RevisionWriter(),
+                                       reviewer=section_reviewer)
+    verify_manuscript_revision(root)
+    for section in revised["sections"]:
+        sid = section["task"]["id"]
+        assert (content_hash(section) != old_hashes[sid]) == (sid == issue["section_id"])
+
+
+def test_rehashed_revision_record_cannot_self_close_issue(study):
+    root, _ = study
+    build(study)
+    peer = review_manuscript(root, reviewer=FindingReviewer())
+    revise_manuscript_issues(root, peer, [peer["issues"][0]["issue_id"]], llm=RevisionWriter())
+    path = root / "manuscript_revision.json"
+    record = json.loads(path.read_text())
+    record["closures"][0]["closure"] = "author_claimed_fixed"
+    rehash(record)
+    write_json(path, record)
+    with pytest.raises(ManuscriptError, match="closure evidence"):
+        verify_manuscript_revision(root)
+
+
 def test_changed_authoritative_evidence_discards_cached_sections(study):
     root, _ = study
     first = build(study)
@@ -295,3 +404,44 @@ def test_model_cannot_insert_even_plausible_raw_metric_literals(study):
     assert report["status"] == "incomplete"
     assert any("generated result records" in error for section in report["sections"]
                for attempt in section["attempts"] for error in attempt["errors"])
+
+
+# ---------------------------------------------------------------------------
+# contribution binding completeness: every ledger record reaches a section,
+# a rendered paragraph and non-empty spans in both exported formats
+# ---------------------------------------------------------------------------
+
+
+def test_every_contribution_reaches_a_task_and_paragraph_binding(study):
+    root, _ = study
+    catalog = evidence_catalog(root)
+    ids = {key for key, entry in catalog["entries"].items() if entry["kind"] == "contribution"}
+    assert ids
+    assert ids <= {key for task in section_tasks(catalog) for key in task["evidence_ids"]}
+    build(study)
+    export_manuscript(root, root)
+    manifest = json.loads((root / "manuscript_bindings.json").read_text(encoding="utf-8"))
+    md = (root / "paper_final.md").read_text(encoding="utf-8")
+    tex = (root / "paper.tex").read_text(encoding="utf-8")
+    covered = {}
+    for paragraph in manifest["paragraphs"]:
+        for key in paragraph["evidence_ids"]:
+            covered.setdefault(key, paragraph["spans"])
+    assert ids <= set(covered)
+    for key in ids:
+        for name, text in (("paper_final.md", md), ("paper.tex", tex)):
+            span = covered[key][name]
+            assert text[span["start"]:span["end"]].strip()
+    verify_exports(root)
+
+
+def test_unbound_contribution_fails_closed(monkeypatch):
+    from researchclaw.pipeline import manuscript as manuscript_module
+    catalog = {"dependencies": [], "version": "x",
+               "entries": {"contribution:abc": {"kind": "contribution",
+                                                "data": {"contribution_id": "abc", "kind": "theoretical_obligation"}}}}
+    entry_bound = {key for task in section_tasks(catalog) for key in task["evidence_ids"]}
+    assert "contribution:abc" in entry_bound
+    monkeypatch.setattr(manuscript_module, "CONTRACTS", {"methods": manuscript_module.CONTRACTS["methods"]})
+    with pytest.raises(ManuscriptError, match="not bound to any section"):
+        section_tasks(catalog)

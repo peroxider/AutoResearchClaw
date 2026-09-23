@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import re
+import statistics
 from pathlib import Path
 
 from researchclaw.literature.evidence import write_json
@@ -36,7 +37,7 @@ def _render_digest(figure: dict, format: str) -> str:
     key = content_hash(figure), format, content_hash(_backend())
     if key not in _RENDER_DIGESTS:
         from researchclaw.pipeline.diagram_spec import diagram_bytes
-        render = diagram_bytes if "source_method_version" in figure else chart_bytes
+        render = diagram_bytes if "nodes" in figure and "edges" in figure else chart_bytes
         _RENDER_DIGESTS[key] = hashlib.sha256(render(figure, format)).hexdigest()
     return _RENDER_DIGESTS[key]
 
@@ -109,6 +110,7 @@ def content_spec(root: Path) -> dict:
     from researchclaw.pipeline.research_workbench import compile_method, compile_theory
     from researchclaw.pipeline.experiment_protocol import load_protocol
     source_versions, equations, algorithm, proofs, figures, diagrams = {}, [], [], [], [], []
+    contract = None
     method_path, theory_path = root / "method_spec.json", root / "theory_bundle.json"
     if method_path.is_file():
         method = _read(method_path)
@@ -122,23 +124,42 @@ def content_spec(root: Path) -> dict:
                       "inputs": equation["inputs"], "outputs": equation["outputs"],
                       "source_version": method["version"]} for equation in spec["equations"]]
         steps = {step["id"]: step for step in spec["steps"]}
+        from researchclaw.pipeline.method_semantics import reported_equivalence
+        semantics = reported_equivalence(root, method)
         algorithm = {"method_id": spec["method_id"], "source_version": method["version"],
             "variables": spec["variables"], "steps": [steps[sid] for sid in method["step_order"]],
             "losses": spec["losses"], "stopping_rule": spec["stopping_rule"], "complexity": spec["complexity"],
-            "semantic_equivalence": method["semantic_equivalence"]}
+            "semantic_equivalence": semantics["status"], "semantic_reviewer": semantics["checker"]}
     if theory_path.is_file():
         theory = _read(theory_path)
         if compile_theory(theory["spec"]) != theory:
             raise AssetError("TheoryBundle changed")
         source_versions["theory_bundle.json"] = file_hash(theory_path)
         originals = {item["id"]: item for item in theory["spec"]["obligations"]}
+        for item in theory["spec"]["obligations"]:
+            if item["statement"].get("kind") == "conjunction":
+                for index, part in enumerate(item["statement"]["parts"], start=1):
+                    originals[f"{item['id']}_part{index}"] = part
+            elif item["statement"].get("kind") == "informal_decomposition":
+                for part in item["statement"]["parts"]:
+                    originals[f"{item['id']}__{part['id']}"] = part
         for obligation in theory["obligations"]:
             statement = obligation["statement"]
             equation = (polynomial_latex(statement["left"]) + " = " + polynomial_latex(statement["right"])) if statement["kind"] == "polynomial_identity" else ""
-            proofs.append({**obligation, "latex": equation, "proof_text": originals[obligation["id"]].get("proof_text", ""),
+            proofs.append({**obligation, "latex": equation, "proof_text": originals.get(obligation["id"], {}).get("proof_text", ""),
                            "definitions": theory["spec"]["definitions"], "source_version": theory["version"]})
+    if (root / "research_contract.json").is_file():
+        from researchclaw.research_inputs import verify_bundle_contract
+        from researchclaw.pipeline.diagram_spec import experiment_split_diagrams
+        contract = verify_bundle_contract(root)
+        source_versions["research_contract.json"] = file_hash(root / "research_contract.json")
+        diagrams.extend(experiment_split_diagrams(contract))
     protocol = load_protocol(root)
     if protocol is not None:
+        if contract is None:
+            raise AssetError("Experiment protocol requires its frozen ResearchContract")
+        from researchclaw.pipeline.diagram_spec import research_overview_diagram
+        diagrams.append(research_overview_diagram(contract, protocol))
         from researchclaw.pipeline.analysis_spec import build_analysis, analysis_figures, AnalysisError
         try:
             analysis = build_analysis(root)
@@ -156,12 +177,21 @@ def content_spec(root: Path) -> dict:
 
 def chart_csv(figure: dict) -> str:
     output = io.StringIO(newline="")
-    fields = ["seed", "baseline", "candidate", "difference", "baseline_result", "candidate_result"]
+    kind = figure.get("kind")
     rows = figure.get("rows", [])
-    if figure.get("kind") == "effect_summary":
+    if kind == "effect_summary":
+        fields = ["seed", "baseline", "candidate", "difference", "baseline_result", "candidate_result"]
         fields = ["analysis_id", "baseline_method", "candidate_method", *fields]
         rows = [{"analysis_id": item["analysis_id"], "baseline_method": item["baseline"], "candidate_method": item["candidate"], **row}
                 for item in figure["comparisons"] for row in item["pairs"]]
+    elif kind == "calibration":
+        fields = ["seed", "baseline_ece", "candidate_ece", "difference", "test_samples"]
+    elif kind == "efficiency_pareto":
+        fields = ["seed", "baseline", "candidate", "baseline_seconds", "candidate_seconds"]
+    elif kind == "learning_curve":
+        fields = ["seed", "step", "baseline", "candidate", "difference"]
+    else:
+        fields = ["seed", "baseline", "candidate", "difference", "baseline_result", "candidate_result"]
     writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
@@ -171,6 +201,12 @@ def chart_csv(figure: dict) -> str:
 def chart_bytes(figure: dict, format: str) -> bytes:
     if figure.get("kind") == "effect_summary":
         return effect_chart_bytes(figure, format)
+    if figure.get("kind") == "calibration":
+        return calibration_chart_bytes(figure, format)
+    if figure.get("kind") == "efficiency_pareto":
+        return pareto_chart_bytes(figure, format)
+    if figure.get("kind") == "learning_curve":
+        return learning_curve_chart_bytes(figure, format)
     import matplotlib
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -212,6 +248,142 @@ def chart_bytes(figure: dict, format: str) -> bytes:
             ax.spines[["top", "right"]].set_visible(False)
         plot.suptitle(fill(f"{figure['question']} / {figure['dataset']} / {figure['metric']}", 65), fontsize=12)
         plot.text(0.5, 0.015, "Training-seed variability on one frozen test split;\nno population inference.", ha="center", fontsize=10)
+        plot.tight_layout(rect=(0, 0.09, 1, 0.94))
+        buffer = io.BytesIO()
+        metadata = {"Creator": "AutoResearchClaw", "CreationDate": None, "ModDate": None} if format == "pdf" else {"Software": "AutoResearchClaw"}
+        plot.savefig(buffer, format=format, metadata=metadata)
+        return buffer.getvalue()
+
+
+def calibration_chart_bytes(figure: dict, format: str) -> bytes:
+    """Matched per-seed expected calibration error; ECE lies in [0, 1]."""
+    import matplotlib
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from textwrap import fill
+    settings = {key: value for key, value in matplotlib.rcParamsDefault.items() if key != "backend"}
+    settings.update({"font.family": "DejaVu Sans", "font.size": 11, "text.usetex": False})
+    with matplotlib.rc_context(settings):
+        plot = Figure(figsize=(6, 4.8), dpi=160)
+        FigureCanvasAgg(plot)
+        left, right = plot.subplots(1, 2)
+        rows = figure["rows"]
+        for row in rows:
+            left.plot([0, 1], [row["baseline_ece"], row["candidate_ece"]], color="#a6adb5", alpha=0.7, linewidth=1)
+        left.scatter([0] * len(rows), [r["baseline_ece"] for r in rows], color="#345b9a", label="Baseline", zorder=3)
+        left.scatter([1] * len(rows), [r["candidate_ece"] for r in rows], color="#c67520", label="Candidate", zorder=3)
+        left.set_xticks([0, 1], [fill(figure["baseline"], 18), fill(figure["candidate"], 18)])
+        left.set_ylabel("Expected calibration error")
+        left.set_ylim(-0.02, 1.02)
+        left.set_yticks([i / 5 for i in range(6)])
+        left.set_title("Matched seed ECE")
+        differences = [row["difference"] for row in rows]
+        right.axhline(0, color="#555555", linewidth=0.8)
+        right.scatter(range(len(rows)), differences, color="#345b9a", zorder=3)
+        right.axhline(figure["mean_difference"], color="#c67520", linestyle="--", label="Observed mean")
+        extent = max([abs(v) for v in differences] + [0.01]) * 1.2
+        right.set_ylim(-extent, extent)
+        right.set_xticks(range(len(rows)), [r["seed"] for r in rows], rotation=45 if len(rows) > 8 else 0)
+        right.set_xlabel("Training seed")
+        right.set_ylabel("Candidate minus baseline ECE")
+        right.set_title("Paired ECE differences")
+        right.legend(loc="best", fontsize=10)
+        for ax in (left, right):
+            ax.grid(axis="y", color="#e5e7eb", linewidth=0.5)
+            ax.spines[["top", "right"]].set_visible(False)
+        plot.suptitle(fill(f"{figure['question']} / {figure['dataset']} / {figure['metric']}: calibration", 60), fontsize=12)
+        plot.text(0.5, 0.015, f"ECE over {figure['bins']} equal-width score bins per training seed;\n"
+                             "lower is better. One frozen test split; no population claim.", ha="center", fontsize=10)
+        plot.tight_layout(rect=(0, 0.09, 1, 0.94))
+        buffer = io.BytesIO()
+        metadata = {"Creator": "AutoResearchClaw", "CreationDate": None, "ModDate": None} if format == "pdf" else {"Software": "AutoResearchClaw"}
+        plot.savefig(buffer, format=format, metadata=metadata)
+        return buffer.getvalue()
+
+
+def learning_curve_chart_bytes(figure: dict, format: str) -> bytes:
+    """Hash-bound experiment telemetry, with all seed traces retained."""
+    import matplotlib
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from textwrap import fill
+    settings = {key: value for key, value in matplotlib.rcParamsDefault.items() if key != "backend"}
+    settings.update({"font.family": "DejaVu Sans", "font.size": 11, "text.usetex": False})
+    with matplotlib.rc_context(settings):
+        plot = Figure(figsize=(6.4, 4.8), dpi=160)
+        FigureCanvasAgg(plot)
+        axis = plot.subplots()
+        seeds = list(dict.fromkeys(row["seed"] for row in figure["rows"]))
+        steps = sorted({row["step"] for row in figure["rows"]})
+        by_seed = {seed: [row for row in figure["rows"] if row["seed"] == seed] for seed in seeds}
+        colors = {"baseline": "#345b9a", "candidate": "#c67520"}
+        for seed in seeds:
+            for method in ("baseline", "candidate"):
+                axis.plot([row["step"] for row in by_seed[seed]], [row[method] for row in by_seed[seed]],
+                          color=colors[method], alpha=0.18, linewidth=0.9)
+        for method, label in (("baseline", figure["baseline"]), ("candidate", figure["candidate"])):
+            means = [statistics.fmean(row[method] for row in figure["rows"] if row["step"] == step)
+                     for step in steps]
+            axis.plot(steps, means, color=colors[method], linewidth=2.2, marker="o", markersize=3,
+                      label=fill(label, 28))
+        axis.set_xlabel("Declared training step")
+        axis.set_ylabel(f"{figure['curve_metric']} ({figure['curve_split']})")
+        axis.set_title(fill(f"{figure['question']} / {figure['dataset']}", 68))
+        axis.grid(color="#e5e7eb", linewidth=0.5)
+        axis.spines[["top", "right"]].set_visible(False)
+        axis.legend(loc="best", fontsize=9)
+        plot.text(0.5, 0.015, "Thin lines are frozen per-seed telemetry; bold lines are observed seed means.\n"
+                             "Host schema-validated, not independently recomputed; no convergence claim.",
+                  ha="center", fontsize=9)
+        plot.tight_layout(rect=(0, 0.1, 1, 0.98))
+        buffer = io.BytesIO()
+        metadata = {"Creator": "AutoResearchClaw", "CreationDate": None, "ModDate": None} \
+            if format == "pdf" else {"Software": "AutoResearchClaw"}
+        plot.savefig(buffer, format=format, metadata=metadata)
+        return buffer.getvalue()
+
+
+def pareto_chart_bytes(figure: dict, format: str) -> bytes:
+    """Efficiency positions of the two declared methods; wall-clock on one host."""
+    import matplotlib
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from textwrap import fill
+    settings = {key: value for key, value in matplotlib.rcParamsDefault.items() if key != "backend"}
+    settings.update({"font.family": "DejaVu Sans", "font.size": 11, "text.usetex": False})
+    with matplotlib.rc_context(settings):
+        plot = Figure(figsize=(6, 4.8), dpi=160)
+        FigureCanvasAgg(plot)
+        axis = plot.subplots()
+        rows, means = figure["rows"], figure["means"]
+        colors = {"baseline": "#345b9a", "candidate": "#c67520"}
+        # Faint per-seed observations show spread; no aggregation is invented.
+        for method in ("baseline", "candidate"):
+            axis.scatter([r[f"{method}_seconds"] for r in rows], [r[method] for r in rows],
+                         s=18, color=colors[method], alpha=0.45, zorder=2)
+        for method in ("baseline", "candidate"):
+            axis.scatter([means[method]["seconds"]], [means[method]["metric"]], s=90, marker="D",
+                         color=colors[method], zorder=4, edgecolors="black", linewidths=0.6,
+                         label=f"{figure[method]} (mean)")
+        # Declared direction, not an observed ranking: with two methods the
+        # frontier is their non-dominated subset, never a fitted curve.
+        low, high = (min(m["seconds"] for m in means.values()), max(m["seconds"] for m in means.values()))
+        metric_values = [m["metric"] for m in means.values()] + [v for r in rows for v in (r["baseline"], r["candidate"])]
+        axis.set_xlim(0, low + (high - low) * 2 + (high or 1) * 0.2)
+        pad = max(abs(v) for v in metric_values) * 0.15 if metric_values else 0.1
+        axis.set_ylim(min(metric_values) - pad, max(metric_values) + pad)
+        axis.annotate("", xy=(0.32, 0.96), xytext=(0.45, 0.96), xycoords="axes fraction",
+                      arrowprops=dict(arrowstyle="->", color="#555555"))
+        axis.text(0.46, 0.955, f"better: fewer seconds, {figure['metric_direction']} metric",
+                  transform=axis.transAxes, fontsize=9, va="center", color="#555555")
+        axis.set_xlabel("Wall-clock seconds per cell (frozen host ledger)")
+        axis.set_ylabel(fill(f"{figure['metric']} ({figure['unit']})", 30))
+        axis.legend(loc="best", fontsize=10)
+        axis.grid(color="#e5e7eb", linewidth=0.5)
+        axis.spines[["top", "right"]].set_visible(False)
+        plot.suptitle(fill(f"{figure['question']} / {figure['dataset']}: efficiency", 60), fontsize=12)
+        plot.text(0.5, 0.015, "Single-host wall-clock seconds from the frozen execution ledger;\n"
+                             "no cross-hardware, cost or statistical ranking claim.", ha="center", fontsize=10)
         plot.tight_layout(rect=(0, 0.09, 1, 0.94))
         buffer = io.BytesIO()
         metadata = {"Creator": "AutoResearchClaw", "CreationDate": None, "ModDate": None} if format == "pdf" else {"Software": "AutoResearchClaw"}
@@ -346,8 +518,10 @@ def prepare_assets(root: Path) -> dict:
             outputs[target.relative_to(root).as_posix()] = file_hash(target)
             if extension in {"png", "pdf"}:
                 _RENDER_DIGESTS[content_hash(figure), extension, content_hash(_backend())] = hashlib.sha256(data).hexdigest()
-    from researchclaw.pipeline.diagram_spec import diagram_bytes
+    from researchclaw.pipeline.diagram_spec import diagram_bytes, diagram_visual_review
+    visual_reviews = {}
     for diagram in spec["diagrams"]:
+        visual_reviews[diagram["id"]] = diagram_visual_review(diagram)
         for extension in ("svg", "png", "pdf"):
             data = diagram_bytes(diagram, extension)
             target = directory / (diagram["id"] + "." + extension)
@@ -358,7 +532,8 @@ def prepare_assets(root: Path) -> dict:
     script.write_text(REPRODUCE_SCRIPT, encoding="utf-8", newline="")
     outputs[script.relative_to(root).as_posix()] = file_hash(script)
     report = {"spec": spec, "outputs": outputs, "backend": _backend(),
-              "status": "rendered", "visual_review": "unavailable",
+              "status": "rendered", "visual_review": "machine_checked_geometry",
+              "visual_reviews": visual_reviews,
               "semantic_scope": "deterministic_values_labels_and_declared_topology"}
     report["version"] = content_hash(report)
     write_json(path, report)
@@ -383,14 +558,18 @@ def verify_assets(root: Path) -> dict:
             name = f"publication_assets/{figure['id']}.{format}"
             if file_hash(root / name) != _render_digest(figure, format):
                 raise AssetError("Figure differs from deterministic rendering of its evaluated source")
+    from researchclaw.pipeline.diagram_spec import diagram_visual_review
+    expected_reviews = {}
     for diagram in report["spec"]["diagrams"]:
+        expected_reviews[diagram["id"]] = diagram_visual_review(diagram)
         for format in ("svg", "png", "pdf"):
             name = f"publication_assets/{diagram['id']}.{format}"
             expected.add(name)
             if file_hash(root / name) != _render_digest(diagram, format):
                 raise AssetError("Diagram differs from deterministic rendering of MethodSpec")
     if (set(report["outputs"]) != expected or report.get("status") != "rendered"
-            or report.get("visual_review") != "unavailable"
+            or report.get("visual_review") != "machine_checked_geometry"
+            or report.get("visual_reviews") != expected_reviews
             or report.get("semantic_scope") != "deterministic_values_labels_and_declared_topology"):
         raise AssetError("Missing publication outputs")
     for name, digest in report["outputs"].items():
@@ -431,18 +610,46 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
         tex += "\\end{enumerate}\n"
         text = (f"Loss equations: {', '.join('eq-' + eid for eid in algorithm['losses']) or 'none'}. "
                 f"Stopping rule: {algorithm['stopping_rule']}. Declared complexity: time {algorithm['complexity']['time']}; "
-                f"space {algorithm['complexity']['space']}. Code/method semantic equivalence: {algorithm['semantic_equivalence']}.")
+                f"space {algorithm['complexity']['space']}. Code/method semantic equivalence: "
+                f"{algorithm['semantic_equivalence']}"
+                + (f" (reviewer: {algorithm['semantic_reviewer']})." if algorithm.get("semantic_reviewer") else ".")
+                + " An informal review is not a machine proof.")
         md += _md(text) + "\n\n"
         tex += _tex(text) + "\n\n"
-        for diagram in spec["diagrams"]:
-            caption = (f"Declared {diagram['kind']} of {diagram['method_id']}. "
-                       + ("Arrows are dependencies, not tensor flow or execution order. " if diagram["kind"] == "architecture"
-                          else "True/false arrows are declared decisions; dashed edges are loops. ")
-                       + "Node colors distinguish training and inference. Code equivalence and termination are unverified.")
+        for diagram in (item for item in spec["diagrams"] if "source_method_version" in item):
+            page = (f" Page {diagram['page']} of {diagram['page_count']}."
+                    if diagram.get("page_count", 1) > 1 else "")
+            semantics = ("Arrows are dependencies, not tensor flow or execution order. " if diagram["kind"] == "architecture"
+                         else "Variable-to-step arrows are declared reads and step-to-variable arrows are declared writes; "
+                              "they are not observed runtime tensors. " if diagram["kind"] == "data_flow"
+                         else "True/false arrows are declared decisions; dashed edges are loops. ")
+            caption = (f"Declared {diagram['kind']} of {diagram['method_id']}.{page} " + semantics
+                       + "Continuation annotations preserve cross-page edges. Node colors distinguish training and inference. "
+                         "Code equivalence and termination are unverified.")
             md += f"![{_md(caption)}](publication_assets/{diagram['id']}.png)\n\n"
             tex += ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
                     + diagram["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + diagram["id"] + "}\n\\end{figure}\n")
         fragments["methods"] = md, tex
+    split_diagrams = [item for item in spec["diagrams"] if item.get("kind") == "dataset_split"]
+    if split_diagrams:
+        md, tex = "", ""
+        for diagram in split_diagrams:
+            caption = (f"Frozen split for {diagram['dataset']}. Counts and split strategy come from the verified "
+                       "ResearchContract. Test labels remain in a host-only evidence artifact; this file separation "
+                       "does not establish operating-system isolation.")
+            md += f"![{_md(caption)}](publication_assets/{diagram['id']}.png)\n\n"
+            tex += ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
+                    + diagram["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + diagram["id"] + "}\n\\end{figure}\n")
+        fragments["experiments"] = md, tex
+    overview = next((item for item in spec["diagrams"] if item.get("kind") == "research_overview"), None)
+    if overview is not None:
+        caption = ("Frozen research overview derived from the ResearchContract and ExperimentProtocol. "
+                   "Arrows show declared inputs, comparisons and host evaluation flow; they do not establish "
+                   "causality, implementation fidelity or scientific validity.")
+        md = f"![{_md(caption)}](publication_assets/{overview['id']}.png)\n\n"
+        tex = ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
+               + overview["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + overview["id"] + "}\n\\end{figure}\n")
+        fragments["introduction"] = md, tex
     md, tex = "", ""
     for proof in spec["proofs"]:
         heading = "Obligation " + proof["id"] + " - " + proof["status"]
@@ -457,7 +664,18 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
             md += "$$\n" + proof["latex"] + "\n$$\n\n"
             tex += "\\begin{equation}\n" + proof["latex"] + "\n\\end{equation}\n"
         else:
-            statement = proof["statement"]["text"]
+            typed = proof["statement"]
+            if "text" in typed:
+                statement = typed["text"]
+            elif typed.get("kind") in {"rational_identity", "symbolic_equality"}:
+                statement = f"Typed {typed['kind']}: {typed['left']} = {typed['right']}."
+            elif typed.get("kind") == "linear_arithmetic":
+                statement = ("Typed linear arithmetic implication: "
+                             + json.dumps(typed, ensure_ascii=False, sort_keys=True) + ".")
+            elif typed.get("kind") == "conjunction":
+                statement = f"Typed conjunction of {len(typed['parts'])} generated proof obligations."
+            else:
+                statement = json.dumps(typed, ensure_ascii=False, sort_keys=True)
             md += _md(statement) + "\n\n"
             tex += _tex(statement) + "\n\n"
         detail = proof["proof_text"] or json.dumps(proof["evidence"], ensure_ascii=False, sort_keys=True)
@@ -472,6 +690,12 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
                        f"metric {figure['metric']} in {figure['unit']}. Gray points are matched training seeds; diamonds are observed means. "
                        "Intervals, when available, are predeclared paired-seed bootstrap intervals conditional on exchangeability. "
                        "Positive differences need not mean improvement. No population, significance or simultaneous-coverage claim is implied.")
+        elif figure.get("kind") == "learning_curve":
+            caption = (f"{figure['question']} on {figure['dataset']}: declared {figure['curve_split']} telemetry "
+                       f"for {figure['curve_metric']}, comparing {figure['candidate']} with {figure['baseline']}. "
+                       "Thin lines retain every training seed and bold lines are observed seed means. The frozen experiment "
+                       "process emitted these values; the host validated and hash-bound them but did not independently recompute "
+                       "the training metric. No test-performance or convergence claim is implied.")
         else:
             caption = (f"{figure['question']} on {figure['dataset']}: {figure['candidate']} versus {figure['baseline']}, "
                        f"metric {figure['metric']} in {figure['unit']}. Each point is a training seed; "

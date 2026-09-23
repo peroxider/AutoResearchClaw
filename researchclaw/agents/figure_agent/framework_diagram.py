@@ -1229,6 +1229,86 @@ def _compose_hybrid_framework(
 # ---------------------------------------------------------------------------
 
 
+class FrameworkDiagramVerificationError(ValueError):
+    pass
+
+
+def verify_framework_diagram_artifacts(output_dir: Path) -> dict:
+    """Verify the portable Stage 22 image-generation evidence chain."""
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "framework_diagram_generation.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise FrameworkDiagramVerificationError("Missing or invalid framework diagram manifest") from exc
+    common = {"schema_version", "artifact", "render_mode", "provider", "generation_attempts", "model",
+              "size", "aspect_ratio", "prompt_sha256", "prompt_artifact", "original_output_sha256",
+              "image_sha256"}
+    hybrid = {"semantic_source", "semantic_nodes", "visual_candidate", "professional_style",
+              "visual_influence", "semantic_lock", "skeleton_sha256"}
+    direct = {"original_output"}
+    mode = manifest.get("render_mode")
+    expected_fields = common | (hybrid if mode == "hybrid" else direct if mode == "direct" else set())
+    if set(manifest) != expected_fields or manifest.get("schema_version") != 2:
+        raise FrameworkDiagramVerificationError("Invalid framework diagram manifest schema")
+
+    def payload(name, expected_name, digest_field, *, image=False):
+        if name != expected_name:
+            raise FrameworkDiagramVerificationError("Unexpected framework diagram artifact path")
+        path = output_dir / expected_name
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise FrameworkDiagramVerificationError("Missing framework diagram artifact") from exc
+        if hashlib.sha256(data).hexdigest() != manifest[digest_field]:
+            raise FrameworkDiagramVerificationError("Framework diagram artifact hash differs")
+        if image and not _looks_like_image(data):
+            raise FrameworkDiagramVerificationError("Framework diagram artifact is not an image")
+        return data
+
+    prompt = payload(manifest["prompt_artifact"], "framework_diagram_image_prompt.txt", "prompt_sha256")
+    try:
+        prompt.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FrameworkDiagramVerificationError("Framework diagram prompt is not UTF-8") from exc
+    payload(manifest["artifact"], "framework_diagram.png", "image_sha256", image=True)
+    attempts = manifest["generation_attempts"]
+    if not isinstance(attempts, list) or len(attempts) > 16:
+        raise FrameworkDiagramVerificationError("Invalid framework diagram attempt ledger")
+    for item in attempts:
+        base = {"provider", "mode", "status"}
+        if (not isinstance(item, dict) or frozenset(item) not in {frozenset(base), frozenset(base | {"error_type"})}
+                or item.get("status") not in {"succeeded", "failed"}
+                or not all(isinstance(item.get(key), str) and item[key] for key in base)
+                or (item["status"] == "failed") != ("error_type" in item)):
+            raise FrameworkDiagramVerificationError("Invalid framework diagram attempt entry")
+    if not isinstance(manifest["provider"], (str, type(None))) or not isinstance(manifest["model"], (str, type(None))):
+        raise FrameworkDiagramVerificationError("Invalid framework diagram provider identity")
+    if mode == "direct":
+        original = manifest["original_output"]
+        if original is None:
+            if manifest["provider"] != "matplotlib" or manifest["original_output_sha256"] is not None:
+                raise FrameworkDiagramVerificationError("Direct fallback has inconsistent original output")
+        else:
+            payload(original, "framework_diagram_model_original.png", "original_output_sha256", image=True)
+            if manifest["provider"] in {None, "matplotlib"}:
+                raise FrameworkDiagramVerificationError("Model original lacks a model provider")
+    else:
+        payload(manifest["semantic_source"], "framework_diagram_skeleton.svg", "skeleton_sha256")
+        candidate = manifest["visual_candidate"]
+        if candidate is None:
+            if manifest["provider"] is not None or manifest["original_output_sha256"] is not None:
+                raise FrameworkDiagramVerificationError("Hybrid fallback has inconsistent candidate")
+        else:
+            payload(candidate, "framework_diagram_visual_candidate.png", "original_output_sha256", image=True)
+            if manifest["provider"] is None:
+                raise FrameworkDiagramVerificationError("Hybrid candidate lacks a provider")
+        if manifest["semantic_lock"] != {"labels": True, "nodes": True, "arrows": True,
+                                         "module_boundaries": True}:
+            raise FrameworkDiagramVerificationError("Hybrid semantic lock is incomplete")
+    return manifest
+
+
 def generate_framework_diagram_artifacts(
     *,
     paper_text: str,
@@ -1279,6 +1359,9 @@ def generate_framework_diagram_artifacts(
         artifacts.append(prompt_path.name)
 
     image_prompt = extract_framework_prompt_text(prompt_md) or paper_text
+    image_prompt_path = output_dir / "framework_diagram_image_prompt.txt"
+    image_prompt_path.write_text(image_prompt, encoding="utf-8", newline="")
+    artifacts.append(image_prompt_path.name)
 
     # Hybrid mode: the SVG and transparent PNG are the semantic source of
     # truth. Image models may provide only a faint visual candidate beneath
@@ -1313,6 +1396,7 @@ def generate_framework_diagram_artifacts(
         reference_bytes = semantic_png.read_bytes()
         candidate_bytes: bytes | None = None
         candidate_provider: str | None = None
+        generation_attempts: list[dict[str, Any]] = []
         enhancement_prompt = (
             "Treat the attached diagram only as an immutable layout reference. "
             "Do not add, remove, rewrite, or relocate nodes, labels, arrows, "
@@ -1334,6 +1418,8 @@ def generate_framework_diagram_artifacts(
                             aspect_ratio=framework_cfg.aspect_ratio,
                             size=framework_cfg.size,
                         )
+                        generation_attempts.append({"provider": provider.name, "mode": "reference",
+                                                    "status": "succeeded"})
                     except Exception as reference_exc:  # noqa: BLE001
                         logger.warning(
                             "framework_diagram: provider %s rejected the "
@@ -1352,15 +1438,24 @@ def generate_framework_diagram_artifacts(
                             aspect_ratio=framework_cfg.aspect_ratio,
                             size=framework_cfg.size,
                         )
+                        generation_attempts.append({"provider": provider.name, "mode": "reference",
+                                                    "status": "failed",
+                                                    "error_type": type(reference_exc).__name__})
+                        generation_attempts.append({"provider": provider.name, "mode": "text_free",
+                                                    "status": "succeeded"})
                 else:
                     candidate_bytes = provider.generate(
                         enhancement_prompt,
                         aspect_ratio=framework_cfg.aspect_ratio,
                         size=framework_cfg.size,
                     )
+                    generation_attempts.append({"provider": provider.name, "mode": "prompt",
+                                                "status": "succeeded"})
                 candidate_provider = provider.name
                 break
             except Exception as exc:  # noqa: BLE001
+                generation_attempts.append({"provider": provider.name, "mode": "provider",
+                                            "status": "failed", "error_type": type(exc).__name__})
                 logger.warning(
                     "framework_diagram: hybrid candidate provider %s failed (%s)",
                     provider.name,
@@ -1386,6 +1481,7 @@ def generate_framework_diagram_artifacts(
         artifacts.append(png_path.name)
         manifest_path = output_dir / "framework_diagram_generation.json"
         manifest = {
+            "schema_version": 2,
             "artifact": png_path.name,
             "render_mode": "hybrid",
             "semantic_source": skeleton_svg.name,
@@ -1394,6 +1490,7 @@ def generate_framework_diagram_artifacts(
                 candidate_path.name if candidate_bytes else None
             ),
             "provider": candidate_provider,
+            "generation_attempts": generation_attempts,
             "model": (
                 framework_cfg.grsai_model
                 if candidate_provider == "grsai_gpt_images"
@@ -1416,16 +1513,20 @@ def generate_framework_diagram_artifacts(
             "prompt_sha256": hashlib.sha256(
                 image_prompt.encode("utf-8")
             ).hexdigest(),
+            "prompt_artifact": image_prompt_path.name,
             "skeleton_sha256": hashlib.sha256(
                 skeleton_svg.read_bytes()
             ).hexdigest(),
             "image_sha256": hashlib.sha256(png_path.read_bytes()).hexdigest(),
+            "original_output_sha256": (hashlib.sha256(candidate_bytes).hexdigest()
+                                        if candidate_bytes else None),
         }
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         artifacts.append(manifest_path.name)
+        verify_framework_diagram_artifacts(output_dir)
         logger.info(
             "framework_diagram: wrote locked hybrid %s via %s",
             png_path.name,
@@ -1443,6 +1544,8 @@ def generate_framework_diagram_artifacts(
 
     png_path = output_dir / "framework_diagram.png"
     generated_via: str | None = None
+    generation_attempts: list[dict[str, Any]] = []
+    original_path = output_dir / "framework_diagram_model_original.png"
     for provider in providers:
         try:
             image_bytes = provider.generate(
@@ -1451,6 +1554,8 @@ def generate_framework_diagram_artifacts(
                 size=framework_cfg.size,
             )
         except Exception as exc:  # noqa: BLE001
+            generation_attempts.append({"provider": provider.name, "mode": "prompt", "status": "failed",
+                                        "error_type": type(exc).__name__})
             logger.warning(
                 "framework_diagram: provider %s failed (%s)",
                 provider.name,
@@ -1458,8 +1563,10 @@ def generate_framework_diagram_artifacts(
             )
             continue
         if image_bytes:
+            original_path.write_bytes(image_bytes)
             png_path.write_bytes(image_bytes)
             generated_via = provider.name
+            generation_attempts.append({"provider": provider.name, "mode": "prompt", "status": "succeeded"})
             break
 
     # 3. Fall back to matplotlib
@@ -1482,11 +1589,16 @@ def generate_framework_diagram_artifacts(
             return artifacts, None
 
     if png_path.exists() and png_path.stat().st_size > 0:
+        if original_path.exists():
+            artifacts.append(original_path.name)
         artifacts.append(png_path.name)
         manifest_path = output_dir / "framework_diagram_generation.json"
         manifest = {
+            "schema_version": 2,
             "artifact": png_path.name,
+            "render_mode": "direct",
             "provider": generated_via,
+            "generation_attempts": generation_attempts,
             "model": (
                 framework_cfg.grsai_model
                 if generated_via == "grsai_gpt_images"
@@ -1497,6 +1609,10 @@ def generate_framework_diagram_artifacts(
             "prompt_sha256": hashlib.sha256(
                 image_prompt.encode("utf-8")
             ).hexdigest(),
+            "prompt_artifact": image_prompt_path.name,
+            "original_output": original_path.name if original_path.exists() else None,
+            "original_output_sha256": (hashlib.sha256(original_path.read_bytes()).hexdigest()
+                                        if original_path.exists() else None),
             "image_sha256": hashlib.sha256(png_path.read_bytes()).hexdigest(),
         }
         manifest_path.write_text(
@@ -1504,6 +1620,7 @@ def generate_framework_diagram_artifacts(
             encoding="utf-8",
         )
         artifacts.append(manifest_path.name)
+        verify_framework_diagram_artifacts(output_dir)
         logger.info(
             "framework_diagram: wrote %s via %s (%d bytes)",
             png_path.name,
@@ -1522,6 +1639,8 @@ __all__ = [
     "extract_framework_prompt_text",
     "build_framework_diagram_providers",
     "generate_framework_diagram_artifacts",
+    "verify_framework_diagram_artifacts",
+    "FrameworkDiagramVerificationError",
     "_render_traditional_framework_diagram",
     "_render_semantic_skeleton",
     "_render_section_semantic_skeleton",

@@ -5,6 +5,7 @@ in full against its declared evidence, with no document-length truncation.
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import asdict
@@ -32,7 +33,8 @@ CONTRACTS = {
 DISPLAY_ORDER = ("abstract", "introduction", "related_work", "methods", "theory", "experiments", "results", "discussion", "conclusion")
 DEPENDENCIES = ("research_contract.json", "method_spec.json", "theory_bundle.json", "experiment_protocol.json",
                 "evidence_store.json", "literature_evidence.json", "novelty_matrix.json", "contribution_ledger.json",
-                "publication_assets.json", "publication_template.json", "analysis_spec.json", "method_validation.json")
+                "publication_assets.json", "publication_template.json", "analysis_spec.json", "method_validation.json",
+                "method_semantic_review.json", "method_semantic_review_packet.json")
 ROLE_KINDS = {
     "methods": {"brief", "method", "protocol"}, "experiments": {"brief", "protocol", "result"},
     "results": {"brief", "result", "contribution"}, "theory": {"theory", "method"},
@@ -104,6 +106,14 @@ def evidence_catalog(root: Path) -> dict:
                 "scope": "Bounded synthetic probes only; semantic equivalence remains unresolved"}
         except (ValueError, OSError, KeyError, TypeError) as exc:
             raise ManuscriptError("Invalid method validation evidence: " + str(exc)) from exc
+    if "method_semantic_review.json" in dependencies and "method" in entries:
+        from researchclaw.pipeline.method_semantics import verify_semantic_review
+        try:
+            reviewed = verify_semantic_review(root, entries["method"]["data"], _read(root / "protocol_code.json"))
+            entries["method_semantics"] = {"kind": "method", "data": reviewed,
+                "scope": "One named reviewer's judgment over the frozen spec and archived source; never a machine proof"}
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise ManuscriptError("Invalid method semantic review: " + str(exc)) from exc
     protocol = load_protocol(root)
     if protocol is not None:
         entries["protocol"] = {"kind": "protocol", "data": protocol,
@@ -165,7 +175,11 @@ def evidence_catalog(root: Path) -> dict:
 
 
 def section_tasks(catalog: dict) -> list[dict]:
-    """Bounded subsections include every item; no silent top-k result truncation."""
+    """Bounded subsections include every item; no silent top-k result truncation.
+
+    Every contribution ledger record must be bound to at least one section;
+    assignment must never depend on default kind sets staying generous.
+    """
     entries, tasks = catalog["entries"], []
     for role, contract in CONTRACTS.items():
         if role == "results" and "protocol" in entries:
@@ -199,6 +213,11 @@ def section_tasks(catalog: dict) -> list[dict]:
             if len(chunks) > 1:
                 task["title"] += f" - evidence group {index}"
             tasks.append(task)
+    assigned = {key for task in tasks for key in task["evidence_ids"]}
+    unbound = sorted(key for key, item in entries.items()
+                     if item["kind"] == "contribution" and key not in assigned)
+    if unbound:
+        raise ManuscriptError("Contribution records not bound to any section: " + ", ".join(unbound))
     for task in tasks:
         task["publication_rules"] = catalog.get("publication_rules", {})
     return tasks
@@ -687,11 +706,222 @@ def review_manuscript(root: Path, *, reviewer=None, max_calls=160) -> dict:
             issues.append("Section contract failed or unavailable: " + str(verdict.get("issues", [])))
         sections.append({"id": section["task"]["id"], "paragraphs": reviews,
                          "quality_review": {"verdict": verdict, "trace": trace}, "issues": issues})
+    issue_records = []
+    for reviewed, section in zip(sections, report["sections"]):
+        for paragraph in reviewed["paragraphs"]:
+            verdict = paragraph["verdict"]
+            if verdict.get("status") != "supported" or not verdict.get("rationale"):
+                identity = {"ir_version": report["version"], "section_id": reviewed["id"],
+                            "block": paragraph["block"], "checker": "paragraph_support",
+                            "reason": str(verdict.get("rationale", "review unavailable"))}
+                issue_records.append({"issue_id": content_hash(identity), **identity,
+                                      "repair_owner": "manuscript",
+                                      "evidence_ids": section["blocks"][paragraph["block"]]["evidence_ids"]})
+        verdict = reviewed["quality_review"]["verdict"]
+        if not _quality_valid(verdict):
+            reason = json.dumps(verdict.get("issues", []), ensure_ascii=False, sort_keys=True)
+            identity = {"ir_version": report["version"], "section_id": reviewed["id"],
+                        "block": None, "checker": "section_contract", "reason": reason}
+            issue_records.append({"issue_id": content_hash(identity), **identity,
+                                  "repair_owner": "manuscript", "evidence_ids": section["task"]["evidence_ids"]})
     result = {"schema_version": 1, "ir_version": report["version"], "sections": sections,
+              "issues": issue_records,
               "status": "reviewed" if not any(s["issues"] for s in sections) else "needs_revision",
               "calls": budget.calls, "limit": budget.limit,
               "independence": "Fresh contexts may use the same model; not independent expert certification"}
     return _version(result)
+
+
+def validate_peer_review(root: Path, peer: dict, report: dict | None = None) -> dict:
+    """Recheck every stored peer-review response and rebuild its issue ledger."""
+    data = dict(peer)
+    if data.pop("version", None) != content_hash(data) or peer.get("schema_version") != 1:
+        raise ManuscriptError("Peer-review version changed")
+    report = report or _read(root / "manuscript_ir.json")
+    catalog = validate_manuscript(root, report)
+    if peer.get("ir_version") != report["version"] or len(peer.get("sections", [])) != len(report["sections"]):
+        raise ManuscriptError("Peer review targets a different manuscript")
+    rebuilt = []
+    for reviewed, section in zip(peer["sections"], report["sections"]):
+        if reviewed.get("id") != section["task"]["id"] or len(reviewed.get("paragraphs", [])) != len(section["blocks"]):
+            raise ManuscriptError("Peer review does not cover the exact section paragraphs")
+        for index, stored in enumerate(reviewed["paragraphs"]):
+            if stored.get("block") != index:
+                raise ManuscriptError("Peer-review paragraph order changed")
+            if _trace_result(stored["trace"], CHECK_SYSTEM,
+                             _block_payload(section["blocks"][index], catalog)) != stored.get("verdict"):
+                raise ManuscriptError("Peer-review paragraph verdict changed")
+        quality = reviewed["quality_review"]
+        if _trace_result(quality["trace"], SECTION_SYSTEM, _section_payload(section, catalog)) != quality["verdict"]:
+            raise ManuscriptError("Peer-review section verdict changed")
+        rebuilt.append(reviewed)
+    expected = review_manuscript_issues(report, peer["sections"])
+    if peer.get("issues") != expected:
+        raise ManuscriptError("Peer-review issue ledger changed")
+    expected_status = "reviewed" if not any(section["issues"] for section in peer["sections"]) else "needs_revision"
+    if peer.get("status") != expected_status:
+        raise ManuscriptError("Peer-review status changed")
+    return peer
+
+
+def review_manuscript_issues(report: dict, sections: list[dict]) -> list[dict]:
+    """Pure issue derivation shared by review validation and revision."""
+    output = []
+    by_id = {section["task"]["id"]: section for section in report["sections"]}
+    for reviewed in sections:
+        section = by_id[reviewed["id"]]
+        for paragraph in reviewed["paragraphs"]:
+            verdict = paragraph["verdict"]
+            if verdict.get("status") != "supported" or not verdict.get("rationale"):
+                identity = {"ir_version": report["version"], "section_id": reviewed["id"],
+                            "block": paragraph["block"], "checker": "paragraph_support",
+                            "reason": str(verdict.get("rationale", "review unavailable"))}
+                output.append({"issue_id": content_hash(identity), **identity, "repair_owner": "manuscript",
+                               "evidence_ids": section["blocks"][paragraph["block"]]["evidence_ids"]})
+        verdict = reviewed["quality_review"]["verdict"]
+        if not _quality_valid(verdict):
+            identity = {"ir_version": report["version"], "section_id": reviewed["id"], "block": None,
+                        "checker": "section_contract",
+                        "reason": json.dumps(verdict.get("issues", []), ensure_ascii=False, sort_keys=True)}
+            output.append({"issue_id": content_hash(identity), **identity, "repair_owner": "manuscript",
+                           "evidence_ids": section["task"]["evidence_ids"]})
+    return output
+
+
+def revise_manuscript_issues(root: Path, peer: dict, issue_ids: list[str], *, llm, reviewer=None,
+                             max_calls: int = 40) -> dict:
+    """Revise only issue-addressed paragraphs/sections and freeze closure evidence."""
+    report = _read(root / "manuscript_ir.json")
+    catalog = validate_manuscript(root, report)
+    validate_peer_review(root, peer, report)
+    if (not isinstance(issue_ids, list) or not issue_ids or len(set(issue_ids)) != len(issue_ids)
+            or any(not isinstance(value, str) for value in issue_ids)):
+        raise ManuscriptError("Targeted revision needs unique issue IDs")
+    issues = {item["issue_id"]: item for item in peer["issues"]}
+    if set(issue_ids) - issues.keys():
+        raise ManuscriptError("Targeted revision references an unknown or already closed issue")
+    before = copy.deepcopy(report)
+    before_version = before["version"]
+    before_path = root / "evidence_artifacts/manuscript_history" / f"{content_hash(before)}.json"
+    write_json(before_path, before)
+    write_json(root / "manuscript_peer_review.json", peer)
+    targets: dict[str, set[int]] = {}
+    reasons: dict[tuple[str, int], list[dict]] = {}
+    by_section = {section["task"]["id"]: section for section in report["sections"]}
+    for issue_id in issue_ids:
+        issue = issues[issue_id]
+        section = by_section.get(issue["section_id"])
+        if section is None:
+            raise ManuscriptError("Revision issue targets a missing section")
+        indexes = range(len(section["blocks"])) if issue["block"] is None else [issue["block"]]
+        for index in indexes:
+            if type(index) is not int or not 0 <= index < len(section["blocks"]):
+                raise ManuscriptError("Revision issue targets a missing paragraph")
+            targets.setdefault(issue["section_id"], set()).add(index)
+            reasons.setdefault((issue["section_id"], index), []).append(issue)
+    budget, closures = ReviewBudget(max_calls), []
+    old_section_hashes = {sid: content_hash(section) for sid, section in by_section.items()}
+    for section_id, indexes in targets.items():
+        section = by_section[section_id]
+        for index in sorted(indexes):
+            old = section["blocks"][index]
+            block_issues = reasons[(section_id, index)]
+            payload = {"title": report["title"], "task": section["task"],
+                       "evidence": _packet(catalog, section["task"]["evidence_ids"]),
+                       "feedback": "", "repair": [item["reason"] for item in block_issues],
+                       "previous_blocks": [{k: old[k] for k in ("text", "kind", "evidence_ids")}],
+                       "target_issues": block_issues, "target_block": index}
+            proposal, writer_trace = budget.ask(llm, WRITE_SYSTEM, payload)
+            blocks = proposal.get("blocks") if isinstance(proposal, dict) else None
+            if not isinstance(blocks, list) or len(blocks) != 1:
+                raise ManuscriptError("Targeted paragraph revision must return exactly one block")
+            revised = blocks[0]
+            _check_block(revised, section["task"], catalog)
+            if revised == {k: old[k] for k in ("text", "kind", "evidence_ids")}:
+                raise ManuscriptError("Targeted revision returned an unchanged paragraph")
+            verdict, review_trace = budget.ask(reviewer or llm, CHECK_SYSTEM, _block_payload(revised, catalog))
+            if verdict.get("status") != "supported" or not isinstance(verdict.get("rationale"), str) or not verdict["rationale"].strip():
+                raise ManuscriptError("Targeted revision did not earn paragraph support")
+            section["blocks"][index] = {**revised, "review": {"verdict": verdict, "trace": review_trace}}
+            closures.append({"issue_ids": [item["issue_id"] for item in block_issues], "section_id": section_id,
+                             "block": index, "before_block": content_hash(old),
+                             "after_block": content_hash(section["blocks"][index]),
+                             "writer_trace": writer_trace, "review_trace": review_trace,
+                             "closure": "reviewer_supported"})
+        used = {key for block in section["blocks"] for key in block["evidence_ids"]}
+        if used != set(section["task"]["evidence_ids"]):
+            raise ManuscriptError("Targeted revision lost required section evidence")
+        verdict, trace = budget.ask(reviewer or llm, SECTION_SYSTEM, _section_payload(section, catalog))
+        if not _quality_valid(verdict):
+            raise ManuscriptError("Targeted revision did not pass the section contract")
+        section["quality_review"] = {"verdict": verdict, "trace": trace}
+        section["status"] = "reviewed"
+    report["review_budget"] = {"limit": budget.limit, "calls": budget.calls, "failures": budget.failures}
+    report["status"] = "reviewed"
+    _version(report)
+    write_json(root / "manuscript_ir.json", report)
+    validate_manuscript(root, report)
+    unchanged = {sid: old_section_hashes[sid] for sid in old_section_hashes if sid not in targets}
+    if any(content_hash(by_section[sid]) != digest for sid, digest in unchanged.items()):
+        raise ManuscriptError("Targeted revision changed an unrelated section")
+    record = {"schema_version": 1, "checker": "issue-directed-manuscript-revision/v1",
+              "before_version": before_version, "after_version": report["version"],
+              "before_artifact": before_path.relative_to(root).as_posix(),
+              "peer_review_sha256": file_hash(root / "manuscript_peer_review.json"),
+              "selected_issue_ids": issue_ids, "closures": closures,
+              "targeted_sections": sorted(targets), "unchanged_section_hashes": unchanged,
+              "calls": budget.calls, "status": "closed"}
+    write_json(root / "manuscript_revision.json", _version(record))
+    verify_manuscript_revision(root)
+    return report
+
+
+def verify_manuscript_revision(root: Path) -> dict:
+    record = _read(root / "manuscript_revision.json")
+    data = dict(record)
+    if data.pop("version", None) != content_hash(data) or record.get("checker") != "issue-directed-manuscript-revision/v1":
+        raise ManuscriptError("Revision record changed")
+    current = _read(root / "manuscript_ir.json")
+    validate_manuscript(root, current)
+    before_path = (root / record["before_artifact"]).resolve()
+    if not before_path.is_relative_to(root.resolve() / "evidence_artifacts" / "manuscript_history"):
+        raise ManuscriptError("Revision history path escaped its evidence directory")
+    before = _read(before_path)
+    validate_manuscript(root, before)
+    peer_path = root / "manuscript_peer_review.json"
+    if file_hash(peer_path) != record["peer_review_sha256"]:
+        raise ManuscriptError("Revision peer review changed")
+    peer = _read(peer_path)
+    validate_peer_review(root, peer, before)
+    if record["before_version"] != before["version"] or record["after_version"] != current["version"]:
+        raise ManuscriptError("Revision lineage changed")
+    issues = {item["issue_id"]: item for item in peer["issues"]}
+    if (set(record["selected_issue_ids"]) - issues.keys()
+            or {issue for closure in record["closures"] for issue in closure["issue_ids"]}
+               != set(record["selected_issue_ids"])):
+        raise ManuscriptError("Revision closures do not cover the selected issues")
+    current_sections = {section["task"]["id"]: section for section in current["sections"]}
+    before_sections = {section["task"]["id"]: section for section in before["sections"]}
+    for sid, digest in record["unchanged_section_hashes"].items():
+        if content_hash(before_sections[sid]) != digest or content_hash(current_sections[sid]) != digest:
+            raise ManuscriptError("Unrelated manuscript section changed during targeted revision")
+    for closure in record["closures"]:
+        old = before_sections[closure["section_id"]]["blocks"][closure["block"]]
+        new = current_sections[closure["section_id"]]["blocks"][closure["block"]]
+        if (closure["before_block"] != content_hash(old) or closure["after_block"] != content_hash(new)
+                or closure["closure"] != "reviewer_supported"
+                or _trace_result(closure["writer_trace"], WRITE_SYSTEM, {
+                    "title": before["title"], "task": before_sections[closure["section_id"]]["task"],
+                    "evidence": _packet(evidence_catalog(root), before_sections[closure["section_id"]]["task"]["evidence_ids"]),
+                    "feedback": "", "repair": [issues[item]["reason"] for item in closure["issue_ids"]],
+                    "previous_blocks": [{k: old[k] for k in ("text", "kind", "evidence_ids")}],
+                    "target_issues": [issues[item] for item in closure["issue_ids"]],
+                    "target_block": closure["block"]}).get("blocks") != [{k: new[k] for k in ("text", "kind", "evidence_ids")}]
+                or _trace_result(closure["review_trace"], CHECK_SYSTEM,
+                                 _block_payload({k: new[k] for k in ("text", "kind", "evidence_ids")},
+                                                evidence_catalog(root))).get("status") != "supported"):
+            raise ManuscriptError("Revision closure evidence changed or no longer supports the paragraph")
+    return record
 
 
 def package_manuscript(root: Path, run_id: str, config) -> Path:
@@ -704,7 +934,9 @@ def package_manuscript(root: Path, run_id: str, config) -> Path:
     # Copy all current dependencies, invalidating stale files on resumed exports.
     names = {*DEPENDENCIES, "manuscript_ir.json", "citation_support.json", "literature_coverage.json",
              "experiment_coverage.json", "protocol_code.json", "protocol_execution.jsonl", "protocol_budget.json",
-             "method_implementation.json", "method_validation.json", "data_preflight.json", "final_reviews.json", "pipeline_blockers.json"}
+             "method_implementation.json", "method_validation.json", "data_preflight.json", "final_reviews.json",
+             "pipeline_blockers.json", "method_semantic_review_packet.json", "llm_call_ledger.json",
+             "manuscript_peer_review.json", "manuscript_revision.json"}
     for name in sorted(names):
         if (root / name).is_file():
             shutil.copy2(root / name, dest / name)

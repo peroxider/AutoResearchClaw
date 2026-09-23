@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from researchclaw.pipeline.evidence_store import EvidenceStore, content_hash, file_hash
+from researchclaw.pipeline.resource_ledger import build_resource_ledger, ledger_issues
 
 RESEARCH_DIMENSIONS = ("data", "experiments", "numeric", "citations", "theory")
 PRESENTATION_DIMENSIONS = ("quality", "consistency", "figures", "layout")
-_GENERATED = {"manifest.json", "final_acceptance.json", "final_reviews.json"}
+_GENERATED = {"manifest.json", "final_acceptance.json", "final_reviews.json", "resource_ledger.json"}
 
 
 def inventory(root: Path) -> dict[str, str]:
@@ -30,7 +31,7 @@ def compilation_inputs(root: Path) -> dict[str, str]:
     """All locally bundled inputs that may affect the PDF."""
     return {name: digest for name, digest in inventory(root).items()
             if Path(name).suffix.lower() in {
-                ".tex", ".bib", ".sty", ".cls", ".bst", ".png", ".jpg", ".jpeg",
+                ".tex", ".bib", ".sty", ".cls", ".bst", ".bbx", ".cbx", ".lbx", ".png", ".jpg", ".jpeg",
                 ".svg", ".eps", ".pdf", ".bbl", ".def", ".clo", ".cfg",
             } and name != "paper.pdf"}
 
@@ -156,14 +157,39 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
             verify_assets(root)
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             issue("figures", "invalid_or_stale_publication_assets", "publication_assets.json")
+    framework_dir = root / "charts"
+    framework_image = framework_dir / "framework_diagram.png"
+    framework_manifest = framework_dir / "framework_diagram_generation.json"
+    if framework_image.is_file() or framework_manifest.is_file():
+        from researchclaw.agents.figure_agent.framework_diagram import verify_framework_diagram_artifacts
+        try:
+            verify_framework_diagram_artifacts(framework_dir)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            issue("figures", "invalid_or_stale_framework_diagram_evidence",
+                  "charts/framework_diagram_generation.json")
     if (root / "manuscript_ir.json").is_file():
-        from researchclaw.pipeline.manuscript import verify_exports, quality_report
+        from researchclaw.pipeline.manuscript import (
+            quality_report, validate_peer_review, verify_exports, verify_manuscript_revision,
+        )
         try:
             verify_exports(root)
             if gate != quality_report(root, quality_threshold):
                 issue("quality", "stale_section_contract_reviews", "quality_report.json")
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             issue("consistency", "invalid_or_stale_manuscript_ir", "manuscript_ir.json")
+        peer_path, revision_path = root / "manuscript_peer_review.json", root / "manuscript_revision.json"
+        try:
+            if revision_path.is_file():
+                if not peer_path.is_file():
+                    raise ValueError("revision lacks peer review")
+                verify_manuscript_revision(root)
+            elif peer_path.is_file():
+                peer = _read(peer_path)
+                validate_peer_review(root, peer)
+                if peer.get("issues"):
+                    issue("quality", "peer_review_issues_not_closed", "manuscript_peer_review.json")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            issue("quality", "invalid_or_stale_issue_directed_revision", "manuscript_revision.json")
         from researchclaw.pipeline.submission_bundle import verify_submission
         try:
             verify_submission(root)
@@ -248,6 +274,14 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                     verify_validation(root, method, _read(root / "protocol_code.json"))
                 except (ValueError, TypeError, KeyError, OSError):
                     issue("experiments", "method_runtime_validation_failed", "method_validation.json")
+            if (root / "method_semantic_review.json").is_file():
+                from researchclaw.pipeline.method_semantics import verify_semantic_review
+                try:
+                    reviewed = verify_semantic_review(root, method, _read(root / "protocol_code.json"))
+                    if reviewed["semantic_equivalence"] == "contradicted":
+                        issue("experiments", "method_semantic_review_contradicted", "method_semantic_review.json")
+                except (ValueError, TypeError, KeyError, OSError):
+                    issue("experiments", "invalid_or_stale_method_semantic_review", "method_semantic_review.json")
         except (ValueError, TypeError, KeyError):
             issue("experiments", "invalid_method_spec", "method_spec.json")
     obligations = theory.get("obligations", [])
@@ -324,11 +358,22 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
     except (ValueError, KeyError, TypeError, AttributeError):
         issue("numeric", "missing_or_invalid_evidence_store", "evidence_store.json")
 
+    # Run-level resource accounting is part of the audited bundle: unreadable
+    # sources and exceeded budgets are acceptance issues, not notes. The
+    # ledger is derived data, so it is excluded from the input inventory and
+    # cannot shift the review binding.
+    ledger = build_resource_ledger(root)
+    (root / "resource_ledger.json").write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+    dimensions["resources"] = "passed"
+    for reason in ledger_issues(ledger):
+        issue("resources", reason, "resource_ledger.json")
+
     # Retry exhaustion or a failed stage is never an earned quality state.
     blockers = _read(root / "pipeline_blockers.json")
     if blockers.get("issues"):
         issue("experiments", "pipeline_has_unresolved_blockers", "pipeline_blockers.json")
-    research_ok = all(dimensions[d] in {"passed", "not_applicable"} for d in RESEARCH_DIMENSIONS)
+    research_ok = (all(dimensions[d] in {"passed", "not_applicable"} for d in RESEARCH_DIMENSIONS)
+                   and dimensions.get("resources") == "passed")
     submission_ok = (research_ok and all(dimensions[d] == "passed" for d in PRESENTATION_DIMENSIONS)
                      and dimensions.get("anonymity", "passed") == "passed")
     status = "submission_candidate" if submission_ok else "research_complete" if research_ok else "exploratory"
@@ -370,6 +415,8 @@ def seal_delivery(root: Path, **kwargs: Any) -> dict[str, Any]:
                               "final_acceptance.json": file_hash(root / "final_acceptance.json")}
     if (root / "final_reviews.json").is_file():
         manifest["file_hashes"]["final_reviews.json"] = file_hash(root / "final_reviews.json")
+    if (root / "resource_ledger.json").is_file():
+        manifest["file_hashes"]["resource_ledger.json"] = file_hash(root / "resource_ledger.json")
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return report
 

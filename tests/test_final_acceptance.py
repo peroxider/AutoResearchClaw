@@ -101,6 +101,18 @@ def test_missing_figure_and_placeholder_are_not_accepted(delivery):
     assert report["dimensions"]["consistency"] == "failed"
 
 
+def test_framework_diagram_requires_verified_generation_evidence(delivery):
+    charts = delivery / "charts"
+    charts.mkdir()
+    (charts / "framework_diagram.png").write_bytes(b"\x89PNG\r\n\x1a\ninvalid")
+    write_json(charts, "framework_diagram_generation.json", {"schema_version": 2})
+    review(delivery)
+    report = assess_delivery(delivery, target_status="submission_candidate")
+    assert report["dimensions"]["figures"] == "failed"
+    assert any(item["reason"] == "invalid_or_stale_framework_diagram_evidence"
+               for item in report["issues"])
+
+
 def test_empty_delivery_is_exploratory_not_submission(tmp_path):
     report = assess_delivery(tmp_path, target_status="submission_candidate")
     assert report["artifact_status"] == "exploratory"
@@ -136,3 +148,43 @@ def test_malformed_review_fails_closed(delivery):
                                                "dimensions": ["passed"]})
     report = assess_delivery(delivery, target_status="submission_candidate")
     assert not report["target_met"] and report["artifact_status"] == "exploratory"
+
+
+def test_resource_ledger_is_written_and_sealed(delivery):
+    report = seal_delivery(delivery, target_status="submission_candidate")
+    assert report["dimensions"]["resources"] == "passed"
+    ledger = json.loads((delivery / "resource_ledger.json").read_text(encoding="utf-8"))
+    by_source = {row["source"]: row for row in ledger["rows"]}
+    assert by_source["citation_support.json"]["kind"] == "llm_review"
+    assert validate_seal(delivery)
+
+
+def test_budget_exceeded_blocks_research_acceptance(delivery):
+    (delivery / "stage-18").mkdir()
+    write_json(delivery, "stage-18/manuscript_peer_review.json",
+               {"schema_version": 1, "ir_version": "ir-v1", "calls": 50, "limit": 40,
+                "status": "reviewed"})
+    review(delivery)
+    report = assess_delivery(delivery, target_status="research_complete")
+    assert report["dimensions"]["resources"] == "failed"
+    assert {"dimension": "resources", "reason": "budget_exceeded:stage-18/manuscript_peer_review.json",
+            "artifact": "resource_ledger.json", "repair_owner": "resources"} in report["issues"]
+    assert report["artifact_status"] == "exploratory"
+
+
+def test_unreadable_ledger_source_fails_closed(delivery):
+    write_json(delivery, "novelty_matrix.json", "not-a-mapping")
+    review(delivery)
+    report = assess_delivery(delivery, target_status="research_complete")
+    assert report["dimensions"]["resources"] == "failed"
+    assert any(issue["reason"] == "unreadable_resource_source:novelty_matrix.json"
+               for issue in report["issues"])
+
+
+def test_ledger_write_does_not_shift_review_binding(delivery):
+    before = content_hash(inventory(delivery))
+    report = assess_delivery(delivery, target_status="submission_candidate")
+    assert (delivery / "resource_ledger.json").is_file()
+    assert content_hash(inventory(delivery)) == before
+    assert report["dimensions"]["citations"] == "passed"
+    assert not any(i["reason"] == "missing_failed_or_stale_review" for i in report["issues"])

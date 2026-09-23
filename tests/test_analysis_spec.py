@@ -1,14 +1,18 @@
 import copy
 import csv
 import json
+import sys
+from dataclasses import replace
 
 import pytest
 
 from researchclaw.adapters import AdapterBundle
+from researchclaw.experiment.protocol_runner import run_matrix
 from researchclaw.literature.evidence import write_json
 from researchclaw.pipeline.analysis_spec import (
-    AnalysisError, DEFAULT_PLAN, analysis_figures, build_analysis, prepare_analysis,
-    summarize_pairs, validate_plan, verify_analysis,
+    AnalysisError, DEFAULT_PLAN, analysis_figures, build_analysis, calibration_rows,
+    efficiency_rows, expected_calibration_error, prepare_analysis, summarize_pairs,
+    read_learning_curve, validate_plan, verify_analysis,
 )
 from researchclaw.pipeline.evidence_store import EvidenceStore, content_hash, file_hash
 from researchclaw.pipeline.experiment_protocol import ProtocolError, load_protocol
@@ -298,3 +302,327 @@ def test_effect_figures_budget_long_labels_without_clipping_or_dropping(study):
     for figure in figures:
         assert sum(effect_label_weight(c) for c in figure["comparisons"]) <= 22
         assert chart_bytes(figure, "pdf").startswith(b"%PDF-")
+
+
+def test_efficiency_plan_requires_declared_direction_and_rejects_stray_fields():
+    assert validate_plan({**DEFAULT_PLAN, "figures": ["calibration"]})["figures"] == ["calibration"]
+    pareto = {**DEFAULT_PLAN, "figures": ["paired_seed", "efficiency_pareto"], "metric_direction": "maximize"}
+    assert validate_plan(pareto) == pareto
+    for bad in ({**DEFAULT_PLAN, "figures": ["efficiency_pareto"]},
+                {**DEFAULT_PLAN, "figures": ["paired_seed"], "metric_direction": "maximize"},
+                {**DEFAULT_PLAN, "figures": ["efficiency_pareto"], "metric_direction": "up"},
+                {**DEFAULT_PLAN, "figures": ["efficiency_pareto"], "metric_direction": True},
+                {**DEFAULT_PLAN, "figures": ["paired_seed", "fabricated_learning_curve"]},
+                {**DEFAULT_PLAN, "figures": ["calibration"], "metric_direction": "minimize"}):
+        with pytest.raises(AnalysisError):
+            validate_plan(bad)
+
+
+def learning_plan(**changes):
+    declaration = {"metric": "validation_loss", "split": "validation",
+                   "direction": "minimize", "max_points": 20}
+    declaration.update(changes)
+    return {**DEFAULT_PLAN, "figures": ["paired_seed", "learning_curve"],
+            "learning_curve": declaration}
+
+
+def structured_plan(method, **changes):
+    interval = {"method": method, "confidence": 0.95, "replicates": 1000, "random_seed": 23,
+                "resampling_unit": "group" if method == "cluster_percentile_bootstrap" else "time_point"}
+    if method == "moving_block_percentile_bootstrap":
+        interval.update(block_length=2, chronological_order_preserved=True)
+    interval.update(changes)
+    return {**DEFAULT_PLAN, "figures": ["paired_seed", "effect_summary"], "interval": interval}
+
+
+@pytest.mark.parametrize("plan", [
+    {**DEFAULT_PLAN, "figures": ["learning_curve"]},
+    {**DEFAULT_PLAN, "figures": ["paired_seed"], "learning_curve": learning_plan()["learning_curve"]},
+    learning_plan(metric="bad metric"), learning_plan(split="test"), learning_plan(direction="up"),
+    learning_plan(max_points=1), learning_plan(max_points=True), learning_plan(extra=True),
+])
+def test_learning_curve_plan_is_exact_and_predeclared(plan):
+    with pytest.raises(AnalysisError):
+        validate_plan(plan)
+    assert validate_plan(learning_plan()) == learning_plan()
+
+
+@pytest.mark.parametrize("content", [
+    "step,value\n0,1\n0,0.5\n", "step,value\n0,1\n2,nan\n",
+    "epoch,value\n0,1\n1,0.5\n", "step,value\n00,1\n1,0.5\n",
+    "step,value\n0,1\n", "step,value,extra\n0,1,x\n1,0.5,x\n",
+])
+def test_learning_curve_reader_rejects_malformed_or_cherry_picked_points(tmp_path, content):
+    path = tmp_path / "curve.csv"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        read_learning_curve(path, learning_plan()["learning_curve"])
+
+
+LEARNING_SCRIPT = '''import csv, json, os
+from collections import Counter
+from pathlib import Path
+request = json.loads(os.environ["ARC_PROTOCOL_REQUEST"])
+Path(request["tuning"]["output"]).write_text(json.dumps({"schema_version": 1,
+    "metric": request["tuning"]["metric"], "trials": [], "selected_trial_id": None}))
+data = request["dataset"]
+train = list(csv.DictReader(Path(data["paths"]["train"]).open()))
+test = list(csv.DictReader(Path(data["paths"]["test_features"]).open()))
+label = Counter(row[data["label_column"]] for row in train).most_common(1)[0][0]
+with Path(request["output"]).open("w", newline="") as stream:
+    writer = csv.writer(stream); writer.writerow(["id", "prediction"])
+    writer.writerows([row[data["id_column"]], data["label_encoding"][label]] for row in test)
+if "learning_curve" in request:
+    assert request["learning_curve"]["columns"] == ["step", "value"]
+    offset = 0.1 if request["key"]["method"] == "A_full" else 0.0
+    with Path(request["learning_curve"]["output"]).open("w", newline="") as stream:
+        writer = csv.writer(stream); writer.writerow(["step", "value"])
+        writer.writerows((step, 1.0 / (step + 1) + offset) for step in (0, 1, 2))
+'''
+
+
+def test_learning_curve_is_host_archived_recomputed_rendered_and_tamper_evident(inputs, spec):
+    from tests.test_protocol_runner import setup
+    spec["questions"][0]["analysis_plan"] = learning_plan()
+    root, project, protocol, cfg = setup(inputs, spec, LEARNING_SCRIPT)
+    assert run_matrix(root, project, cfg.experiment)["status"] == "complete"
+    report = prepare_analysis(root)
+    curves = [item for item in report["analyses"] if "learning_curve" in item]
+    assert len(curves) == 1 and len(curves[0]["learning_curve"]["rows"]) == 6
+    assert {row["step"] for row in curves[0]["learning_curve"]["rows"]} == {0, 1, 2}
+    figure = next(item for item in analysis_figures(report) if item["kind"] == "learning_curve")
+    assert "step,baseline,candidate,difference" in chart_csv(figure)
+    assert chart_bytes(figure, "png").startswith(b"\x89PNG")
+    assert chart_bytes(figure, "pdf").startswith(b"%PDF")
+    assets = prepare_assets(root)
+    assert verify_assets(root) == assets
+    receipts = list((root / "evidence_artifacts/protocol_runs").glob("*/execution.json"))
+    with_curve = [json.loads(path.read_text()) for path in receipts if "learning_curve" in json.loads(path.read_text())]
+    assert len(with_curve) == 4  # two methods x two seeds for rq_main only
+    curve_path = root / with_curve[0]["learning_curve"]
+    curve_path.write_text(curve_path.read_text().replace("1.0", "9.0", 1), encoding="utf-8")
+    with pytest.raises(ProtocolError, match="telemetry changed"):
+        from researchclaw.experiment.protocol_runner import verify_execution_bundle
+        verify_execution_bundle(root, protocol)
+
+
+@pytest.mark.parametrize("method,manifest_changes,expected_unit", [
+    ("cluster_percentile_bootstrap", {"group_column": "person", "split": {"strategy": "group"}}, "test_group"),
+    ("moving_block_percentile_bootstrap", {"time_column": "time", "split": {"strategy": "time"}},
+     "time_point_circular_block"),
+])
+def test_structured_bootstrap_uses_private_frozen_test_units(inputs, spec, method, manifest_changes, expected_unit):
+    from tests.test_protocol_runner import setup, SCRIPT
+    manifest = inputs[2]
+    manifest.update(manifest_changes)
+    dump(inputs[0].parent / "manifest.json", manifest)
+    spec["questions"][0]["analysis_plan"] = structured_plan(method)
+    root, project, protocol, cfg = setup(inputs, spec, SCRIPT)
+    assert run_matrix(root, project, cfg.experiment)["status"] == "complete"
+    report = prepare_analysis(root)
+    analyzed = next(item for item in report["analyses"] if item["question"] == "rq_main")
+    interval = analyzed["statistics"]["interval"]
+    assert interval["status"] == "computed_conditional" and interval["resampling_unit"] == expected_unit
+    assert interval["unit_count"] >= 3 and interval["sample_count"] > interval["unit_count"]
+    assert interval["low"] == interval["high"] == 0
+    assert interval["assumption_verified"] is interval["simultaneous_coverage"] is False
+    contract = json.loads((root / "research_contract.json").read_text())
+    units = contract["datasets"][0]["analysis_units"]
+    assert file_hash(root / units) == contract["outputs"][units]
+    assert not any(path.name == "test_analysis_units.csv" for path in project.rglob("*"))
+    before = verify_analysis(root)
+    assert before == report
+    (root / units).write_text((root / units).read_text() + "tamper", encoding="utf-8")
+    with pytest.raises(ValueError):
+        verify_analysis(root)
+
+
+@pytest.mark.parametrize("plan", [
+    structured_plan("cluster_percentile_bootstrap", resampling_unit="seed"),
+    structured_plan("moving_block_percentile_bootstrap", block_length=1),
+    structured_plan("moving_block_percentile_bootstrap", chronological_order_preserved=False),
+])
+def test_structured_bootstrap_plan_rejects_wrong_unit_or_block(plan):
+    with pytest.raises(AnalysisError):
+        validate_plan(plan)
+
+
+def test_structured_bootstrap_requires_matching_dataset_structure(inputs, spec):
+    spec["questions"][0]["analysis_plan"] = structured_plan("cluster_percentile_bootstrap")
+    with pytest.raises(ValueError) as failure:
+        freeze(inputs, spec)
+    assert "group_column" in str(failure.value.__cause__)
+
+
+def test_expected_calibration_error_matches_known_bin_values():
+    scores = {str(i): 0.9 for i in range(10)}
+    labels = {str(i): (1.0 if i < 5 else 0.0) for i in range(10)}
+    assert abs(expected_calibration_error(scores, labels) - 0.4) < 1e-12
+    # Perfectly calibrated bin and empty bins contribute nothing.
+    assert expected_calibration_error({"a": 0.5, "b": 0.5}, {"a": 1.0, "b": 0.0}) == 0.0
+    assert expected_calibration_error({}, {}) == 0.0
+
+
+SCORE_SCRIPT = '''import csv, json, os
+from pathlib import Path
+request = json.loads(os.environ["ARC_PROTOCOL_REQUEST"])
+assert request["phase"] == "frozen_test"
+Path(request["tuning"]["output"]).write_text(json.dumps({"schema_version": 1,
+    "metric": request["tuning"]["metric"], "trials": [], "selected_trial_id": None}))
+data = request["dataset"]
+test = list(csv.DictReader(Path(data["paths"]["test_features"]).open()))
+assert data["label_column"] not in test[0]
+if request["key"]["method"] == "Z_base":
+    scores = {row[data["id_column"]]: 0.5 for row in test}
+else:
+    # Deliberately overconfident and inverted: high scores on label-0 rows.
+    scores = {row[data["id_column"]]: (0.99 if int(round(float(row["feature"]) - 0.125)) % 2 == 0 else 0.01)
+              for row in test}
+with Path(request["output"]).open("w", newline="") as stream:
+    writer = csv.writer(stream)
+    writer.writerow(["id", "prediction"])
+    writer.writerows(scores.items())
+'''
+
+
+@pytest.fixture
+def score_study(inputs, spec):
+    """A real host-executed frozen study whose predictions are scores."""
+    # AUROC accepts continuous scores against the binary frozen labels.
+    manifest = inputs[2]
+    manifest["metric"] = "auroc"
+    dump(inputs[0].parent / "manifest.json", manifest)
+    spec["seeds"] = [7, 19]
+    spec["questions"][0]["analysis_plan"] = {
+        **DEFAULT_PLAN, "figures": ["paired_seed", "calibration", "efficiency_pareto"], "metric_direction": "maximize"}
+    root, contract, protocol, cfg = freeze(inputs, spec)
+    cfg = replace(cfg, experiment=replace(cfg.experiment,
+                  sandbox=replace(cfg.experiment.sandbox, python_path=sys.executable)))
+    project = root / "stage-10" / "experiment"
+    project.mkdir(parents=True)
+    (project / "main.py").write_text(SCORE_SCRIPT, encoding="utf-8")
+    report = run_matrix(root, project, cfg.experiment)
+    assert report["status"] == "complete"
+    return root
+
+
+def test_calibration_and_efficiency_data_are_frozen_and_recomputed(score_study):
+    report = prepare_analysis(score_study)
+    assert verify_analysis(score_study) == report
+    analyzed = [a for a in report["analyses"] if "calibration" in a["plan"]["figures"]]
+    assert len(analyzed) == 1  # Only the question with a predeclared plan requests figures.
+    analysis = analyzed[0]
+    calibration = analysis["calibration"]
+    assert calibration["bins"] == 10 and len(calibration["rows"]) == 2
+    for row in calibration["rows"]:
+        assert row["test_samples"] > 0
+        assert abs(row["difference"] - (row["candidate_ece"] - row["baseline_ece"])) < 1e-12
+        # Constant-0.5 baseline scores are perfectly calibrated on the
+        # balanced split; the inverted overconfident candidate is not.
+        assert row["baseline_ece"] == 0.0 and row["candidate_ece"] > 0.9
+    efficiency = analysis["efficiency"]
+    assert efficiency["metric_direction"] == "maximize" and len(efficiency["rows"]) == 2
+    assert all(row["baseline_seconds"] > 0 and row["candidate_seconds"] > 0
+               for row in efficiency["rows"])
+
+
+def test_requested_figures_project_frozen_data_into_assets(score_study):
+    report = prepare_analysis(score_study)
+    figures = analysis_figures(report)
+    calibration = next(f for f in figures if f["kind"] == "calibration")
+    assert calibration["bins"] == 10 and calibration["rows"]
+    csv_text = chart_csv(calibration)
+    assert "baseline_ece,candidate_ece,difference,test_samples" in csv_text
+    png = chart_bytes(calibration, "png")
+    assert png.startswith(b"\x89PNG") and png == chart_bytes(calibration, "png")
+    pareto = next(f for f in figures if f["kind"] == "efficiency_pareto")
+    assert pareto["metric_direction"] == "maximize" and set(pareto["means"]) == {"baseline", "candidate"}
+    assert "baseline_seconds" in chart_csv(pareto)
+    pdf = chart_bytes(pareto, "pdf")
+    assert pdf.startswith(b"%PDF") and pdf == chart_bytes(pareto, "pdf")
+    assets = prepare_assets(score_study)
+    assert verify_assets(score_study) == assets
+    assert [f["kind"] for f in assets["spec"]["figures"] if f["kind"] in ("calibration", "efficiency_pareto")] \
+        == ["calibration", "efficiency_pareto"]
+
+
+def test_calibration_fails_closed_without_frozen_or_consistent_scores(score_study):
+    (score_study / "trusted_evaluation.json").unlink()
+    with pytest.raises(AnalysisError, match="trusted_evaluation"):
+        build_analysis(score_study)
+    write_json(score_study / "trusted_evaluation.json", {"schema_version": 1, "runs": []})
+    with pytest.raises(AnalysisError, match="does not bind"):
+        build_analysis(score_study)  # No manifest run binds the analyzed records.
+
+
+def test_calibration_rejects_out_of_range_or_non_binary_frozen_data(score_study):
+    analysis = prepare_analysis(score_study)["analyses"][0]
+    rows = analysis["pairs"]
+    store = EvidenceStore.from_dict(json.loads((score_study / "evidence_store.json").read_text()))
+    record = store.records[rows[0]["candidate_result"]]
+    predictions = score_study / record.artifacts[1][0]
+    original = predictions.read_text()
+    # Out-of-range scores with a consistent stored digest reach the range check.
+    predictions.write_text(original.replace("0.99", "1.5"), encoding="utf-8")
+    store.records[rows[0]["candidate_result"]] = replace(
+        record, artifacts=record.artifacts[:1]
+        + ((record.artifacts[1][0], file_hash(predictions)),) + record.artifacts[2:])
+    with pytest.raises(AnalysisError, match="probabilistic scores"):
+        calibration_rows(score_study, store, rows)
+    # Non-binary labels with a consistent digest must also fail closed; both
+    # records share the labels file, so both digests move together.
+    predictions.write_text(original, encoding="utf-8")
+    store = EvidenceStore.from_dict(json.loads((score_study / "evidence_store.json").read_text()))
+    labels = score_study / store.records[rows[0]["candidate_result"]].artifacts[0][0]
+    labels.write_text(labels.read_text().replace(",1", ",0.5"), encoding="utf-8")
+    digest = file_hash(labels)
+    for name in ("baseline_result", "candidate_result"):
+        shared = store.records[rows[0][name]]
+        store.records[rows[0][name]] = replace(
+            shared, artifacts=((shared.artifacts[0][0], digest),) + shared.artifacts[1:])
+    with pytest.raises(AnalysisError, match="binary labels"):
+        calibration_rows(score_study, store, rows)
+
+
+def test_tampered_frozen_predictions_reject_calibration(score_study):
+    analysis = prepare_analysis(score_study)["analyses"][0]
+    rows = analysis["pairs"]
+    store = EvidenceStore.from_dict(json.loads((score_study / "evidence_store.json").read_text()))
+    record = store.records[rows[0]["candidate_result"]]
+    predictions = score_study / record.artifacts[1][0]
+    document = predictions.read_text()
+    predictions.write_text(document.replace("0.99", "0.42", 1), encoding="utf-8")
+    with pytest.raises(AnalysisError, match="changed"):
+        calibration_rows(score_study, store, rows)
+    # Through the full pipeline the same tampering is caught even earlier, by
+    # the coverage audit's artifact digest validation.
+    with pytest.raises(AnalysisError, match="incomplete protocol"):
+        build_analysis(score_study)
+
+
+def test_efficiency_fails_closed_without_complete_matching_budget(score_study):
+    analysis = prepare_analysis(score_study)["analyses"][0]
+    rows = analysis["pairs"]
+    store = EvidenceStore.from_dict(json.loads((score_study / "evidence_store.json").read_text()))
+    protocol = load_protocol(score_study)
+    budget = json.loads((score_study / "protocol_budget.json").read_text())
+    assert efficiency_rows(score_study, protocol, store, rows, "maximize")["rows"]
+    # A missing budget cannot support the figure; the full pipeline fails
+    # closed even earlier, at the coverage audit.
+    (score_study / "protocol_budget.json").unlink()
+    with pytest.raises(AnalysisError, match="protocol budget record"):
+        efficiency_rows(score_study, protocol, store, rows, "maximize")
+    with pytest.raises(AnalysisError, match="incomplete protocol"):
+        build_analysis(score_study)
+    write_json(score_study / "protocol_budget.json", budget)
+    for mutation, pattern in (({"status": "incomplete"}, "complete protocol budget"),
+                              ({"schema_version": 2}, "complete protocol budget"),
+                              ({"protocol_version": "changed"}, "same protocol version")):
+        write_json(score_study / "protocol_budget.json", {**budget, **mutation})
+        with pytest.raises(AnalysisError, match=pattern):
+            efficiency_rows(score_study, protocol, store, rows, "maximize")
+    first_cell = next(iter(budget["per_cell_seconds"]))
+    write_json(score_study / "protocol_budget.json",
+               {**budget, "per_cell_seconds": {**budget["per_cell_seconds"], first_cell: True}})
+    with pytest.raises(AnalysisError, match="finite seconds"):
+        efficiency_rows(score_study, protocol, store, rows, "maximize")
