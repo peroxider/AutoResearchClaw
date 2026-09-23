@@ -97,6 +97,10 @@ class LLMClient:
         self.config = config
         self._model_chain = [config.primary_model] + list(config.fallback_models)
         self._anthropic = None  # Will be set by from_rc_config if needed
+        self._call_records: list[dict] = []
+        from researchclaw.llm.call_ledger import register_client
+
+        register_client(self)
 
     @staticmethod
     def _normalize_wire_api(wire_api: str) -> str:
@@ -276,6 +280,34 @@ class LLMClient:
         temp = temperature if temperature is not None else self.config.temperature
 
         last_error: Exception | None = None
+        started = time.monotonic()
+        fallback_failures: list[dict[str, str]] = []
+
+        def _record(status: str, served_model: str | None, resp: LLMResponse | None) -> None:
+            if self._anthropic is not None:
+                # The Anthropic adapter POSTs {base_url}/v1/messages.
+                base = str(getattr(self._anthropic, "base_url", self.config.base_url))
+                endpoint = f"{base.rstrip('/')}/v1/messages"
+            else:
+                endpoint = self._endpoint_url(self.config.base_url)
+            # LLMResponse keeps 0 defaults for legacy consumers; the ledger
+            # records usage only when the server actually reported a usage
+            # object — absent or null stays honestly unmeasured, never 0.
+            usage_reported = resp is not None and isinstance(
+                resp.raw.get("usage"), dict)
+            self._call_records.append({
+                "status": status, "requested_chain": list(models),
+                "served_model": served_model,
+                "endpoint": endpoint,
+                "adapter": "anthropic" if self._anthropic else "openai",
+                "max_tokens": max_tok, "temperature": temp, "json_mode": json_mode,
+                "prompt_tokens": resp.prompt_tokens if usage_reported else None,
+                "completion_tokens": resp.completion_tokens if usage_reported else None,
+                "total_tokens": resp.total_tokens if usage_reported else None,
+                "finish_reason": resp.finish_reason if resp is not None else "",
+                "truncated": resp.truncated if resp is not None else False,
+                "fallback_failures": fallback_failures,
+                "duration_seconds": round(time.monotonic() - started, 6)})
 
         for m in models:
             try:
@@ -293,11 +325,17 @@ class LLMClient:
                         truncated=resp.truncated,
                         raw=resp.raw,
                     )
+                # The served model is what the endpoint reported back, which is
+                # not assumed to equal the requested display name.
+                _record("succeeded", resp.model or m, resp)
                 return resp
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Model %s failed: %s. Trying next.", m, exc)
+                fallback_failures.append(
+                    {"model": m, "error": f"{type(exc).__name__}: {exc}"[:500]})
                 last_error = exc
 
+        _record("failed", None, None)
         raise RuntimeError(
             f"All models failed. Last error: {last_error}"
         ) from last_error
@@ -643,7 +681,9 @@ class LLMClient:
             raise ValueError(f"Malformed API response: missing choices. Got: {data}")
 
         choice = data["choices"][0]
-        usage = data.get("usage", {})
+        # A null usage block must not crash parsing into a phantom failure:
+        # the call succeeded, its tokens are just unmeasured.
+        usage = data.get("usage") or {}
 
         message = choice.get("message", {})
         content = message.get("content") or ""

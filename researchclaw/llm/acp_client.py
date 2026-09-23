@@ -75,6 +75,10 @@ class ACPClient:
         self.config = acp_config
         self._acpx: str | None = acp_config.acpx_command or None
         self._session_ready = False
+        self._call_records: list[dict] = []
+        from researchclaw.llm.call_ledger import register_client
+
+        register_client(self)
         # Prune dead weakrefs, then track this instance
         ACPClient._live_instances = [r for r in ACPClient._live_instances if r() is not None]
         ACPClient._live_instances.append(weakref.ref(self))
@@ -124,10 +128,32 @@ class ACPClient:
         when the reasoning trace itself is what you want.
         """
         prompt_text = self._messages_to_prompt(messages, system=system)
-        content = self._send_prompt(prompt_text)
+        started = time.monotonic()
+
+        def _record(status: str) -> None:
+            # The agent manages its own model and parameters; token usage is
+            # not observable here and stays honestly null in the ledger.
+            self._call_records.append({
+                "status": status, "requested_chain": [f"acp:{self.config.agent}"],
+                "served_model": f"acp:{self.config.agent}" if status == "succeeded" else None,
+                "endpoint": f"acpx:{self.config.acpx_command or 'auto'}",
+                "adapter": "acp",
+                "max_tokens": None, "temperature": None, "json_mode": json_mode,
+                "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+                "finish_reason": "stop" if status == "succeeded" else "",
+                "truncated": False,
+                "fallback_failures": [],
+                "duration_seconds": round(time.monotonic() - started, 6)})
+
+        try:
+            content = self._send_prompt(prompt_text)
+        except Exception:
+            _record("failed")
+            raise
         if strip_thinking:
             from researchclaw.utils.thinking_tags import strip_thinking_tags
             content = strip_thinking_tags(content)
+        _record("succeeded")
         return LLMResponse(
             content=content,
             model=f"acp:{self.config.agent}",
