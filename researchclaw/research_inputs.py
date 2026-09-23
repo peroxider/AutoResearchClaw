@@ -3,7 +3,8 @@
 Preflight uses labels for deterministic splitting and schema validation only.
 Exploratory summaries are computed on the training partition. Holding labels
 out of prompts is logical isolation; filesystem access control is the executor's
-responsibility. No raw data is fetched from the network by this module.
+responsibility. Local intake performs no network I/O; external datasets enter
+only through pinned, size-capped declarations in researchclaw.data_sources.
 """
 from __future__ import annotations
 
@@ -15,13 +16,14 @@ import re
 import shutil
 import statistics
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from researchclaw.data_sources import DataAcquisitionError, materialize_fetch, normalize_fetch
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 
 
@@ -100,6 +102,7 @@ class DatasetManifest:
     source: str
     license: str
     forbidden_features: tuple[str, ...] = ()
+    fetch: dict = field(default_factory=dict)
     group_column: str = ""
     time_column: str = ""
     split: SplitSpec = field(default_factory=SplitSpec)
@@ -146,6 +149,15 @@ class DatasetManifest:
             raise InputContractError("Time splitting requires time_column")
         if result.split.strategy == "stratified" and result.task != "classification":
             raise InputContractError("Stratified splitting is supported for classification only")
+        if result.fetch:
+            try:
+                result = replace(result, fetch=normalize_fetch(result.fetch))
+            except DataAcquisitionError as exc:
+                raise InputContractError(f"External dataset declaration is invalid: {exc}") from exc
+            # The manifest path is the content-addressed cache payload name; a
+            # mismatch means the manifest does not describe the pinned bytes.
+            if result.path != f"{result.fetch['sha256']}.csv":
+                raise InputContractError("External dataset path must be the pinned payload name '<sha256>.csv'")
         return result
 
 
@@ -341,7 +353,13 @@ def prepare_inputs(brief_path: Path, run_dir: Path, *, runtime: dict | None = No
         if manifest.dataset.casefold() in seen:
             raise InputContractError("Dataset identifiers must be unique (case insensitive)")
         seen.add(manifest.dataset.casefold())
-        path = (manifest_path.parent / manifest.path).resolve()
+        if manifest.fetch:
+            if not brief.allow_external_data:
+                raise InputContractError("External dataset acquisition requires allow_external_data")
+            path = materialize_fetch(manifest.fetch, run_dir / "external_data",
+                                     expected_name=manifest.path).resolve()
+        else:
+            path = (manifest_path.parent / manifest.path).resolve()
         if path.suffix.lower() != ".csv":
             raise InputContractError("This intake supports local CSV files only")
         sources[str(manifest_path)] = file_hash(manifest_path)
@@ -367,6 +385,17 @@ def prepare_inputs(brief_path: Path, run_dir: Path, *, runtime: dict | None = No
         outputs[label_path] = _csv(["id", "label"], [
             {"id": r[manifest.id_column], "label": encoding[r[manifest.label_column]] if encoding
              else r[manifest.label_column]} for r in parts["test"]])
+        analysis_units, ordered_times = "", []
+        if manifest.group_column or manifest.time_column:
+            analysis_units = f"evidence_artifacts/{manifest.dataset}/test_analysis_units.csv"
+            ordered_times = (sorted({_timestamp(r[manifest.time_column]) for r in parts["test"]})
+                             if manifest.time_column else [])
+            time_order = {value: index for index, value in enumerate(ordered_times)}
+            outputs[analysis_units] = _csv(["id", "group", "time", "time_order"], [
+                {"id": r[manifest.id_column], "group": r[manifest.group_column] if manifest.group_column else "",
+                 "time": r[manifest.time_column] if manifest.time_column else "",
+                 "time_order": time_order[_timestamp(r[manifest.time_column])] if manifest.time_column else ""}
+                for r in parts["test"]])
         split_ids = {name: [r[manifest.id_column] for r in part] for name, part in parts.items()}
         outputs[f"{base}/split_ids.json"] = json.dumps(split_ids, indent=2)
         card = {"dataset": manifest.dataset, "version": manifest.version, "source": manifest.source,
@@ -377,6 +406,10 @@ def prepare_inputs(brief_path: Path, run_dir: Path, *, runtime: dict | None = No
                 "split": asdict(manifest.split), "split_sizes": {k: len(v) for k, v in parts.items()},
                 "split_ids_sha256": content_hash(split_ids), "training_profile": profile,
                 "preprocessing_fit_scope": "train_only",
+                "analysis_units": {"group": bool(manifest.group_column), "time": bool(manifest.time_column),
+                                   "test_group_count": len({r[manifest.group_column] for r in parts["test"]})
+                                   if manifest.group_column else 0,
+                                   "test_time_count": len(ordered_times)},
                 "paths": {name: f"{base}/{name}.csv" for name in ("train", "validation", "test_features")}}
         # Equal measurements from distinct subjects can be genuine repeats.
         # Report potential duplication; do not infer a data defect from values alone.
@@ -384,8 +417,17 @@ def prepare_inputs(brief_path: Path, run_dir: Path, *, runtime: dict | None = No
         card["duplicate_feature_label_rows"] = len(rows) - len(signatures)
         card["warnings"] = (["Repeated feature/label rows require provenance review"]
                             if len(signatures) < len(rows) else [])
+        if manifest.fetch:
+            # Content provenance for the model-facing card; the origin URL is
+            # kept out of context and lives only in the cache sidecar.
+            card["external_source"] = {"sha256": manifest.fetch["sha256"],
+                                       "size_bytes": path.stat().st_size,
+                                       "cache": f"external_data/{manifest.path}"}
         outputs[f"{base}/dataset_card.json"] = json.dumps(card, indent=2)
-        datasets.append({"manifest": asdict(manifest), "card": card, "labels": label_path})
+        dataset_entry = {"manifest": asdict(manifest), "card": card, "labels": label_path}
+        if analysis_units:
+            dataset_entry["analysis_units"] = analysis_units
+        datasets.append(dataset_entry)
     if brief.protocol_path:
         from researchclaw.pipeline.experiment_protocol import compile_protocol
         protocol_path = (brief_path.parent / brief.protocol_path).resolve()
@@ -451,6 +493,11 @@ def verify_bundle_contract(run_dir: Path) -> dict:
         DatasetManifest.from_dict(dataset.get("manifest"))
         if dataset.get("labels") not in contract["outputs"]:
             raise InputContractError("Frozen labels missing from output inventory")
+        manifest = DatasetManifest.from_dict(dataset.get("manifest"))
+        expected_units = bool(manifest.group_column or manifest.time_column)
+        if expected_units != (isinstance(dataset.get("analysis_units"), str)
+                              and dataset.get("analysis_units") in contract["outputs"]):
+            raise InputContractError("Frozen group/time analysis units are missing or unexpected")
     for name, digest in contract["outputs"].items():
         path = (run_dir / name).resolve()
         if not path.is_relative_to(run_dir.resolve()) or not path.is_file() or file_hash(path) != digest:
@@ -517,7 +564,7 @@ def public_context(contract: dict, run_dir: Path) -> str:
 def contract_for_config(config: Any, run_dir: Path, *, initialize: bool = False) -> dict | None:
     brief = getattr(config.research, "brief_path", "")
     frozen = (run_dir / "research_contract.json").exists()
-    if not brief:
+    if not isinstance(brief, (str, Path)) or not str(brief).strip():
         if frozen:
             raise InputContractError("Cannot remove research.brief_path from an initialized run")
         return None
