@@ -537,6 +537,576 @@ def test_inconsistent_linear_premises_are_not_accepted_vacuously():
     assert obligation["evidence"]["vacuous_implication_rejected"] is True
 
 
+def test_inconsistent_closed_real_premises_get_a_portable_inconsistency_certificate(monkeypatch):
+    spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": ">=", "constant": 1},
+                  {"coefficients": {"x": 1}, "relation": "<=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "farkas_linear_inconsistency"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import verify_inconsistency_certificate
+    statement = spec["obligations"][0]["statement"]
+    assert verify_inconsistency_certificate(statement, certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    recompiled = compile_theory(portable)["obligations"][0]
+    assert recompiled["status"] == "unresolved"
+    assert recompiled["checker"] == "exact_fraction_inconsistency/v1"
+    assert recompiled["evidence"]["backend"] == "portable_certificate"
+    assert recompiled["evidence"]["vacuous_implication_rejected"] is True
+    broken = copy.deepcopy(portable)
+    broken["obligations"][0]["statement"]["portable_certificate"]["multipliers"][0] = "-1"
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
+def test_integer_inconsistency_over_reals_and_real_consistent_parity_stays_unresolved(monkeypatch):
+    spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": ">=", "constant": 1},
+                  {"coefficients": {"x": 1}, "relation": "<=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "farkas_linear_inconsistency_over_reals"
+    assert certificate["proof_domain"] == "real_superset_of_integer_domain"
+    from researchclaw.pipeline.formal_proof import verify_inconsistency_certificate
+    assert verify_inconsistency_certificate(spec["obligations"][0]["statement"], certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    assert compile_theory(portable)["obligations"][0]["status"] == "unresolved"
+    # 2x == 1 is unsatisfiable over the integers but consistent over the
+    # reals, so no real-relaxation certificate exists and the verdict
+    # stays honestly unresolved rather than faking one.
+    parity = compile_theory(linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0}))["obligations"][0]
+    assert parity["status"] == "unresolved"
+    assert parity["evidence"].get("portable_certificate") is None
+
+
+def test_strict_premise_inconsistency_gets_a_portable_motzkin_certificate(monkeypatch):
+    spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": ">", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "motzkin_linear_inconsistency"
+    assert obligation["evidence"]["portable_certificate_checker"] == "exact_fraction_motzkin/v1"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import verify_motzkin_inconsistency_certificate
+    statement = spec["obligations"][0]["statement"]
+    assert verify_motzkin_inconsistency_certificate(statement, certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    recompiled = compile_theory(portable)["obligations"][0]
+    assert recompiled["status"] == "unresolved"
+    assert recompiled["checker"] == "exact_fraction_motzkin/v1"
+    assert recompiled["evidence"]["backend"] == "portable_certificate"
+    assert recompiled["evidence"]["vacuous_implication_rejected"] is True
+    broken = copy.deepcopy(portable)
+    broken["obligations"][0]["statement"]["portable_certificate"]["strict_multipliers"][0] = "-1"
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
+def test_mixed_closed_and_strict_inconsistency_gets_a_motzkin_certificate():
+    spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": ">=", "constant": 1},
+                  {"coefficients": {"x": 1}, "relation": "<", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "motzkin_linear_inconsistency"
+    assert certificate["premise_rows"] == ["premise_1:lower"]
+    assert certificate["strict_premise_rows"] == ["premise_2:strict"]
+    from researchclaw.pipeline.formal_proof import verify_motzkin_inconsistency_certificate
+    assert verify_motzkin_inconsistency_certificate(spec["obligations"][0]["statement"], certificate)
+
+
+def test_equality_premises_keep_farkas_certificates_and_split_both_rows():
+    # Regression for the round-55 verification: an elif in the strict/closed
+    # split dropped the :lower row of == premises, silently removing Farkas
+    # certificates from closed equality systems and crashing
+    # check_linear_arithmetic on x==0 & x>=1 (the generated certificate's
+    # premise_rows no longer matched the verifier's re-derived rows).
+    crashed = compile_theory(linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "==", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": ">=", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0}))["obligations"][0]
+    assert crashed["status"] == "unresolved"
+    assert crashed["evidence"]["portable_certificate"]["kind"] == "farkas_linear_inconsistency"
+    mixed_spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "==", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": "<", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    mixed = compile_theory(mixed_spec)["obligations"][0]
+    certificate = mixed["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "motzkin_linear_inconsistency"
+    assert certificate["premise_rows"] == ["premise_1:upper", "premise_1:lower"]
+    assert certificate["strict_premise_rows"] == ["premise_2:strict"]
+    from researchclaw.pipeline.formal_proof import verify_motzkin_inconsistency_certificate
+    assert verify_motzkin_inconsistency_certificate(mixed_spec["obligations"][0]["statement"], certificate)
+
+
+def test_integer_motzkin_over_reals_and_real_feasible_parity_stays_certless(monkeypatch):
+    spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": ">", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "motzkin_linear_inconsistency_over_reals"
+    assert certificate["proof_domain"] == "real_superset_of_integer_domain"
+    from researchclaw.pipeline.formal_proof import verify_motzkin_inconsistency_certificate
+    assert verify_motzkin_inconsistency_certificate(spec["obligations"][0]["statement"], certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    assert compile_theory(portable)["obligations"][0]["status"] == "unresolved"
+    # x < 1 with 2x > 1 is unsatisfiable over the integers but feasible
+    # over the reals (x = 3/4), so no real-relaxation certificate exists
+    # and the verdict stays honestly unresolved rather than faking one.
+    parity = compile_theory(linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<", "constant": 1},
+                  {"coefficients": {"x": 2}, "relation": ">", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0}))["obligations"][0]
+    assert parity["status"] == "unresolved"
+    assert parity["evidence"].get("portable_certificate") is None
+
+
+def test_feasible_strict_system_rejects_all_zero_strict_motzkin_forgery():
+    # x <= 5 with x >= 5 with x < 100 is feasible. With all-zero strict
+    # multipliers the Motzkin combination would "refute" consistent
+    # premises, which is exactly what the mu != 0 requirement forbids.
+    spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<=", "constant": 5},
+                  {"coefficients": {"x": 1}, "relation": ">=", "constant": 5},
+                  {"coefficients": {"x": 1}, "relation": "<", "constant": 100}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    from researchclaw.pipeline.formal_proof import (verify_motzkin_inconsistency_certificate,
+                                                    FormalProofError, _statement_hash)
+    statement = spec["obligations"][0]["statement"]
+    base = {"schema_version": 1, "kind": "motzkin_linear_inconsistency",
+            "statement_hash": _statement_hash(statement),
+            "premise_rows": ["premise_1:upper", "premise_2:lower"],
+            "strict_premise_rows": ["premise_3:strict"],
+            "closed_multipliers": ["1", "1"], "strict_multipliers": ["0"],
+            "combined_constant": "0"}
+    with pytest.raises(FormalProofError, match="positive strict multiplier"):
+        verify_motzkin_inconsistency_certificate(statement, base)
+    # Even with a positive strict multiplier, a feasible system cannot
+    # reach a nonpositive combined constant: A^T*lambda + C^T*mu = 0 and
+    # the feasible point force b^T*lambda + d^T*mu > 0.
+    stretched = dict(base, closed_multipliers=["0", "1"], strict_multipliers=["1"],
+                     combined_constant="95")
+    with pytest.raises(FormalProofError, match="do not derive a contradiction"):
+        verify_motzkin_inconsistency_certificate(statement, stretched)
+
+
+def test_nequality_premise_inconsistency_stays_without_certificate():
+    # x == 0 and x != 0 contradict, but the closed rows alone (x <= 0 and
+    # -x <= 0) combine only to 0 <= 0: no Farkas refutation exists over the
+    # reals, and the bounds replay needs the integer domain, so the
+    # contradiction stays Z3-only and cert-less here.
+    obligation = compile_theory(linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "==", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": "!=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0}))["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    assert obligation["evidence"].get("portable_certificate") is None
+
+
+def test_motzkin_branch_falls_back_to_closed_farkas_when_strict_rows_cannot_participate(monkeypatch):
+    # The strict row is the only one touching v0/v2, so any Motzkin
+    # refutation is forced to mu = 0; the contradiction lives in the closed
+    # rows alone (3*v1 <= -2 with -3*v1 <= 1 gives 0 <= -1). Fuzz trial 162.
+    spec = linear(
+        domain="integer", variables=("v0", "v1", "v2"),
+        premises=[{"coefficients": {"v0": 1, "v1": 2, "v2": 1}, "relation": "<", "constant": 2},
+                  {"coefficients": {"v1": 3}, "relation": ">=", "constant": -1},
+                  {"coefficients": {"v1": 3}, "relation": "<=", "constant": -2}],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["premises_consistent"] is False
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "farkas_linear_inconsistency_over_reals"
+    assert certificate["premise_rows"] == ["premise_2:lower", "premise_3:upper"]
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import (verify_inconsistency_certificate,
+                                                    FormalProofError)
+    statement = spec["obligations"][0]["statement"]
+    assert verify_inconsistency_certificate(statement, certificate)
+    strict_contaminated = copy.deepcopy(certificate)
+    strict_contaminated["premise_rows"] = ["premise_1:strict", "premise_2:lower", "premise_3:upper"]
+    with pytest.raises(FormalProofError):
+        verify_inconsistency_certificate(statement, strict_contaminated)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    replay = compile_theory(portable)["obligations"][0]
+    assert replay["status"] == "unresolved"
+    assert replay["checker"] == "exact_fraction_inconsistency/v1"
+    assert replay["evidence"]["vacuous_implication_rejected"] is True
+
+
+def test_nequality_premises_no_longer_blind_the_inconsistency_search():
+    # A != premise is itself no obstacle: a contradiction carried by the
+    # remaining closed rows still refutes the conjunction, and over the
+    # integers the != premise participates in the bounds replay enumeration.
+    # Fuzz trial 412 plus the integer-domain x == 0 /\ x != 0 shape.
+    farkas_spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": -2}, "relation": "!=", "constant": 0},
+                  {"coefficients": {"x": 4}, "relation": "<=", "constant": -2},
+                  {"coefficients": {"x": 1}, "relation": "==", "constant": 2}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(farkas_spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "farkas_linear_inconsistency"
+    assert certificate["premise_rows"] == ["premise_2:upper", "premise_3:upper", "premise_3:lower"]
+    from researchclaw.pipeline.formal_proof import (verify_inconsistency_certificate,
+                                                    verify_bounded_integer_infeasibility)
+    assert verify_inconsistency_certificate(
+        farkas_spec["obligations"][0]["statement"], certificate)
+
+    bounds_spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "==", "constant": 0},
+                  {"coefficients": {"x": 1}, "relation": "!=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    bounds = compile_theory(bounds_spec)["obligations"][0]
+    assert bounds["status"] == "unresolved"
+    bounds_certificate = bounds["evidence"]["portable_certificate"]
+    assert bounds_certificate["kind"] == "bounded_integer_infeasibility"
+    assert bounds_certificate["checked_assignments"] == 1
+    assert bounds["evidence"]["portable_certificate_verified"] is True
+    assert verify_bounded_integer_infeasibility(
+        bounds_spec["obligations"][0]["statement"], bounds_certificate)
+
+
+def test_parity_equality_gets_a_bounded_integer_infeasibility_certificate(monkeypatch):
+    spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "bounded_integer_infeasibility"
+    assert certificate["bounds"] == {"x": {"lower": 1, "upper": 0}}
+    assert certificate["checked_assignments"] == 0
+    assert obligation["evidence"]["portable_certificate_checker"] == "exact_bounded_integer_infeasibility/v1"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import verify_bounded_integer_infeasibility
+    statement = spec["obligations"][0]["statement"]
+    assert verify_bounded_integer_infeasibility(statement, certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    recompiled = compile_theory(portable)["obligations"][0]
+    assert recompiled["status"] == "unresolved"
+    assert recompiled["checker"] == "exact_bounded_integer_infeasibility/v1"
+    assert recompiled["evidence"]["vacuous_implication_rejected"] is True
+    broken = copy.deepcopy(portable)
+    broken["obligations"][0]["statement"]["portable_certificate"]["bounds"]["x"]["lower"] = 0
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
+def test_strict_parity_bounded_infeasibility_certificate():
+    strict_spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<", "constant": 1},
+                  {"coefficients": {"x": 2}, "relation": ">", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    strict = compile_theory(strict_spec)["obligations"][0]
+    certificate = strict["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "bounded_integer_infeasibility"
+    assert certificate["checked_assignments"] == 0
+    assert certificate["strict_premise_rows"] == ["premise_1:strict", "premise_2:strict"]
+    from researchclaw.pipeline.formal_proof import verify_bounded_integer_infeasibility
+    assert verify_bounded_integer_infeasibility(strict_spec["obligations"][0]["statement"], certificate)
+
+
+def test_coupling_equality_gets_an_integer_congruence_certificate(monkeypatch):
+    # The row space of 2x - 2y == 1 cannot pin either variable alone, so the
+    # bounded-box certificate is out of reach; the congruence argument still
+    # proves the contradiction: any solution satisfies 2x - 2y == 1, whose
+    # left side is even at every integer point while the right side is odd.
+    spec = linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "integer_congruence_infeasibility"
+    assert certificate["equality_premise_rows"] == [["premise_1:upper", "premise_1:lower"]]
+    assert certificate["row_multipliers"] == ["1"]
+    assert certificate["derived_coefficients"] == {"x": "2", "y": "-2"}
+    assert certificate["derived_constant"] == "1"
+    assert certificate["modulus"] == 2
+    assert obligation["evidence"]["portable_certificate_checker"] == "exact_integer_congruence_infeasibility/v1"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import verify_integer_congruence_infeasibility
+    statement = spec["obligations"][0]["statement"]
+    assert verify_integer_congruence_infeasibility(statement, certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    recompiled = compile_theory(portable)["obligations"][0]
+    assert recompiled["status"] == "unresolved"
+    assert recompiled["checker"] == "exact_integer_congruence_infeasibility/v1"
+    assert recompiled["evidence"]["vacuous_implication_rejected"] is True
+    broken = copy.deepcopy(portable)
+    broken["obligations"][0]["statement"]["portable_certificate"]["modulus"] = 1
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
+def test_congruence_elimination_and_pair_form_certificates():
+    from researchclaw.pipeline.formal_proof import (_integer_congruence_infeasibility_certificate,
+                                                    validate_linear_statement)
+    # The single-row shortcuts cannot see this contradiction; echelon
+    # elimination derives (x+y) - (x-y) == 1, i.e. 2y == 1, whose primitive
+    # row has a fractional constant.
+    spec = linear(
+        domain="integer", variables=("x", "y", "z"),
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "==", "constant": 1},
+                  {"coefficients": {"x": 1, "y": -1}, "relation": "==", "constant": 0},
+                  {"coefficients": {"x": 2, "z": 2}, "relation": "==", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = _integer_congruence_infeasibility_certificate(
+        statement, validate_linear_statement(statement))
+    assert certificate["kind"] == "integer_congruence_infeasibility"
+    assert certificate["equality_premise_rows"] == [["premise_1:upper", "premise_1:lower"],
+                                                    ["premise_2:upper", "premise_2:lower"],
+                                                    ["premise_3:upper", "premise_3:lower"]]
+    assert certificate["row_multipliers"] == ["1", "-1", "0"]
+    assert certificate["derived_coefficients"] == {"x": "0", "y": "2", "z": "0"}
+    assert certificate["derived_constant"] == "1"
+    assert certificate["modulus"] == 2
+    # Opposite closed premises force an equality too: 2x - 2y <= 1 with
+    # 2x - 2y >= 1 pins the coupled form from both sides, the bounded-box
+    # search still fails, and the congruence certificate closes the system.
+    pair = compile_theory(linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "<=", "constant": 1},
+                  {"coefficients": {"x": 2, "y": -2}, "relation": ">=", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0}))["obligations"][0]
+    pair_certificate = pair["evidence"]["portable_certificate"]
+    assert pair_certificate["kind"] == "integer_congruence_infeasibility"
+    assert pair_certificate["equality_premise_rows"] == [["premise_1:upper", "premise_2:lower"]]
+    assert pair["evidence"]["portable_certificate_checker"] == "exact_integer_congruence_infeasibility/v1"
+    assert pair["status"] == "unresolved"
+
+
+def test_congruence_survives_content_divided_rows_in_elimination():
+    from researchclaw.pipeline.formal_proof import (_integer_congruence_infeasibility_certificate,
+                                                    validate_linear_statement,
+                                                    verify_integer_congruence_infeasibility)
+    # 2x + 4y == -2 is stored content-divided (x + 2y == -1), so the firing
+    # elimination mixes rows of different scales: 2*(4x - y) - 4*(2x + 4y)
+    # == 10 gives -18y == 10, i.e. y == -5/9. The recorded multipliers must
+    # reproduce that derived row exactly or the frozen certificate would not
+    # re-verify.
+    spec = linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 4, "y": -1}, "relation": "==", "constant": 1},
+                  {"coefficients": {"x": 2, "y": 4}, "relation": "==", "constant": -2},
+                  {"coefficients": {"x": 2, "y": 2}, "relation": "<=", "constant": -1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = _integer_congruence_infeasibility_certificate(
+        statement, validate_linear_statement(statement))
+    assert certificate is not None
+    assert certificate["kind"] == "integer_congruence_infeasibility"
+    assert certificate["equality_premise_rows"] == [["premise_1:upper", "premise_1:lower"],
+                                                    ["premise_2:upper", "premise_2:lower"]]
+    assert certificate["row_multipliers"] == ["2", "-4"]
+    assert certificate["derived_coefficients"] == {"x": "0", "y": "-18"}
+    assert certificate["derived_constant"] == "10"
+    assert certificate["modulus"] == 18
+    assert verify_integer_congruence_infeasibility(statement, certificate) is True
+
+
+def test_congruence_forgeries_rejected():
+    from researchclaw.pipeline.formal_proof import (FormalProofError,
+                                                    _integer_congruence_infeasibility_certificate,
+                                                    _statement_hash, validate_linear_statement,
+                                                    verify_integer_congruence_infeasibility)
+    infeasible = linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = infeasible["obligations"][0]["statement"]
+    good = _integer_congruence_infeasibility_certificate(statement, validate_linear_statement(statement))
+    assert verify_integer_congruence_infeasibility(statement, good)
+    # The derivation is genuine for the feasible system 2x - 2y == 0 as well,
+    # but its scaled constant 0 is divisible by the modulus 2, so no
+    # contradiction is derivable and the verifier refuses the certificate.
+    feasible = linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "==", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    feasible_statement = feasible["obligations"][0]["statement"]
+    # The declared row is the genuine derivation (2x - 2y == 0), so the
+    # verifier reaches the divisibility test and finds nothing to reject.
+    with pytest.raises(FormalProofError, match="no contradiction"):
+        verify_integer_congruence_infeasibility(feasible_statement, {
+            "schema_version": 1, "kind": "integer_congruence_infeasibility",
+            "statement_hash": _statement_hash(feasible_statement),
+            "equality_premise_rows": [["premise_1:upper", "premise_1:lower"]],
+            "row_multipliers": ["1"],
+            "derived_coefficients": {"x": "2", "y": "-2"}, "derived_constant": "0",
+            "modulus": 2})
+    # Over the reals the congruence argument proves nothing: 2x - 2y == 1 has
+    # the real solution x = y + 1/2, so the certificate kind is out of place.
+    real = linear(
+        variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    real_statement = real["obligations"][0]["statement"]
+    with pytest.raises(FormalProofError, match="requires the integer domain"):
+        verify_integer_congruence_infeasibility(
+            real_statement, dict(good, statement_hash=_statement_hash(real_statement)))
+    # A stale declared row: multiplier 2 recomputes to 4x - 4y == 2, which
+    # differs from the declared 2x - 2y == 1 combination.
+    with pytest.raises(FormalProofError, match="differs from the multiplier combination"):
+        verify_integer_congruence_infeasibility(statement, dict(good, row_multipliers=["2"]))
+    # Zero multipliers with a matching zero row derive no congruence at all.
+    vacuous = {"schema_version": 1, "kind": "integer_congruence_infeasibility",
+               "statement_hash": _statement_hash(statement),
+               "equality_premise_rows": [["premise_1:upper", "premise_1:lower"]],
+               "row_multipliers": ["0"],
+               "derived_coefficients": {"x": "0", "y": "0"}, "derived_constant": "0",
+               "modulus": 0}
+    with pytest.raises(FormalProofError, match="derive no congruence"):
+        verify_integer_congruence_infeasibility(statement, vacuous)
+    # Statements without effective equalities (strict parity) admit no
+    # congruence combination: the empty identity must be refused outright.
+    strict = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": "<", "constant": 1},
+                  {"coefficients": {"x": 2}, "relation": ">", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    strict_statement = strict["obligations"][0]["statement"]
+    with pytest.raises(FormalProofError, match="derive no congruence"):
+        verify_integer_congruence_infeasibility(strict_statement, {
+            "schema_version": 1, "kind": "integer_congruence_infeasibility",
+            "statement_hash": _statement_hash(strict_statement),
+            "equality_premise_rows": [], "row_multipliers": [],
+            "derived_coefficients": {"x": "0"}, "derived_constant": "0", "modulus": 0})
+
+
+def test_feasible_box_rejects_infeasibility_forgery():
+    spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 2}, "relation": "==", "constant": 2}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    from researchclaw.pipeline.formal_proof import (verify_bounded_integer_infeasibility,
+                                                    FormalProofError, _statement_hash)
+    statement = spec["obligations"][0]["statement"]
+    proofs = {"lower": {"closed_multipliers": ["0", "1/2"], "strict_multipliers": [], "constant": "-1"},
+              "upper": {"closed_multipliers": ["1/2", "0"], "strict_multipliers": [], "constant": "1"}}
+    base = {"schema_version": 1, "kind": "bounded_integer_infeasibility",
+            "statement_hash": _statement_hash(statement),
+            "premise_rows": ["premise_1:upper", "premise_1:lower"],
+            "strict_premise_rows": [], "bounds": {"x": {"lower": 1, "upper": 1}},
+            "bound_proofs": {"x": proofs}, "checked_assignments": 1}
+    # The bound proofs are genuine (2x == 2 forces x <= 1 and x >= 1), but
+    # the declared box contains the satisfying point x = 1, so the
+    # infeasibility claim fails the enumeration replay.
+    with pytest.raises(FormalProofError, match="contains a satisfying point"):
+        verify_bounded_integer_infeasibility(statement, base)
+    with pytest.raises(FormalProofError, match="Declared integer bounds differ"):
+        verify_bounded_integer_infeasibility(statement, dict(base, bounds={"x": {"lower": 0, "upper": 1}}))
+
+
+def test_disproved_implication_gets_a_portable_counterexample_witness(monkeypatch):
+    spec = linear(
+        variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": ">=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 1})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "disproved"
+    assert obligation["evidence"]["counterexample_exactly_validated"] is True
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "linear_counterexample_witness"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    from researchclaw.pipeline.formal_proof import verify_counterexample_witness
+    statement = spec["obligations"][0]["statement"]
+    assert verify_counterexample_witness(statement, certificate)
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    recompiled = compile_theory(portable)["obligations"][0]
+    assert recompiled["status"] == "disproved"
+    assert recompiled["checker"] == "exact_fraction_counterexample/v1"
+    assert recompiled["evidence"]["counterexample"] == obligation["evidence"]["counterexample"]
+    assert recompiled["evidence"]["counterexample_exactly_validated"] is True
+    broken = copy.deepcopy(portable)
+    broken["obligations"][0]["statement"]["portable_certificate"]["witness"]["x"] = "999"
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
+def test_integer_counterexample_witness_rejects_rational_points():
+    spec = linear(
+        domain="integer", variables=("x",),
+        premises=[{"coefficients": {"x": 1}, "relation": ">=", "constant": 0}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 1})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "disproved"
+    certificate = copy.deepcopy(obligation["evidence"]["portable_certificate"])
+    certificate["witness"]["x"] = "1/2"
+    from researchclaw.pipeline.formal_proof import verify_counterexample_witness, FormalProofError
+    with pytest.raises(FormalProofError, match="integral"):
+        verify_counterexample_witness(spec["obligations"][0]["statement"], certificate)
+
+
+def test_unknown_portable_certificate_kind_fails_loudly():
+    broken = linear()
+    broken["obligations"][0]["statement"]["portable_certificate"] = {"kind": "bogus"}
+    with pytest.raises(WorkbenchError):
+        compile_theory(broken)
+
+
 def test_z3_backend_absence_is_honest_and_grammar_still_validated(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "z3", None)
