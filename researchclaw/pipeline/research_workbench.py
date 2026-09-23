@@ -471,7 +471,7 @@ def _symbolic_check(statement):
     try:
         left = _symbolic_expression(statement["left"], variables, sympy)
         right = _symbolic_expression(statement["right"], variables, sympy)
-        difference = sympy.simplify(left - right)
+        difference = sympy.expand(left - right)
     except (RecursionError, MemoryError, ZeroDivisionError, TypeError, ValueError):
         evidence["decided"] = False
         return "unresolved", checker, evidence
@@ -480,7 +480,31 @@ def _symbolic_check(statement):
         evidence["undefined_difference"] = True
         return "unresolved", checker, evidence
     if difference == 0:
-        evidence.update({"exact_arithmetic": True, "simplified_to_zero": True})
+        evidence.update({"exact_arithmetic": True, "simplified_to_zero": True, "reduction": "expand"})
+        return "machine_checked", checker, evidence
+    # expand is canonical for polynomials but blind to rational and trig
+    # structure; cancel is a deterministic rational canonical form. Only an
+    # undecided difference reaches the heuristic simplifier, whose search
+    # paths must never decide a machine check.
+    try:
+        difference = sympy.cancel(difference)
+    except (RecursionError, MemoryError, ZeroDivisionError, TypeError, ValueError):
+        evidence["decided"] = False
+        return "unresolved", checker, evidence
+    if difference.has(sympy.zoo, sympy.nan, sympy.oo):
+        evidence["decided"] = False
+        evidence["undefined_difference"] = True
+        return "unresolved", checker, evidence
+    if difference == 0:
+        evidence.update({"exact_arithmetic": True, "simplified_to_zero": True, "reduction": "cancel"})
+        return "machine_checked", checker, evidence
+    try:
+        difference = sympy.simplify(difference)
+    except (RecursionError, MemoryError, ZeroDivisionError, TypeError, ValueError):
+        evidence["decided"] = False
+        return "unresolved", checker, evidence
+    if difference == 0:
+        evidence.update({"exact_arithmetic": True, "simplified_to_zero": True, "reduction": "simplify"})
         return "machine_checked", checker, evidence
     if not getattr(difference, "free_symbols", {None}):
         evidence["difference_value"] = str(difference)[:200]
