@@ -68,6 +68,25 @@ def _llm_chat_row(document: dict) -> tuple[dict | None, str | None]:
             "tokens": totals["total_tokens"], "version": document.get("version")}, None
 
 
+def _image_generation_row(document: dict) -> tuple[dict | None, str | None]:
+    """Re-derive the image_generation row; any self-inconsistency fails closed."""
+    from researchclaw.llm.image_call_ledger import (
+        image_call_totals,
+        validate_image_call_ledger,
+    )
+
+    try:
+        validate_image_call_ledger(document)
+    except ValueError as exc:
+        return None, str(exc)
+    totals = image_call_totals(document["calls"])
+    return {"source": "image_call_ledger.json", "kind": "image_generation",
+            "calls": totals["calls"], "limit": None,
+            "failures": totals["failures"],
+            "image_bytes": totals["total_image_bytes"],
+            "version": document.get("version")}, None
+
+
 def build_resource_ledger(root: Path) -> dict:
     rows: list[dict] = []
     errors: list[dict] = []
@@ -130,6 +149,14 @@ def build_resource_ledger(root: Path) -> dict:
         row, problem = _llm_chat_row(llm_ledger)
         if row is None:
             errors.append({"source": "llm_call_ledger.json", "reason": problem})
+        else:
+            rows.append(row)
+
+    image_ledger = _read(root, "image_call_ledger.json", errors)
+    if image_ledger is not None:
+        row, problem = _image_generation_row(image_ledger)
+        if row is None:
+            errors.append({"source": "image_call_ledger.json", "reason": problem})
         else:
             rows.append(row)
 

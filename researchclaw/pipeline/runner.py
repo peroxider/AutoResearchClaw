@@ -982,9 +982,12 @@ def execute_pipeline(
         json.dumps({"issues": blockers}, indent=2), encoding="utf-8"
     )
     # Freeze what the LLM clients actually served (model IDs, endpoints,
-    # usage, fallbacks) before packaging, so the delivery carries it.
+    # usage, fallbacks) and what the raw image-model providers attempted,
+    # before packaging, so the delivery carries it.
     from researchclaw.llm.call_ledger import write_call_ledger
     write_call_ledger(run_dir)
+    from researchclaw.llm.image_call_ledger import write_image_call_ledger
+    write_image_call_ledger(run_dir)
     deliverables_dir = None
     try:
         deliverables_dir = _package_deliverables(run_dir, run_id, config)

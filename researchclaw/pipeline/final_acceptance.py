@@ -55,6 +55,41 @@ def _citations(text: str) -> set[str]:
     return keys
 
 
+def _image_ledger_problem(root: Path, manifest_path: Path) -> tuple[str, str] | None:
+    """Every provider attempt frozen in the diagram manifest must be covered
+    by the run-level image call ledger. Stage retries leave earlier attempts
+    as extra ledger records, so the check is containment, not equality.
+    Returns (reason, artifact) for an acceptance issue, or None."""
+    from researchclaw.llm.image_call_ledger import validate_image_call_ledger
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        # The figures dimension already reports the unreadable manifest.
+        return None
+    attempts = manifest.get("generation_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    ledger_path = root / "image_call_ledger.json"
+    if not ledger_path.is_file():
+        return ("image_model_calls_missing_run_ledger", "image_call_ledger.json")
+    try:
+        document = json.loads(ledger_path.read_text(encoding="utf-8"))
+        validate_image_call_ledger(document)
+        available = [(record.get("provider") or "", record.get("status") or "")
+                     for record in document["calls"]]
+        for entry in attempts:
+            if not isinstance(entry, dict):
+                raise ValueError("Image call ledger cross-check is malformed")
+            attempt = (str(entry.get("provider", "")), str(entry.get("status", "")))
+            if attempt not in available:
+                return ("image_model_calls_not_fully_ledgered", "image_call_ledger.json")
+            available.remove(attempt)
+    except (OSError, ValueError, TypeError):
+        return ("invalid_image_call_ledger", "image_call_ledger.json")
+    return None
+
+
 def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                      quality_threshold: float = 7.0) -> dict[str, Any]:
     hashes = inventory(root)
@@ -367,6 +402,12 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
     dimensions["resources"] = "passed"
     for reason in ledger_issues(ledger):
         issue("resources", reason, "resource_ledger.json")
+    # Checked here so an image-ledger issue cannot be clobbered by the
+    # unconditional "passed" reset above; issue() re-fails the dimension.
+    if framework_manifest.is_file():
+        problem = _image_ledger_problem(root, framework_manifest)
+        if problem is not None:
+            issue("resources", problem[0], problem[1])
 
     # Retry exhaustion or a failed stage is never an earned quality state.
     blockers = _read(root / "pipeline_blockers.json")
