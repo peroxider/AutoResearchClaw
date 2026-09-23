@@ -58,12 +58,14 @@ def runtime_method():
             ]}}
 
 
-def prepared(tmp_path, runtime_method, model=MODEL):
+def prepared(tmp_path, runtime_method, model=MODEL, extra_sources=None):
     root = tmp_path / "probe-run"
     source = root / "evidence_artifacts" / "protocol_source"
     source.mkdir(parents=True)
     (source / "model.py").write_text(model, encoding="utf-8")
     (source / "main.py").write_text("raise RuntimeError('main must not execute in probes')", encoding="utf-8")
+    for name, text in (extra_sources or {}).items():
+        (source / name).write_text(text, encoding="utf-8")
     method = compile_method(runtime_method)
     cfg = ExperimentConfig(sandbox=SandboxConfig(python_path=sys.executable))
     files = {p.name: file_hash(p) for p in source.iterdir()}
@@ -354,3 +356,388 @@ def test_malformed_evidence_is_validation_failure_even_when_rehashed(tmp_path, r
     dump(root / "method_validation.json", report)
     with pytest.raises(WorkbenchError):
         verify_validation(root, method, code)
+
+
+STATE_MODEL = '''from pathlib import Path
+assert not Path("research_data").exists(), "probe received study data"
+CALLS = []
+def loss(x):
+    return sum(v * v for v in x)
+class Model:
+    def __init__(self, factor=1): self.factor = factor
+    def predict(self, x, enabled):
+        CALLS.append(1)
+        return [v * self.factor + int(enabled) + len(CALLS) for v in x]
+'''
+
+
+# A minimal reverse-mode autodiff stand-in placed as torch.py inside the frozen
+# source archive; the probe driver shadows any installed backend with it.
+TORCH_STUB = '''"""Minimal reverse-mode autodiff stand-in for probe tests (not a real backend)."""
+
+class _Node:
+    def __init__(self, value, parents=(), requires_grad=False):
+        self.value, self.parents, self.requires_grad, self.grad = value, parents, requires_grad, 0.0
+
+class Tensor:
+    def __init__(self, value=None, requires_grad=False, node=None):
+        self.grad = None
+        if node is not None:
+            self._node, self._leaves, self.requires_grad = node, None, node.requires_grad
+            return
+        if isinstance(value, list):
+            def walk(item):
+                if isinstance(item, list):
+                    return [walk(child) for child in item]
+                return _Node(float(item), requires_grad=requires_grad)
+            self._leaves, self._node, self.requires_grad = walk(value), None, requires_grad
+        else:
+            self._leaves, self._node = None, _Node(float(value), requires_grad=requires_grad)
+            self.requires_grad = requires_grad
+
+    def __iter__(self):
+        for leaf in self._leaves:
+            yield Tensor(node=leaf)
+
+    def __mul__(self, other):
+        a, b = self._node, other._node
+        return Tensor(node=_Node(a.value * b.value, [(a, b.value), (b, a.value)],
+                                 a.requires_grad or b.requires_grad))
+
+    def __add__(self, other):
+        a, b = self._node, other._node
+        return Tensor(node=_Node(a.value + b.value, [(a, 1.0), (b, 1.0)],
+                                 a.requires_grad or b.requires_grad))
+
+    def __radd__(self, other):
+        return self + Tensor(float(other))
+
+    def dim(self):
+        return 0 if self._leaves is None else 1
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return self.grad
+
+    def backward(self):
+        order, seen = [], set()
+        def visit(node):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for parent, _ in node.parents:
+                visit(parent)
+            order.append(node)
+        visit(self._node)
+        self._node.grad = 1.0
+        for node in reversed(order):
+            for parent, local in node.parents:
+                parent.grad += node.grad * local
+        for container in _CONTAINERS:
+            container.grad = [leaf.grad if leaf.requires_grad else None for leaf in container._leaves]
+
+_CONTAINERS = []
+
+float64 = "float64"
+
+def manual_seed(seed):
+    pass
+
+def tensor(value, dtype=None, requires_grad=False):
+    result = Tensor(value, requires_grad=requires_grad)
+    if result._leaves is not None:
+        _CONTAINERS.append(result)
+    return result
+'''
+
+
+def autodiff_case(**overrides):
+    case = {"id": "autograd", "kind": "autodiff", "atol": 1e-6, "rtol": 1e-6,
+            "call": {"step": "loss", "kwargs": {"x": [2.0, -3.0]}}, "argument": "x", "epsilon": 0.0001}
+    case.update(overrides)
+    return case
+
+
+def determinism_case(**overrides):
+    case = {"id": "stable", "kind": "determinism", "atol": 0, "rtol": 0,
+            "call": {"step": "predict", "kwargs": {"x": [2, 3], "enabled": True},
+                     "constructor_kwargs": {"factor": 2}}}
+    case.update(overrides)
+    return case
+
+
+def process_determinism_case(**overrides):
+    case = determinism_case(id="portable", kind="process_determinism")
+    case.update(overrides)
+    return case
+
+
+def device_inventory_case(**overrides):
+    case = {"id": "devices", "kind": "device_inventory", "required_devices": ["cpu"],
+            "minimum_cuda_devices": 0, "require_torch_determinism": False}
+    case.update(overrides)
+    return case
+
+
+def runtime_state(pid, *, torch_status="unavailable", cuda_count=0, deterministic=False):
+    available = torch_status == "available"
+    devices = [{"index": index, "name": f"GPU {index}", "capability": [8, 0],
+                "total_memory": 1024} for index in range(cuda_count)] if available else []
+    return {"process_id": pid, "python_version": "3.12.0", "implementation": "CPython",
+            "platform": "test", "environment": {"CUDA_VISIBLE_DEVICES": None,
+                                                   "CUBLAS_WORKSPACE_CONFIG": None,
+                                                   "CUDA_LAUNCH_BLOCKING": None},
+            "torch": {"status": torch_status, "version": "test" if available else None,
+                      "cuda_available": cuda_count > 0 if available else None,
+                      "cuda_device_count": cuda_count if available else None,
+                      "cuda_devices": devices, "mps_available": False if available else None,
+                      "deterministic_algorithms": deterministic if available else None,
+                      "cudnn_deterministic": False if available else None,
+                      "cudnn_benchmark": False if available else None,
+                      "cudnn_version": None}}
+
+
+def runtime_inventory(controller=100, fresh=()):
+    return {"schema_version": 1, "controller": runtime_state(controller),
+            "fresh_processes": [{"call_id": call_id, "state": runtime_state(pid)}
+                                for call_id, pid in fresh]}
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda c: c["call"].update(step="predict"),
+    lambda c: c.update(argument="not_input"),
+    lambda c: c.update(epsilon=0.02),
+    lambda c: c.update(epsilon=True),
+    lambda c: c["call"]["kwargs"].update(x=[1.0] * 65),
+    lambda c: c["call"]["kwargs"].update(x=[1e100]),
+    lambda c: c.update(expected=[0]),
+    lambda c: c["call"]["kwargs"].update(x=[[1.0], [2.0]]),
+])
+def test_invalid_autodiff_plan_fails_before_execution(runtime_method, mutation):
+    runtime_method["validation"]["cases"] = [autodiff_case()]
+    mutation(runtime_method["validation"]["cases"][0])
+    with pytest.raises(WorkbenchError):
+        compile_method(runtime_method)
+
+
+def test_autodiff_invocation_budget(runtime_method):
+    case = autodiff_case()
+    case["call"]["kwargs"]["x"] = [1.0] * 64
+    runtime_method["validation"]["cases"] = [case, dict(copy.deepcopy(case), id="second")]
+    with pytest.raises(WorkbenchError, match="invocation budget"):
+        compile_method(runtime_method)
+
+
+def test_autodiff_probe_cross_checked_against_finite_differences(tmp_path, runtime_method, monkeypatch):
+    runtime_method["validation"]["cases"] = [autodiff_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method, extra_sources={"torch.py": TORCH_STUB})
+    report = run_validation(root, method, code, cfg)
+    assert report["status"] == "passed" and report["coverage"]["kinds"] == ["autodiff"]
+    assert any("not a derivative proof" in line for line in report["limitations"])
+    request = build_request(method)
+    assert [c["id"] for c in request["calls"]] == [
+        "autograd:autodiff", "autograd:0:plus", "autograd:0:minus", "autograd:1:plus", "autograd:1:minus"]
+    assert request["calls"][0]["mode"] == "autodiff" and request["calls"][0]["argument"] == "x"
+    assert "expected" not in json.dumps(request)
+    rows = json.loads((root / "evidence_artifacts/method_validation/observations.json").read_text())["observations"]
+    by_id = {row["id"]: row.get("value") for row in rows}
+    assert by_id["autograd:autodiff"] == [4.0, -6.0]
+    assert by_id["autograd:0:plus"] == (2.0 + 0.0001) ** 2 + 9.0
+    monkeypatch.setattr("researchclaw.experiment.factory.create_sandbox", lambda *a: pytest.fail("must not rerun"))
+    assert run_validation(root, method, code, cfg) == report
+
+
+def test_autodiff_without_backend_fails_without_degrading(tmp_path, runtime_method):
+    import importlib.util
+    if importlib.util.find_spec("torch") is not None:
+        pytest.skip("a real torch backend is installed; the unavailable path needs one without it")
+    runtime_method["validation"]["cases"] = [autodiff_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method)
+    with pytest.raises(WorkbenchError):
+        run_validation(root, method, code, cfg)
+    report = json.loads((root / "method_validation.json").read_text())
+    assert report["status"] == "failed"
+    assert "PyTorch backend is required" in json.dumps(report["checks"])
+
+
+def test_assess_autodiff_matches_exact_finite_difference(runtime_method):
+    runtime_method["validation"]["cases"] = [autodiff_case()]
+    method = compile_method(runtime_method)
+    base, epsilon = [2.0, -3.0], 0.0001
+    rows = [{"id": "autograd:autodiff", "value": [4.0, -6.0]}]
+    for index in range(2):
+        for sign, role in ((1, "plus"), (-1, "minus")):
+            perturbed = list(base)
+            perturbed[index] += sign * epsilon
+            rows.append({"id": f"autograd:{index}:{role}", "value": sum(v * v for v in perturbed)})
+    results = assess(method, {"schema_version": 1, "observations": rows})
+    assert results[0]["status"] == "passed"
+    assert results[0]["checks"][0]["comparison"] == "autograd_vs_central_finite_difference"
+
+
+def test_assess_autodiff_wrong_gradient_and_shape_fail(runtime_method):
+    runtime_method["validation"]["cases"] = [autodiff_case()]
+    method = compile_method(runtime_method)
+    epsilon = 0.0001
+    def rows_with(autograd_value):
+        rows = [{"id": "autograd:autodiff", "value": autograd_value}]
+        for index in range(2):
+            for sign, role in ((1, "plus"), (-1, "minus")):
+                perturbed = [2.0, -3.0]
+                perturbed[index] += sign * epsilon
+                rows.append({"id": f"autograd:{index}:{role}", "value": sum(v * v for v in perturbed)})
+        return rows
+    wrong = assess(method, {"schema_version": 1, "observations": rows_with([4.0, -5.0])})
+    assert wrong[0]["status"] == "failed" and wrong[0]["checks"][0]["status"] == "failed"
+    shaped = assess(method, {"schema_version": 1, "observations": rows_with([[4.0, -6.0]])})
+    assert shaped[0]["status"] == "failed" and "shape differs" in shaped[0]["error"]
+
+
+def test_determinism_repeat_runs_last_and_passes_when_stateless(tmp_path, runtime_method, monkeypatch):
+    runtime_method["validation"]["cases"] = [determinism_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method)
+    report = run_validation(root, method, code, cfg)
+    assert report["status"] == "passed" and report["coverage"]["kinds"] == ["determinism"]
+    assert [c["id"] for c in build_request(method)["calls"]] == ["stable:first", "stable:repeat"]
+    monkeypatch.setattr("researchclaw.experiment.factory.create_sandbox", lambda *a: pytest.fail("must not rerun"))
+    assert run_validation(root, method, code, cfg) == report
+
+
+def test_determinism_detects_state_pollution_across_calls(tmp_path, runtime_method, monkeypatch):
+    runtime_method["validation"]["cases"] = [determinism_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method, model=STATE_MODEL)
+    with pytest.raises(WorkbenchError):
+        run_validation(root, method, code, cfg)
+    report = json.loads((root / "method_validation.json").read_text())
+    check = next(c for c in report["checks"] if c["id"] == "stable")
+    assert check["status"] == "failed"
+    assert check["checks"][0]["comparison"] == "repeat_after_other_calls"
+    monkeypatch.setattr("researchclaw.experiment.factory.create_sandbox", lambda *a: pytest.fail("must not retry"))
+    with pytest.raises(WorkbenchError):
+        run_validation(root, method, code, cfg)
+
+
+def test_determinism_repeat_is_appended_after_every_other_call(runtime_method):
+    golden = runtime_method["validation"]["cases"][0]
+    runtime_method["validation"]["cases"] = [determinism_case(), golden]
+    request = build_request(compile_method(runtime_method))
+    assert [c["id"] for c in request["calls"]] == ["stable:first", "golden:value", "stable:repeat"]
+
+
+def test_assess_flags_determinism_mismatch(runtime_method):
+    runtime_method["validation"]["cases"] = [determinism_case()]
+    method = compile_method(runtime_method)
+    rows = [{"id": "stable:first", "value": [5, 7]}, {"id": "stable:repeat", "value": [5, 8]}]
+    results = assess(method, {"schema_version": 1, "observations": rows})
+    assert results[0]["status"] == "failed"
+    assert results[0]["checks"][0]["comparison"] == "repeat_after_other_calls"
+    failed_invocation = assess(method, {"schema_version": 1, "observations": [
+        {"id": "stable:first", "value": [5, 7]}, {"id": "stable:repeat", "error": "ValueError: broke"}]})
+    assert failed_invocation[0]["status"] == "failed" and "Invocation failed" in failed_invocation[0]["error"]
+
+
+def test_fresh_process_determinism_uses_distinct_interpreters(tmp_path, runtime_method):
+    runtime_method["validation"]["cases"] = [process_determinism_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method, model=STATE_MODEL)
+    report = run_validation(root, method, code, cfg)
+    assert report["status"] == "passed" and report["coverage"]["kinds"] == ["process_determinism"]
+    request = build_request(method)
+    assert request["fresh_process_timeout_seconds"] == 5
+    assert [call["mode"] for call in request["calls"]] == ["fresh_process", "fresh_process"]
+    runtime = report["runtime_environment"]
+    pids = [entry["state"]["process_id"] for entry in runtime["fresh_processes"]]
+    assert len(set(pids)) == 2 and runtime["controller"]["process_id"] not in pids
+    check = report["checks"][0]
+    assert [item["comparison"] for item in check["checks"]] == [
+        "fresh_python_process_repeat", "distinct_fresh_processes"]
+
+
+def test_fresh_process_determinism_detects_process_identity(tmp_path, runtime_method):
+    runtime_method["validation"]["cases"] = [process_determinism_case()]
+    model = MODEL.replace("from pathlib import Path", "import os\nfrom pathlib import Path").replace(
+        "return [v * self.factor + int(enabled) for v in x]", "return [os.getpid()]")
+    root, method, code, cfg = prepared(tmp_path, runtime_method, model=model)
+    with pytest.raises(WorkbenchError):
+        run_validation(root, method, code, cfg)
+    report = json.loads((root / "method_validation.json").read_text())
+    assert report["checks"][0]["checks"][0]["comparison"] == "fresh_python_process_repeat"
+    assert report["checks"][0]["checks"][0]["status"] == "failed"
+
+
+def test_fresh_process_assessment_requires_complete_distinct_runtime(runtime_method):
+    runtime_method["validation"]["cases"] = [process_determinism_case()]
+    method = compile_method(runtime_method)
+    rows = [{"id": "portable:first", "value": [5, 7]},
+            {"id": "portable:repeat", "value": [5, 7]}]
+    missing = assess(method, {"schema_version": 1, "observations": rows})
+    assert missing[0]["status"] == "failed" and "runtime inventory" in missing[0]["error"]
+    same = runtime_inventory(fresh=(("portable:first", 101), ("portable:repeat", 101)))
+    result = assess(method, {"schema_version": 1, "observations": rows, "runtime": same})
+    assert result[0]["status"] == "failed"
+    assert result[0]["checks"][-1]["comparison"] == "distinct_fresh_processes"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda c: c.update(required_devices=[]),
+    lambda c: c.update(required_devices=["cpu", "cpu"]),
+    lambda c: c.update(required_devices=["tpu"]),
+    lambda c: c.update(minimum_cuda_devices=True),
+    lambda c: c.update(minimum_cuda_devices=-1),
+    lambda c: c.update(minimum_cuda_devices=65),
+    lambda c: c.update(require_torch_determinism=1),
+    lambda c: c.update(extra=True),
+])
+def test_invalid_device_inventory_plan_fails_before_execution(runtime_method, mutation):
+    case = device_inventory_case()
+    mutation(case)
+    runtime_method["validation"]["cases"] = [case]
+    with pytest.raises(WorkbenchError):
+        compile_method(runtime_method)
+
+
+def test_device_inventory_records_pre_source_runtime_without_forged_torch(tmp_path, runtime_method):
+    runtime_method["validation"]["cases"] = [device_inventory_case()]
+    root, method, code, cfg = prepared(tmp_path, runtime_method, extra_sources={"torch.py": TORCH_STUB})
+    report = run_validation(root, method, code, cfg)
+    assert report["status"] == "passed" and report["coverage"]["tested_steps"] == []
+    assert build_request(method)["calls"] == []
+    torch = report["runtime_environment"]["controller"]["torch"]
+    assert torch["version"] != "fixture"
+    assert torch["status"] in {"available", "unavailable"} or torch["status"].startswith("error:")
+    assert report["checks"][0]["checks"][0]["available"]["cpu"] is True
+
+
+def test_device_requirements_are_checked_from_runtime_inventory(runtime_method):
+    runtime_method["validation"]["cases"] = [device_inventory_case(
+        required_devices=["cpu", "cuda"], minimum_cuda_devices=2,
+        require_torch_determinism=True)]
+    method = compile_method(runtime_method)
+    passing_runtime = runtime_inventory()
+    passing_runtime["controller"] = runtime_state(100, torch_status="available", cuda_count=2,
+                                                  deterministic=True)
+    passed = assess(method, {"schema_version": 1, "observations": [], "runtime": passing_runtime})
+    assert passed[0]["status"] == "passed"
+    passing_runtime["controller"]["torch"]["deterministic_algorithms"] = False
+    failed = assess(method, {"schema_version": 1, "observations": [], "runtime": passing_runtime})
+    assert failed[0]["status"] == "failed"
+    assert failed[0]["checks"][-1]["comparison"] == "torch_deterministic_algorithms"
+
+
+def test_fresh_process_timeout_and_runtime_schema_are_strict(runtime_method):
+    runtime_method["validation"]["cases"] = [process_determinism_case()]
+    runtime_method["validation"]["timeout_seconds"] = 1
+    with pytest.raises(WorkbenchError, match="at least two seconds"):
+        compile_method(runtime_method)
+    runtime_method["validation"]["timeout_seconds"] = 10
+    method = compile_method(runtime_method)
+    rows = [{"id": "portable:first", "value": [5, 7]},
+            {"id": "portable:repeat", "value": [5, 7]}]
+    malformed = runtime_inventory(fresh=(("portable:first", 101), ("portable:repeat", 102)))
+    malformed["controller"]["torch"]["cuda_available"] = False
+    with pytest.raises(WorkbenchError, match="device claims"):
+        assess(method, {"schema_version": 1, "observations": rows, "runtime": malformed})
