@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -217,10 +219,25 @@ class HookRegistry:
 
         t0 = time.monotonic()
         try:
+            command = [str(script)]
+            script_input = None
+            if script.suffix.lower() == ".py":
+                command = [sys.executable, str(script)]
+            elif script.suffix.lower() == ".sh" and os.name == "nt":
+                shell = shutil.which("sh") or shutil.which("bash") or shutil.which("bash.exe")
+                if shell is None:
+                    raise OSError("POSIX shell hook requires sh or bash on Windows")
+                import shlex
+                exported = "\n".join(f"export {name}={shlex.quote(env[name])}"
+                                     for name in ("RC_STAGE_NUM", "RC_STAGE_NAME", "RC_HOOK_NAME", "RC_RUN_DIR")
+                                     if name in env)
+                script_input = exported + "\n" + script.read_text(encoding="utf-8")
+                command = [shell, "-s"]
             result = subprocess.run(
-                [str(script)],
+                command,
                 capture_output=True,
                 text=True,
+                input=script_input,
                 timeout=30,
                 env=env,
                 cwd=str(self.run_dir) if self.run_dir else None,
