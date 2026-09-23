@@ -42,6 +42,9 @@ class WebSearchAgentResult:
     pdf_extractions: list[PDFContent] = field(default_factory=list)
     search_answer: str = ""  # Tavily AI answer if available
     elapsed_seconds: float = 0.0
+    # Per-provider outcome records. A silent exception must not look like a
+    # provider that simply found nothing; failures stay visible downstream.
+    provider_log: list[dict] = field(default_factory=list)
 
     @property
     def total_results(self) -> int:
@@ -126,6 +129,7 @@ class WebSearchAgentResult:
             "pdf_extractions_count": len(self.pdf_extractions),
             "has_search_answer": bool(self.search_answer),
             "elapsed_seconds": self.elapsed_seconds,
+            "provider_log": [dict(entry) for entry in self.provider_log],
             "web_results": [r.to_dict() for r in self.web_results[:20]],
             "scholar_papers": [p.to_dict() for p in self.scholar_papers[:20]],
         }
@@ -211,6 +215,10 @@ class WebSearchAgent:
         # 3. Google Scholar search
         if self.enable_scholar and self.scholar_client and self.scholar_client.available:
             self._run_scholar_search(result, topic)
+        else:
+            result.provider_log.append({
+                "provider": "google_scholar", "status": "unavailable", "candidate_count": 0,
+                "queries": 0, "error": "scholar disabled or unavailable"})
 
         # 4. Crawl top URLs for full content
         if self.enable_crawling:
@@ -251,8 +259,14 @@ class WebSearchAgent:
                 result.web_results.extend(resp.results)
                 if resp.answer and not result.search_answer:
                     result.search_answer = resp.answer
+            result.provider_log.append({
+                "provider": "web_search", "status": "results_found" if result.web_results else "no_results",
+                "candidate_count": len(result.web_results), "queries": len(queries), "error": ""})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Web search failed: %s", exc)
+            result.provider_log.append({
+                "provider": "web_search", "status": "failed", "candidate_count": 0,
+                "queries": len(queries), "error": str(exc)})
 
     def _run_scholar_search(
         self, result: WebSearchAgentResult, topic: str
@@ -263,8 +277,15 @@ class WebSearchAgent:
                 topic, limit=self.max_scholar_results
             )
             result.scholar_papers.extend(papers)
+            result.provider_log.append({
+                "provider": "google_scholar",
+                "status": "results_found" if papers else "no_results",
+                "candidate_count": len(papers), "queries": 1, "error": ""})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scholar search failed: %s", exc)
+            result.provider_log.append({
+                "provider": "google_scholar", "status": "failed", "candidate_count": 0,
+                "queries": 1, "error": str(exc)})
 
     def _run_crawling(
         self, result: WebSearchAgentResult, urls: list[str]
