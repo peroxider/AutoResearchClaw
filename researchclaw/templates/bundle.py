@@ -23,6 +23,10 @@ class TemplateError(ValueError):
 
 MARKERS = ("ARC_TITLE", "ARC_AUTHORS", "ARC_PACKAGES", "ARC_CONTENT", "ARC_BIBLIOGRAPHY")
 ROLE_NAMES = {"methods", "theory", "experiments", "results", "related_work", "discussion"}
+# Mirror of pipeline.manuscript DISPLAY_ORDER; declared here because this
+# module must not import the pipeline at module level (manuscript imports us).
+SECTION_ROLES = ("abstract", "introduction", "related_work", "methods", "theory",
+                 "experiments", "results", "discussion", "conclusion")
 ALLOWED = {".tex", ".cls", ".sty", ".bst", ".bbx", ".cbx", ".lbx", ".bib", ".def", ".clo", ".cfg", ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".txt", ".md", ".json"}
 DEFAULT = {
     "schema_version": 1, "name": "generic-journal", "entrypoint": "main.tex", "engine": "pdflatex",
@@ -31,6 +35,7 @@ DEFAULT = {
     "bibliography_backend": "bibtex",
     "max_title_characters": None, "max_abstract_characters": None,
     "max_figures": None, "max_tables": None,
+    "required_sections": [], "banned_sections": [], "max_references": None,
     "columns": None,
 }
 GENERIC = r"""\documentclass[11pt]{article}
@@ -112,13 +117,18 @@ def _policy(data: dict) -> dict:
         if type(result[key]) is not bool:
             raise TemplateError(f"{key} must be boolean")
     for key in ("max_pages", "max_main_pages", "max_title_characters", "max_abstract_characters",
-                "max_figures", "max_tables"):
+                "max_figures", "max_tables", "max_references"):
         if result[key] is not None and (type(result[key]) is not int or result[key] < 1):
             raise TemplateError(f"{key} must be a positive integer or null")
     roles = result["appendix_roles"]
     if (not isinstance(roles, list) or any(not isinstance(r, str) or r not in ROLE_NAMES for r in roles)
             or len(set(roles)) != len(roles)):
         raise TemplateError("Invalid appendix roles")
+    for key in ("required_sections", "banned_sections"):
+        roles = result[key]
+        if (not isinstance(roles, list) or any(not isinstance(r, str) or r not in SECTION_ROLES for r in roles)
+                or len(set(roles)) != len(roles)):
+            raise TemplateError(f"{key} must list distinct known section roles")
     return result
 
 
@@ -329,7 +339,10 @@ def inspect_constraints(root: Path) -> dict:
     record = verify_template(root)
     policy = record["compiled"]["policy"]
     issues, pages, main_pages, appendix_pages = [], None, None, []
-    title_characters = abstract_characters = figures = tables = None
+    title_characters = abstract_characters = figures = tables = references = None
+    sections_present: list[str] | None = None
+    required_missing: list[str] | None = None
+    banned_present: list[str] | None = None
     pdf = root / "paper.pdf"
     if pdf.is_file():
         try:
@@ -363,7 +376,30 @@ def inspect_constraints(root: Path) -> dict:
             title_characters = len(ir["title"])
             abstract = next(section for section in ir["sections"] if section["task"]["role"] == "abstract")
             abstract_characters = sum(len(block["text"]) for block in abstract["blocks"])
+            sections_present = sorted({section["task"]["role"] for section in ir["sections"]})
         except (OSError, ValueError, TypeError, KeyError, StopIteration):
+            pass
+    if policy["required_sections"] or policy["banned_sections"]:
+        if sections_present is None:
+            issues.append("section_rules_unavailable")
+        else:
+            required_missing = sorted(role for role in policy["required_sections"]
+                                      if role not in sections_present)
+            banned_present = sorted(role for role in policy["banned_sections"]
+                                    if role in sections_present)
+            if required_missing:
+                issues.append("required_sections_missing")
+            if banned_present:
+                issues.append("banned_sections_present")
+    bib = root / "references.bib"
+    if bib.is_file():
+        try:
+            source = bib.read_text(encoding="utf-8", errors="replace")
+            # Entry types are case-insensitive in bibtex; @string/@preamble/
+            # @comment are directives, not bibliography entries.
+            references = len(re.findall(r"(?mi)^[ \t]*@\s*(?!string\b|preamble\b|comment\b)\w+\s*\{",
+                                        source))
+        except OSError:
             pass
     tex = root / "paper.tex"
     if tex.is_file():
@@ -373,11 +409,15 @@ def inspect_constraints(root: Path) -> dict:
         tables = len(re.findall(r"\\begin\{(?:table\*?|longtable)\}", source))
     for field, actual in (("max_title_characters", title_characters),
                           ("max_abstract_characters", abstract_characters),
-                          ("max_figures", figures), ("max_tables", tables)):
+                          ("max_figures", figures), ("max_tables", tables),
+                          ("max_references", references)):
         if policy[field] is not None and (actual is None or actual > policy[field]):
             issues.append(field + "_unavailable_or_exceeded")
     return {"template_version": record["version"], "pdf_sha256": file_hash(pdf) if pdf.is_file() else None,
             "pages": pages, "main_pages": main_pages, "title_characters": title_characters,
             "abstract_characters": abstract_characters, "figures": figures, "tables": tables,
+            "references": references, "sections_present": sections_present,
+            "required_sections_missing": required_missing,
+            "banned_sections_present": banned_present,
             "status": "passed" if not issues else "failed", "issues": issues,
             "scope": "page limits and PDF author metadata; content anonymity and visual layout require full review"}

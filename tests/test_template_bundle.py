@@ -91,6 +91,9 @@ def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
     {"max_pages": 0}, {"max_pages": True}, {"engine": "sh"}, {"columns": 3},
     {"max_title_characters": 0}, {"max_abstract_characters": True}, {"max_figures": -1},
     {"max_tables": 1.5},
+    {"max_references": 0}, {"max_references": 1.5},
+    {"required_sections": ["nonsense"]}, {"required_sections": ["methods", "methods"]},
+    {"banned_sections": "methods"}, {"required_sections": [True]},
     {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
 ])
 def test_invalid_policy_fields_are_not_silently_ignored(tmp_path, change):
@@ -298,6 +301,43 @@ def test_declared_title_abstract_figure_and_table_limits_are_recomputed(tmp_path
     assert result["figures"] == 2 and result["tables"] == 2
     assert {"max_abstract_characters_unavailable_or_exceeded", "max_figures_unavailable_or_exceeded",
             "max_tables_unavailable_or_exceeded"} <= set(result["issues"])
+
+
+def test_declared_section_and_reference_rules_are_recomputed(tmp_path):
+    import fitz
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, required_sections=["methods", "results"],
+                                 banned_sections=["theory"], max_references=2))
+    # No IR yet: declared section rules must fail closed, not pass vacuously.
+    assert "section_rules_unavailable" in inspect_constraints(root)["issues"]
+    write_json(root / "manuscript_ir.json", {"title": "Title", "sections": [
+        {"task": {"role": "abstract"}, "blocks": [{"text": "x"}]},
+        {"task": {"role": "results"}, "blocks": []},
+        {"task": {"role": "theory"}, "blocks": []}]})
+    (root / "references.bib").write_text(
+        "@article{a2024,\n  title = {A},\n}\n"
+        "@InProceedings{b2024,\n  title = {B},\n}\n"
+        "@string{venue = {Journal}}\n@preamble{\"\"}\n@comment{not an entry}\n",
+        encoding="utf-8")
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    result = inspect_constraints(root)
+    assert result["sections_present"] == ["abstract", "results", "theory"]
+    assert result["required_sections_missing"] == ["methods"]
+    assert result["banned_sections_present"] == ["theory"]
+    assert result["references"] == 2
+    assert {"required_sections_missing", "banned_sections_present"} <= set(result["issues"])
+    write_json(root / "manuscript_ir.json", {"title": "Title", "sections": [
+        {"task": {"role": "abstract"}, "blocks": [{"text": "x"}]},
+        {"task": {"role": "methods"}, "blocks": []},
+        {"task": {"role": "results"}, "blocks": []},
+        {"task": {"role": "discussion"}, "blocks": []}]})
+    result = inspect_constraints(root)
+    assert result["status"] == "passed"
+    assert result["required_sections_missing"] == [] and result["banned_sections_present"] == []
+    (root / "references.bib").unlink()
+    assert "max_references_unavailable_or_exceeded" in inspect_constraints(root)["issues"]
 
 
 def test_export_refresh_detects_external_template_change(study):
