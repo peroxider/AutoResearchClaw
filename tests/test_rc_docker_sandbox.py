@@ -59,6 +59,12 @@ def test_build_run_command_network_none(tmp_path: Path):
 
 def test_formal_command_drops_privileges_and_does_not_mount_host_caches(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "must-not-enter-formal-container")
+    # The HF cache carries the login token file, not just weights: formal
+    # mode must skip the HF_HOME mount even when the host sets it.
+    hf_home = tmp_path / "hf-home"
+    hf_home.mkdir()
+    (hf_home / "token").write_text("must-not-enter-formal-container", encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(hf_home))
     cfg = DockerSandboxConfig(network_policy="none", keep_containers=False)
     sandbox = DockerSandbox(cfg, tmp_path / "work")
     staging = tmp_path / "staging"

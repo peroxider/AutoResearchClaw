@@ -479,7 +479,10 @@ class DockerSandbox:
         hf_mounted = formal_isolation
         _hf_hub_cache = "/home/researcher/.cache/huggingface/hub"
         hf_home_env = os.environ.get("HF_HOME", "").strip()
-        if hf_home_env:
+        # Formal isolation mounts no host caches: an HF cache directory is
+        # not just weights — it typically carries the login token file, so
+        # mounting it read-only would still leak the credential.
+        if hf_home_env and not formal_isolation:
             xdg_hf = Path(hf_home_env).resolve()
             if xdg_hf.is_dir():
                 cmd.extend(["-v", f"{xdg_hf}:{_hf_hub_cache}:ro"])
