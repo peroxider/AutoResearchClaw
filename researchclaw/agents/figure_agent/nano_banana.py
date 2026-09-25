@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -162,6 +163,7 @@ class NanoBananaAgent(BaseAgent):
                 success = self._generate_image(
                     prompt=prompt,
                     output_path=output_path,
+                    figure_id=figure_id,
                 )
 
                 if success:
@@ -302,31 +304,87 @@ class NanoBananaAgent(BaseAgent):
     # Image generation backends
     # ------------------------------------------------------------------
 
+    def _record_image_attempt(
+        self,
+        *,
+        figure_id: str,
+        endpoint: str,
+        started: float,
+        image_bytes: int | None,
+        exc: Exception | None,
+        usage: Any = None,
+    ) -> None:
+        """Append one generation attempt to the run-level image call ledger.
+
+        Every Nano Banana attempt — SDK or REST, succeeded or failed — is
+        recorded with the serving identity, locally measured duration and
+        endpoint-reported usage (absent stays None, never 0), so the
+        orchestrator's image figures are covered by the same run-level
+        accounting as the framework-diagram providers.
+        """
+        import time as _time
+
+        from researchclaw.llm.image_call_ledger import record_image_call
+
+        record_image_call({
+            "provider": "gemini",
+            "model": self._model,
+            "endpoint": endpoint,
+            "mode": "prompt",
+            "status": "failed" if exc is not None else "succeeded",
+            "error_type": type(exc).__name__ if exc is not None else None,
+            "duration_ms": max(0, int((_time.monotonic() - started) * 1000)),
+            "image_bytes": image_bytes if image_bytes else None,
+            "usage": usage if isinstance(usage, dict) else None,
+            "figure_id": figure_id,
+        })
+
+    @staticmethod
+    def _sdk_usage(response: Any) -> dict[str, int] | None:
+        """Extract the integer token counts the SDK reports, if any."""
+        meta = getattr(response, "usage_metadata", None)
+        if meta is None:
+            return None
+        usage: dict[str, int] = {}
+        for field in ("prompt_token_count", "candidates_token_count",
+                      "total_token_count"):
+            value = getattr(meta, field, None)
+            if type(value) is int:
+                usage[field] = value
+        return usage or None
+
     def _generate_image(
         self,
         prompt: str,
         output_path: Path,
+        figure_id: str,
     ) -> bool:
         """Generate image via Gemini API.
 
         Tries google-genai SDK first, falls back to REST API.
         """
         if self._use_sdk:
-            return self._generate_via_sdk(prompt, output_path)
-        return self._generate_via_rest(prompt, output_path)
+            return self._generate_via_sdk(prompt, output_path, figure_id)
+        return self._generate_via_rest(prompt, output_path, figure_id)
 
     def _generate_via_sdk(
         self,
         prompt: str,
         output_path: Path,
+        figure_id: str,
     ) -> bool:
         """Generate image using google-genai SDK."""
         try:
             from google import genai
             from google.genai import types
+        except ImportError:
+            logger.warning("google-genai SDK not installed, falling back to REST")
+            self._use_sdk = False
+            return self._generate_via_rest(prompt, output_path, figure_id)
 
+        started = time.monotonic()
+        try:
             client = genai.Client(api_key=self._api_key)
-
             response = client.models.generate_content(
                 model=self._model,
                 contents=[prompt],
@@ -337,28 +395,36 @@ class NanoBananaAgent(BaseAgent):
                     ),
                 ),
             )
-
-            for part in response.parts:
-                if part.inline_data is not None:
-                    image = part.as_image()
-                    image.save(str(output_path))
-                    return True
-
-            logger.warning("Gemini SDK returned no image data")
-            return False
-
-        except ImportError:
-            logger.warning("google-genai SDK not installed, falling back to REST")
-            self._use_sdk = False
-            return self._generate_via_rest(prompt, output_path)
         except Exception as e:
             logger.warning("Gemini SDK error: %s, falling back to REST", e)
-            return self._generate_via_rest(prompt, output_path)
+            self._record_image_attempt(
+                figure_id=figure_id, endpoint="google-genai-sdk",
+                started=started, image_bytes=None, exc=e)
+            return self._generate_via_rest(prompt, output_path, figure_id)
+
+        usage = self._sdk_usage(response)
+        for part in response.parts:
+            if part.inline_data is not None:
+                image = part.as_image()
+                image.save(str(output_path))
+                size = output_path.stat().st_size if output_path.is_file() else None
+                self._record_image_attempt(
+                    figure_id=figure_id, endpoint="google-genai-sdk",
+                    started=started, image_bytes=size, exc=None, usage=usage)
+                return True
+
+        logger.warning("Gemini SDK returned no image data")
+        self._record_image_attempt(
+            figure_id=figure_id, endpoint="google-genai-sdk",
+            started=started, image_bytes=None,
+            exc=RuntimeError("no image in response"))
+        return False
 
     def _generate_via_rest(
         self,
         prompt: str,
         output_path: Path,
+        figure_id: str,
     ) -> bool:
         """Generate image using Gemini REST API (no SDK dependency)."""
         # Validate model name to prevent URL injection
@@ -392,6 +458,7 @@ class NanoBananaAgent(BaseAgent):
             method="POST",
         )
 
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
@@ -400,6 +467,9 @@ class NanoBananaAgent(BaseAgent):
             candidates = result.get("candidates", [])
             if not candidates:
                 logger.warning("Gemini REST API returned no candidates")
+                self._record_image_attempt(
+                    figure_id=figure_id, endpoint=url, started=started,
+                    image_bytes=None, exc=RuntimeError("no image in response"))
                 return False
 
             parts = candidates[0].get("content", {}).get("parts", [])
@@ -408,15 +478,28 @@ class NanoBananaAgent(BaseAgent):
                 if inline_data.get("mimeType", "").startswith("image/"):
                     image_bytes = base64.b64decode(inline_data["data"])
                     output_path.write_bytes(image_bytes)
+                    self._record_image_attempt(
+                        figure_id=figure_id, endpoint=url, started=started,
+                        image_bytes=len(image_bytes), exc=None,
+                        usage=result.get("usageMetadata"))
                     return True
 
             logger.warning("Gemini REST API returned no image parts")
+            self._record_image_attempt(
+                figure_id=figure_id, endpoint=url, started=started,
+                image_bytes=None, exc=RuntimeError("no image in response"))
             return False
 
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")[:500]
             logger.warning("Gemini REST API error %d: %s", e.code, body)
+            self._record_image_attempt(
+                figure_id=figure_id, endpoint=url, started=started,
+                image_bytes=None, exc=e)
             return False
         except Exception as e:
             logger.warning("Gemini REST API error: %s", e)
+            self._record_image_attempt(
+                figure_id=figure_id, endpoint=url, started=started,
+                image_bytes=None, exc=e)
             return False

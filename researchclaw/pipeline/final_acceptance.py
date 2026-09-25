@@ -90,6 +90,44 @@ def _image_ledger_problem(root: Path, manifest_path: Path) -> tuple[str, str] | 
     return None
 
 
+def _nano_banana_ledger_problem(root: Path) -> tuple[str, str] | None:
+    """Every figure the Nano Banana orchestrator froze must be covered by a
+    run-level image call ledger attempt with the same figure id and outcome
+    (SDK fallback to REST leaves both attempts in the ledger; the figure
+    needs one matching its final status). Returns (reason, artifact) or None."""
+    from researchclaw.llm.image_call_ledger import validate_image_call_ledger
+
+    results_files = sorted(root.glob("stage-*/nano_banana_results.json"))
+    if not results_files:
+        return None
+    ledger_path = root / "image_call_ledger.json"
+    if not ledger_path.is_file():
+        return ("nano_banana_calls_missing_run_ledger", "image_call_ledger.json")
+    try:
+        document = json.loads(ledger_path.read_text(encoding="utf-8"))
+        validate_image_call_ledger(document)
+        available = [(record.get("figure_id"), record.get("status"))
+                     for record in document["calls"]
+                     if record.get("figure_id") is not None]
+        for results_path in results_files:
+            results = json.loads(results_path.read_text(encoding="utf-8"))
+            generated = results.get("generated") if isinstance(results, dict) else None
+            if not isinstance(generated, list):
+                return ("invalid_nano_banana_results", results_path.name)
+            for entry in generated:
+                if not isinstance(entry, dict):
+                    return ("invalid_nano_banana_results", results_path.name)
+                status = "succeeded" if entry.get("success") else "failed"
+                attempt = (entry.get("figure_id"), status)
+                if attempt not in available:
+                    return ("nano_banana_calls_not_fully_ledgered",
+                            "image_call_ledger.json")
+                available.remove(attempt)
+    except (OSError, ValueError, TypeError):
+        return ("invalid_image_call_ledger", "image_call_ledger.json")
+    return None
+
+
 def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                      quality_threshold: float = 7.0) -> dict[str, Any]:
     hashes = inventory(root)
@@ -408,6 +446,9 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
         problem = _image_ledger_problem(root, framework_manifest)
         if problem is not None:
             issue("resources", problem[0], problem[1])
+    problem = _nano_banana_ledger_problem(root)
+    if problem is not None:
+        issue("resources", problem[0], problem[1])
 
     # Retry exhaustion or a failed stage is never an earned quality state.
     blockers = _read(root / "pipeline_blockers.json")
