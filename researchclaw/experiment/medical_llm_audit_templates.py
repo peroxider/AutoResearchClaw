@@ -106,22 +106,35 @@ def decision_curve(labels, scores):
       rows.append({"threshold":threshold,"net_benefit":tp/n-fp/n*threshold/(1-threshold),"treat_all":prevalence-(1-prevalence)*threshold/(1-threshold),"treat_none":0.0})
     return rows
 
-def api(prompt, required_key="risk_probability"):
+CALLS=[]
+def _write_calls():
+  (ROOT/"model_call_ledger.json").write_text(json.dumps(CALLS,ensure_ascii=False),encoding="utf-8")
+
+def api(prompt, required_key="risk_probability", meta=None):
     key = os.environ.get(R["api_key_env"])
     if not key: raise RuntimeError("missing API key environment variable")
     url = R.get("base_url", "https://api.minimaxi.com/anthropic").rstrip("/") + "/v1/messages"
     body = {"model": R["model"], "max_tokens": 1024, "messages":[{"role":"user","content":prompt}]}
     last_error=None
     for attempt in range(4):
+      meta=meta or {}
+      entry={"role":meta.get("role"),"condition":meta.get("condition"),"row_index":meta.get("row_index"),"attempt":attempt+1,"model":R["model"],"endpoint":url}
+      started=time.time()
       try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"content-type":"application/json", "x-api-key":key, "anthropic-version":"2023-06-01"})
         with urllib.request.urlopen(req, timeout=float(R.get("timeout_sec", 60))) as resp:
             data=json.loads(resp.read().decode())
+        usage=data.get("usage")
+        entry.update({"status":"succeeded","error_type":None,"duration_sec":round(time.time()-started,3),"usage":usage if isinstance(usage,dict) else None,"response_sha":sha(data)})
+        CALLS.append(entry); _write_calls()
         text="".join(x.get("text", "") for x in data.get("content", []) if isinstance(x, dict))
         parsed=json.loads(text[text.find("{"):text.rfind("}")+1])
         if required_key and required_key not in parsed: raise ValueError(required_key + " absent")
         return parsed, sha(data)
       except Exception as exc:
+        if "status" not in entry:
+          entry.update({"status":"failed","error_type":type(exc).__name__,"duration_sec":round(time.time()-started,3),"usage":None,"response_sha":None})
+          CALLS.append(entry); _write_calls()
         last_error=exc
         if attempt < 3: time.sleep(2 ** attempt)
     raise RuntimeError("API request/JSON failed after 4 attempts: " + str(last_error))
@@ -149,12 +162,12 @@ def run():
           mode={"DirectStructured":"state card only", "RetrievalOnly":"state card plus allowed-field evidence list", "NoCritic":"state card/evidence without independent critique", "NoAbstention":"state card/evidence; abstention forbidden", "FullAuditedAgent":"state card/evidence followed by independent audit critique and abstention"}.get(condition, condition)
           prompt=("Return JSON only: {\\\"risk_probability\\\": number 0..1, \\\"abstain\\\": bool, \\\"rationale\\\": string}. "
                   f"Condition={condition}; protocol={mode}. Outcome is unavailable. State card={json.dumps(card,ensure_ascii=False)}")
-          result,response_hash=api(prompt); score=float(result["risk_probability"]); abstain=bool(result.get("abstain",False)); error=""; critic_hash=""; critic_verdict=None
+          result,response_hash=api(prompt, meta={"role":"scorer","condition":condition,"row_index":index}); score=float(result["risk_probability"]); abstain=bool(result.get("abstain",False)); error=""; critic_hash=""; critic_verdict=None
           if condition=="FullAuditedAgent":
             critic_prompt=("Return JSON only: {\"accept\": bool, \"force_abstain\": bool, \"critique\": string}. "
                            "You are an independent clinical safety critic. You must not infer the hidden outcome. "
                            f"Audit this outcome-blind state card and proposed score. state_card={json.dumps(card,ensure_ascii=False)} proposal={json.dumps(result,ensure_ascii=False)}")
-            critic,critic_hash=api(critic_prompt, required_key="accept"); critic_verdict=critic
+            critic,critic_hash=api(critic_prompt, required_key="accept", meta={"role":"critic","condition":condition,"row_index":index}); critic_verdict=critic
             abstain = abstain or bool(critic.get("force_abstain",False)) or not bool(critic.get("accept",False))
           if condition=="NoAbstention": abstain=False
         except Exception as exc: score=None; abstain=True; response_hash=""; critic_hash=""; critic_verdict=None; error=str(exc)
@@ -175,7 +188,7 @@ def run():
       conditions[condition]={"n":len(items),"n_scored":len(usable),"coverage":len(usable)/max(1,len(items)),"auroc":auc(labels,scores),"auroc_ci_low":ci[0],"auroc_ci_high":ci[1],"brier_score":cal["brier"],"expected_calibration_error":cal["ece"],"calibration_curve":cal["bins"],"decision_curve":dca,"mean_latency_sec":sum(x["latency_sec"] for x in items)/max(1,len(items)),"abstention_rate":sum(bool(x["abstain"]) for x in items)/max(1,len(items)),"critic_calls":sum(1 for x in items if x.get("critic_response_hash")),"critic_accepted":sum(1 for x in items if isinstance(x.get("critic_verdict"),dict) and x["critic_verdict"].get("accept"))}
     metrics={"n_records":len(rows),"n_scored":sum(x["n_scored"] for x in conditions.values()),"coverage":sum(x["n_scored"] for x in conditions.values())/max(1,len(scored)),"conditions":conditions}
     (ROOT/"metrics.json").write_text(json.dumps(metrics,indent=2),encoding="utf-8")
-    (ROOT/"results.json").write_text(json.dumps({"metrics":metrics,"conditions":conditions,"contract_hash":sha(CFG)},indent=2),encoding="utf-8")
+    (ROOT/"results.json").write_text(json.dumps({"metrics":metrics,"conditions":conditions,"contract_hash":sha(CFG),"model_calls":{"attempts":len(CALLS),"failures":sum(1 for c in CALLS if c["status"]=="failed")}},indent=2),encoding="utf-8")
     print("coverage: " + str(metrics["coverage"]))
 
 if __name__ == "__main__": run()
