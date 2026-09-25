@@ -92,6 +92,11 @@ def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
     {"max_title_characters": 0}, {"max_abstract_characters": True}, {"max_figures": -1},
     {"max_tables": 1.5},
     {"max_references": 0}, {"max_references": 1.5},
+    {"min_page_ink_percent": 0, "max_sparse_pages": 0},
+    {"min_page_ink_percent": 101, "max_sparse_pages": 0},
+    {"min_page_ink_percent": 5}, {"max_sparse_pages": 1},
+    {"min_page_ink_percent": 5, "max_sparse_pages": -1},
+    {"min_page_ink_percent": 5, "max_sparse_pages": True},
     {"required_sections": ["nonsense"]}, {"required_sections": ["methods", "methods"]},
     {"banned_sections": "methods"}, {"required_sections": [True]},
     {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
@@ -338,6 +343,38 @@ def test_declared_section_and_reference_rules_are_recomputed(tmp_path):
     assert result["required_sections_missing"] == [] and result["banned_sections_present"] == []
     (root / "references.bib").unlink()
     assert "max_references_unavailable_or_exceeded" in inspect_constraints(root)["issues"]
+
+
+def test_declared_sparse_page_budget_is_recomputed_from_final_pdf_pixels(tmp_path):
+    import fitz
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, min_page_ink_percent=5, max_sparse_pages=1))
+    missing = inspect_constraints(root)
+    assert "pdf_sparse_page_analysis_unavailable" in missing["issues"]
+
+    def write_pdf(dense_pages):
+        target = root / "paper.pdf"
+        if target.exists():
+            target.unlink()
+        with fitz.open() as pdf:
+            for index in range(3):
+                page = pdf.new_page()
+                if index in dense_pages:
+                    page.draw_rect(fitz.Rect(50, 50, 545, 790), color=(0, 0, 0), fill=(0, 0, 0))
+            pdf.save(target)
+
+    write_pdf({0})
+    failed = inspect_constraints(root)
+    assert len(failed["page_ink_percent"]) == 3
+    assert failed["page_ink_percent"][0] > 5
+    assert failed["page_ink_percent"][1:] == [0.0, 0.0]
+    assert failed["sparse_pages"] == [2, 3]
+    assert "max_sparse_pages_exceeded" in failed["issues"]
+
+    write_pdf({0, 2})
+    passed = inspect_constraints(root)
+    assert passed["status"] == "passed"
+    assert passed["sparse_pages"] == [2]
 
 
 def test_export_refresh_detects_external_template_change(study):

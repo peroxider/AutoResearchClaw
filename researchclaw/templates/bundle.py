@@ -36,6 +36,7 @@ DEFAULT = {
     "max_title_characters": None, "max_abstract_characters": None,
     "max_figures": None, "max_tables": None,
     "required_sections": [], "banned_sections": [], "max_references": None,
+    "min_page_ink_percent": None, "max_sparse_pages": None,
     "columns": None,
 }
 GENERIC = r"""\documentclass[11pt]{article}
@@ -117,9 +118,16 @@ def _policy(data: dict) -> dict:
         if type(result[key]) is not bool:
             raise TemplateError(f"{key} must be boolean")
     for key in ("max_pages", "max_main_pages", "max_title_characters", "max_abstract_characters",
-                "max_figures", "max_tables", "max_references"):
+                "max_figures", "max_tables", "max_references", "min_page_ink_percent"):
         if result[key] is not None and (type(result[key]) is not int or result[key] < 1):
             raise TemplateError(f"{key} must be a positive integer or null")
+    if result["min_page_ink_percent"] is not None and result["min_page_ink_percent"] > 100:
+        raise TemplateError("min_page_ink_percent must not exceed 100")
+    if result["max_sparse_pages"] is not None and (type(result["max_sparse_pages"]) is not int
+                                                    or result["max_sparse_pages"] < 0):
+        raise TemplateError("max_sparse_pages must be a nonnegative integer or null")
+    if (result["min_page_ink_percent"] is None) != (result["max_sparse_pages"] is None):
+        raise TemplateError("min_page_ink_percent and max_sparse_pages must be declared together")
     roles = result["appendix_roles"]
     if (not isinstance(roles, list) or any(not isinstance(r, str) or r not in ROLE_NAMES for r in roles)
             or len(set(roles)) != len(roles)):
@@ -343,6 +351,8 @@ def inspect_constraints(root: Path) -> dict:
     sections_present: list[str] | None = None
     required_missing: list[str] | None = None
     banned_present: list[str] | None = None
+    page_ink_percent: list[float] | None = None
+    sparse_pages: list[int] | None = None
     pdf = root / "paper.pdf"
     if pdf.is_file():
         try:
@@ -354,10 +364,30 @@ def inspect_constraints(root: Path) -> dict:
                 author = (doc.metadata or {}).get("author", "").strip()
                 if policy["anonymous"] and author not in {"", "Anonymous"}:
                     issues.append("pdf_author_metadata_not_anonymous")
+                if policy["min_page_ink_percent"] is not None:
+                    page_ink_percent = []
+                    for page in doc:
+                        # Bound raster work for adversarial or unusually large
+                        # media boxes while retaining a stable whole-page view.
+                        area = max(1.0, float(page.rect.width * page.rect.height))
+                        scale = min(1.0, (1_000_000.0 / area) ** 0.5)
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                                                colorspace=fitz.csGRAY, alpha=False)
+                        samples = pixmap.samples
+                        ink = sum(value < 245 for value in samples)
+                        page_ink_percent.append(round(100.0 * ink / max(1, len(samples)), 6))
+                    sparse_pages = [index + 1 for index, value in enumerate(page_ink_percent)
+                                    if value < policy["min_page_ink_percent"]]
+                    if len(sparse_pages) > policy["max_sparse_pages"]:
+                        issues.append("max_sparse_pages_exceeded")
         except (ImportError, OSError, ValueError, RuntimeError):
             issues.append("pdf_page_count_unavailable")
+            if policy["min_page_ink_percent"] is not None:
+                issues.append("pdf_sparse_page_analysis_unavailable")
     else:
         issues.append("pdf_missing")
+        if policy["min_page_ink_percent"] is not None:
+            issues.append("pdf_sparse_page_analysis_unavailable")
     if policy["appendix_roles"]:
         # Count physical PDF pages, never a TeX page counter that a venue can reset.
         if len(appendix_pages) == 1 and appendix_pages[0] > 0:
@@ -419,5 +449,6 @@ def inspect_constraints(root: Path) -> dict:
             "references": references, "sections_present": sections_present,
             "required_sections_missing": required_missing,
             "banned_sections_present": banned_present,
+            "page_ink_percent": page_ink_percent, "sparse_pages": sparse_pages,
             "status": "passed" if not issues else "failed", "issues": issues,
-            "scope": "page limits and PDF author metadata; content anonymity and visual layout require full review"}
+            "scope": "declared structural and raster-density constraints; content anonymity and visual quality require full review"}
