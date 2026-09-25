@@ -2,9 +2,15 @@
 
 Individual frozen artifacts record partial call budgets; this module
 aggregates exactly what they record into one validated view. Fields the
-source artifact does not record stay null — never inferred. Stage calls
-outside these artifacts are not counted, so the ledger is not a full API
-cost account; it is the auditable lower bound the pipeline can prove.
+source artifact does not record stay null — never inferred. The chat row
+covers registered clients plus every raw caller that records itself (PRM
+judge votes, session-end signals); embedding requests are split into their
+own row by the records' call family. Beast-Mode subprocess invocations are
+declared from the frozen stage logs — the model calls INSIDE the subprocess
+are invisible to this process and stay uncounted rather than fabricated.
+Stage wall clock aggregates the durations each stage's own stage_health
+artifact recorded. Calls outside all recorded sources remain uncounted, so
+the ledger is still an auditable lower bound, not a billing report.
 """
 from __future__ import annotations
 
@@ -53,19 +59,38 @@ def _retrieval_row(document: dict) -> dict:
             "version": None}
 
 
-def _llm_chat_row(document: dict) -> tuple[dict | None, str | None]:
-    """Re-derive the llm_chat row; any self-inconsistency fails closed."""
+def _llm_rows(document: dict) -> tuple[list[dict], str | None]:
+    """Re-derive the llm_chat and llm_embeddings rows; any self-inconsistency
+    fails closed. Records without a call family are chat calls (client
+    records predate the split); embeddings ride the same frozen artifact so
+    one validation covers both."""
     from researchclaw.llm.call_ledger import call_ledger_totals, validate_call_ledger
 
     try:
         validate_call_ledger(document)
     except ValueError as exc:
-        return None, str(exc)
+        return [], str(exc)
     calls = document["calls"]
-    totals = call_ledger_totals(calls)
-    return {"source": "llm_call_ledger.json", "kind": "llm_chat",
-            "calls": totals["calls"], "limit": None, "failures": totals["failures"],
-            "tokens": totals["total_tokens"], "version": document.get("version")}, None
+    chat = [record for record in calls
+            if record.get("call_family") != "embeddings"]
+    embeddings = [record for record in calls
+                  if record.get("call_family") == "embeddings"]
+    rows: list[dict] = []
+    if chat or not embeddings:
+        chat_totals = call_ledger_totals(chat)
+        rows.append({"source": "llm_call_ledger.json", "kind": "llm_chat",
+                     "calls": chat_totals["calls"], "limit": None,
+                     "failures": chat_totals["failures"],
+                     "tokens": chat_totals["total_tokens"],
+                     "version": document.get("version")})
+    if embeddings:
+        totals = call_ledger_totals(embeddings)
+        rows.append({"source": "llm_call_ledger.json", "kind": "llm_embeddings",
+                     "calls": totals["calls"], "limit": None,
+                     "failures": totals["failures"],
+                     "tokens": totals["total_tokens"],
+                     "version": document.get("version")})
+    return rows, None
 
 
 def _image_generation_row(document: dict) -> tuple[dict | None, str | None]:
@@ -85,6 +110,48 @@ def _image_generation_row(document: dict) -> tuple[dict | None, str | None]:
             "failures": totals["failures"],
             "image_bytes": totals["total_image_bytes"],
             "version": document.get("version")}, None
+
+
+def _stage_glob_rows(root: Path, errors: list, pattern: str,
+                     kind: str) -> list[dict]:
+    """One declaration row per frozen stage artifact matched by the pattern.
+
+    The artifact records one invocation (beast_mode_log.json); the row
+    declares it at run level — what the subprocess did internally is not
+    recorded by the artifact and therefore stays null, never inferred."""
+    rows: list[dict] = []
+    for path in sorted(root.glob(pattern)):
+        source = path.relative_to(root).as_posix()
+        document = _read(root, source, errors)
+        if document is None:
+            continue
+        success = document.get("success")
+        if not isinstance(success, bool):
+            continue
+        rows.append({"source": source, "kind": kind,
+                     "calls": 1, "limit": None,
+                     "failures": 0 if success else 1, "version": None})
+    return rows
+
+
+def _stage_wall_clock(root: Path, errors: list) -> dict:
+    """Aggregate the per-stage durations each stage_health artifact recorded."""
+    entries: list[dict] = []
+    for path in sorted(root.glob("stage-*/stage_health.json")):
+        source = path.relative_to(root).as_posix()
+        document = _read(root, source, errors)
+        if document is None:
+            continue
+        duration = document.get("duration_sec")
+        if type(duration) not in (int, float) or isinstance(duration, bool):
+            errors.append({"source": source,
+                           "reason": "stage_health duration_sec is not a number"})
+            continue
+        entries.append({"source": source, "duration_sec": duration,
+                        "status": document.get("status")})
+    total = round(sum(entry["duration_sec"] for entry in entries), 2) \
+        if entries else None
+    return {"entries": entries, "total_duration_sec": total}
 
 
 def build_resource_ledger(root: Path) -> dict:
@@ -146,11 +213,11 @@ def build_resource_ledger(root: Path) -> dict:
 
     llm_ledger = _read(root, "llm_call_ledger.json", errors)
     if llm_ledger is not None:
-        row, problem = _llm_chat_row(llm_ledger)
-        if row is None:
+        llm_rows, problem = _llm_rows(llm_ledger)
+        if problem is not None:
             errors.append({"source": "llm_call_ledger.json", "reason": problem})
         else:
-            rows.append(row)
+            rows.extend(llm_rows)
 
     image_ledger = _read(root, "image_call_ledger.json", errors)
     if image_ledger is not None:
@@ -160,7 +227,11 @@ def build_resource_ledger(root: Path) -> dict:
         else:
             rows.append(row)
 
-    ledger = {"schema_version": 1, "rows": rows, "errors": errors}
+    rows.extend(_stage_glob_rows(root, errors, "stage-*/beast_mode_log.json",
+                                 "code_agent_subprocess"))
+
+    ledger = {"schema_version": 1, "rows": rows, "errors": errors,
+              "stage_wall_clock": _stage_wall_clock(root, errors)}
     ledger["version"] = content_hash(ledger)
     return ledger
 
