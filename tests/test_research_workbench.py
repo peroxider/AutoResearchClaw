@@ -1033,6 +1033,465 @@ def test_congruence_forgeries_rejected():
             "derived_coefficients": {"x": "0"}, "derived_constant": "0", "modulus": 0})
 
 
+def test_snf_search_closes_obstructions_the_echelon_misses():
+    from researchclaw.pipeline.formal_proof import (_integer_congruence_infeasibility_certificate,
+                                                    validate_linear_statement,
+                                                    verify_integer_congruence_infeasibility)
+    # Four equalities whose obstruction needs a combination outside the
+    # elimination basis: the echelon derives no primitive row with a
+    # fractional constant, but the Smith row transform combines the rows to
+    # 257*v1 == 197, and 257 does not divide 197.
+    spec = linear(
+        domain="integer", variables=("v0", "v1", "v2", "v3"),
+        premises=[{"coefficients": {"v0": -1, "v1": 3, "v2": 1, "v3": 1},
+                   "relation": "==", "constant": 2},
+                  {"coefficients": {"v0": 4, "v1": -1, "v2": 3, "v3": -2},
+                   "relation": "==", "constant": 3},
+                  {"coefficients": {"v0": -2, "v1": -2, "v2": 2, "v3": 1},
+                   "relation": "==", "constant": -2},
+                  {"coefficients": {"v0": -3, "v1": -3, "v2": 4, "v3": -3},
+                   "relation": "==", "constant": -2}],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = _integer_congruence_infeasibility_certificate(
+        statement, validate_linear_statement(statement))
+    assert certificate["kind"] == "integer_congruence_infeasibility"
+    assert certificate["row_multipliers"] == ["63", "-1", "-44", "7"]
+    assert certificate["derived_coefficients"] == {"v0": "0", "v1": "257", "v2": "0", "v3": "0"}
+    assert certificate["derived_constant"] == "197"
+    assert certificate["modulus"] == 257
+    assert verify_integer_congruence_infeasibility(statement, certificate) is True
+    # A dispatch-gap shape recorded by the round-60 fuzz (20000 random
+    # systems): every layer missed it, SNF combines the rows to
+    # 15*v0 - 15*v1 + 15*v2 == -5 with modulus 15.
+    gap = linear(
+        domain="integer", variables=("v0", "v1", "v2", "v3"),
+        premises=[{"coefficients": {"v0": -3, "v1": 3, "v2": 2, "v3": 2},
+                   "relation": "==", "constant": -3},
+                  {"coefficients": {"v0": -2, "v1": -3, "v2": 3, "v3": 3},
+                   "relation": "==", "constant": 3},
+                  {"coefficients": {"v0": 2, "v1": -3, "v2": 4, "v3": 1},
+                   "relation": "==", "constant": -1}],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    gap_statement = gap["obligations"][0]["statement"]
+    gap_certificate = _integer_congruence_infeasibility_certificate(
+        gap_statement, validate_linear_statement(gap_statement))
+    assert gap_certificate["row_multipliers"] == ["-1", "-1", "5"]
+    assert gap_certificate["derived_coefficients"] == {"v0": "15", "v1": "-15",
+                                                       "v2": "15", "v3": "0"}
+    assert gap_certificate["derived_constant"] == "-5"
+    assert gap_certificate["modulus"] == 15
+    # Integer-feasible systems must stay certificate-less: an integer point
+    # forces s_i | (U*d)_i on every Smith pivot, so no row can qualify.
+    for feasible_rows in ([((2, 2), 2)], [((1, 1), 2), ((1, -1), 0)], [((2, 4), 0), ((4, 4), 0)]):
+        feasible = linear(
+            domain="integer", variables=("x", "y"),
+            premises=[{"coefficients": {"x": coeffs[0], "y": coeffs[1]},
+                       "relation": "==", "constant": const} for coeffs, const in feasible_rows],
+            conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+        feasible_statement = feasible["obligations"][0]["statement"]
+        assert _integer_congruence_infeasibility_certificate(
+            feasible_statement, validate_linear_statement(feasible_statement)) is None
+
+
+def test_snf_certificate_extends_dispatch_to_previously_unresolved_systems(monkeypatch):
+    # End-to-end: this system left the dispatch honestly unresolved before
+    # the SNF stage (no Farkas/Motzkin/bounds/echelon certificate); now the
+    # congruence layer closes it.
+    spec = linear(
+        domain="integer", variables=("v0", "v1", "v2", "v3"),
+        premises=[{"coefficients": {"v0": -3, "v1": 3, "v2": 2, "v3": 2},
+                   "relation": "==", "constant": -3},
+                  {"coefficients": {"v0": -2, "v1": -3, "v2": 3, "v3": 3},
+                   "relation": "==", "constant": 3},
+                  {"coefficients": {"v0": 2, "v1": -3, "v2": 4, "v3": 1},
+                   "relation": "==", "constant": -1}],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    assert obligation["evidence"]["portable_certificate_checker"] == \
+        "exact_integer_congruence_infeasibility/v1"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "integer_congruence_infeasibility"
+    assert certificate["modulus"] == 15
+    # Determinism: the search is a pure function of the statement.
+    replay = compile_theory(spec)["obligations"][0]
+    assert json.dumps(replay["evidence"], sort_keys=True) == \
+        json.dumps(obligation["evidence"], sort_keys=True)
+    # Frozen-cert replay without z3: the portable dispatch still resolves
+    # the checker from the certificate alone, and re-derives the identical
+    # certificate.
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    replayed = compile_theory(portable)["obligations"][0]
+    assert replayed["checker"] == "exact_integer_congruence_infeasibility/v1"
+    assert replayed["evidence"]["backend"] == "portable_certificate"
+    assert replayed["evidence"]["portable_certificate"] == certificate
+    # Tampered certificates stay rejected: a shifted constant no longer
+    # matches the multiplier combination, a swapped sign flips the row, and
+    # a wrong modulus diverges from the derived gcd.
+    from researchclaw.pipeline.formal_proof import (FormalProofError,
+                                                    verify_integer_congruence_infeasibility)
+    with pytest.raises(FormalProofError, match="differs from the multiplier combination"):
+        verify_integer_congruence_infeasibility(
+            spec["obligations"][0]["statement"],
+            dict(certificate, derived_constant="-6"))
+    with pytest.raises(FormalProofError, match="differs from the multiplier combination"):
+        verify_integer_congruence_infeasibility(
+            spec["obligations"][0]["statement"],
+            dict(certificate, row_multipliers=["1", "1", "-5"]))
+    with pytest.raises(FormalProofError, match="Declared modulus differs"):
+        verify_integer_congruence_infeasibility(
+            spec["obligations"][0]["statement"], dict(certificate, modulus=16))
+
+
+def test_congruence_dispatch_prefers_the_echelon_certificate():
+    from researchclaw.pipeline.formal_proof import (_integer_congruence_infeasibility_certificate,
+                                                    validate_linear_statement)
+    # When both searches fire, the echelon certificate is kept: 2x - 2y == 1
+    # is caught by the initial primitivization test, multipliers ["1"], and
+    # the SNF stage never runs.
+    spec = linear(
+        domain="integer", variables=("x", "y"),
+        premises=[{"coefficients": {"x": 2, "y": -2}, "relation": "==", "constant": 1}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = _integer_congruence_infeasibility_certificate(
+        statement, validate_linear_statement(statement))
+    assert certificate["row_multipliers"] == ["1"]
+    assert certificate["derived_coefficients"] == {"x": "2", "y": "-2"}
+    assert certificate["derived_constant"] == "1"
+    assert certificate["modulus"] == 2
+
+
+def test_cg_cut_certificate_closes_the_band_class():
+    # The band 1/2 <= x + y <= 9/10 is real-feasible, integer-infeasible,
+    # and carries no pinning bounds and no effective equalities, so Farkas,
+    # Motzkin, the bounded box and the congruence layers all stay
+    # certificate-less. One rounding cut closes it: x + y <= floor(9/10) = 0
+    # holds at every integer point, and together with the original lower
+    # row -x - y <= -1/2 the real relaxation of the derived system is
+    # empty — Farkas territory over the cuts and the premise rows.
+    spec = linear(
+        domain="integer",
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "9/10"},
+                  {"coefficients": {"x": 1, "y": 1}, "relation": ">=", "constant": "1/2"}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["vacuous_implication_rejected"] is True
+    assert obligation["evidence"]["portable_certificate_checker"] == \
+        "exact_integer_cg_cut_infeasibility/v1"
+    assert obligation["evidence"]["certificate_proof_domain"] == "integer"
+    assert obligation["evidence"]["portable_certificate_verified"] is True
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["kind"] == "integer_cg_cut_infeasibility"
+    assert certificate["closed_premise_rows"] == ["premise_1:upper", "premise_2:lower"]
+    assert certificate["strict_premise_rows"] == []
+    assert certificate["cuts"] and all(
+        cut["closed_multipliers"].count("1") + cut["strict_multipliers"].count("1") >= 1
+        for cut in certificate["cuts"])
+    from researchclaw.pipeline.formal_proof import verify_integer_cg_cut_infeasibility
+    assert verify_integer_cg_cut_infeasibility(
+        spec["obligations"][0]["statement"], certificate) is True
+
+
+def test_cg_cut_dispatch_covers_strict_rows_and_spares_feasible_bands():
+    from researchclaw.pipeline.formal_proof import verify_integer_cg_cut_infeasibility
+    # Strict variant: x + y < 9/10 with x + y > 1/2 produces no closed rows,
+    # so Motzkin has no closed multiplier to lean on. The strict cuts round
+    # with ceil(d/g) - 1, landing on the same contradiction.
+    strict_spec = linear(
+        domain="integer",
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "<", "constant": "9/10"},
+                  {"coefficients": {"x": 1, "y": 1}, "relation": ">", "constant": "1/2"}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(strict_spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    assert obligation["evidence"]["portable_certificate_checker"] == \
+        "exact_integer_cg_cut_infeasibility/v1"
+    certificate = obligation["evidence"]["portable_certificate"]
+    assert certificate["closed_premise_rows"] == []
+    assert certificate["strict_premise_rows"] == ["premise_1:strict", "premise_2:strict"]
+    assert verify_integer_cg_cut_infeasibility(
+        strict_spec["obligations"][0]["statement"], certificate) is True
+    # The widened band 1/2 <= x + y <= 3/2 admits the integer point
+    # x + y == 1: no CG certificate may exist, and the dispatch cannot
+    # disguise a counterexample as an infeasibility proof.
+    feasible_spec = linear(
+        domain="integer",
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+                  {"coefficients": {"x": 1, "y": 1}, "relation": ">=", "constant": "1/2"}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    feasible = compile_theory(feasible_spec)["obligations"][0]
+    feasible_certificate = feasible["evidence"].get("portable_certificate")
+    assert feasible_certificate is not None  # the implication is disproved …
+    assert feasible_certificate["kind"] == "linear_counterexample_witness"  # … by witness
+    assert feasible["status"] == "disproved"
+
+
+def test_cg_cut_certificate_freezes_without_z3(monkeypatch):
+    spec = linear(
+        domain="integer",
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "9/10"},
+                  {"coefficients": {"x": 1, "y": 1}, "relation": ">=", "constant": "1/2"}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    from researchclaw.pipeline.formal_proof import verify_integer_cg_cut_infeasibility
+    # The witness multipliers are solver-chosen and may differ between
+    # runs; the layer's verdict is what must reproduce: the same checker
+    # fires on the same premise rows and every certificate it mints
+    # verifies exactly.
+    for _ in range(2):
+        obligation = compile_theory(spec)["obligations"][0]
+        assert obligation["evidence"]["portable_certificate_checker"] == \
+            "exact_integer_cg_cut_infeasibility/v1"
+        assert obligation["evidence"]["certificate_proof_domain"] == "integer"
+        assert verify_integer_cg_cut_infeasibility(
+            spec["obligations"][0]["statement"],
+            obligation["evidence"]["portable_certificate"]) is True
+    certificate = compile_theory(spec)["obligations"][0]["evidence"]["portable_certificate"]
+    # Frozen-cert replay without z3: the portable dispatch re-verifies the
+    # certificate with the pure-Python CG verifier and echoes it unchanged.
+    portable = copy.deepcopy(spec)
+    portable["obligations"][0]["statement"]["portable_certificate"] = certificate
+    import sys
+    monkeypatch.setitem(sys.modules, "z3", None)
+    replayed = compile_theory(portable)["obligations"][0]
+    assert replayed["checker"] == "exact_integer_cg_cut_infeasibility/v1"
+    assert replayed["evidence"]["backend"] == "portable_certificate"
+    assert replayed["evidence"]["portable_certificate"] == certificate
+
+
+def test_cg_cut_verifier_rejects_forgeries():
+    spec = linear(
+        domain="integer",
+        premises=[{"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "9/10"},
+                  {"coefficients": {"x": 1, "y": 1}, "relation": ">=", "constant": "1/2"}],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = compile_theory(spec)["obligations"][0]["evidence"]["portable_certificate"]
+    from researchclaw.pipeline.formal_proof import (FormalProofError,
+                                                    verify_integer_cg_cut_infeasibility)
+
+    def forge(mutate, message):
+        tampered = json.loads(json.dumps(certificate))
+        mutate(tampered)
+        with pytest.raises(FormalProofError, match=message):
+            verify_integer_cg_cut_infeasibility(statement, tampered)
+
+    # A cut that does not re-derive from its declared multipliers: wrong
+    # rounding, negative or fractional derivation multipliers, a derived
+    # row that disagrees with the combination.
+    def wrong_rounding(c):
+        c["cuts"][0]["derived_constant"] = "1"
+
+    def negative_multiplier(c):
+        c["cuts"][0]["closed_multipliers"][0] = "-1"
+
+    def fractional_multiplier(c):
+        c["cuts"][0]["closed_multipliers"][0] = "1/2"
+
+    def wrong_derived_row(c):
+        c["cuts"][0]["derived_coefficients"] = {"x": "1", "y": "2"}
+
+    # A contradiction that never leaves the real relaxation is Farkas
+    # territory, not CG; a witness constant that disagrees with the
+    # multipliers is arithmetic theft.
+    def cut_less_witness(c):
+        c["cut_multipliers"] = ["0" for _ in c["cut_multipliers"]]
+
+    def tampered_combined_constant(c):
+        c["combined_constant"] = "-2"
+
+    def hash_theft(c):
+        c["statement_hash"] = "0" * 64
+
+    forge(wrong_rounding, "differs from the multiplier combination")
+    forge(negative_multiplier, "must be nonnegative and complete")
+    forge(fractional_multiplier, "must be integers")
+    forge(wrong_derived_row, "differs from the multiplier combination")
+    forge(cut_less_witness, "must use at least one cut row")
+    forge(tampered_combined_constant, "do not derive a CG contradiction")
+    forge(hash_theft, "Invalid CG cut certificate identity")
+    # The certificate is an integer-domain proof: the real statement it was
+    # minted from does not accept it.
+    with pytest.raises(FormalProofError, match="require the integer domain"):
+        verify_integer_cg_cut_infeasibility(dict(statement, domain="real"), certificate)
+
+
+def test_staged_cut_pool_closes_a_system_the_old_pool_misses():
+    from researchclaw.pipeline.formal_proof import verify_integer_cg_cut_infeasibility
+    # Real-feasible, integer-infeasible, no effective equality (congruence
+    # blind), and the directions v0 >= / v1 <= have no row-space pinning
+    # proof (bounded-box blind): every valid bounding box keeps integer
+    # points. The old pool (combinations of at most three rows with
+    # multipliers up to two) admits no refutation witness for this system;
+    # the staged tiers (four rows with multipliers up to two, three rows
+    # with multipliers up to three) supply the missing cut — the witness
+    # needs a derivation whose multiplier reaches three, which is exactly
+    # what the old cap excluded. Because the old pool's witness search is
+    # unsat for this system, EVERY valid witness must use at least one cut
+    # outside the old pool, so that property is asserted instead of any
+    # solver-chosen multiplier.
+    spec = linear(
+        domain="integer",
+        variables=("v0", "v1", "v2"),
+        premises=[
+            {"coefficients": {"v0": 3, "v1": 3, "v2": 1}, "relation": "<", "constant": 1},
+            {"coefficients": {"v0": 2, "v1": 2, "v2": -3}, "relation": "<", "constant": 0},
+            {"coefficients": {"v0": -3, "v1": -3, "v2": -1}, "relation": "<=", "constant": 1},
+            {"coefficients": {"v0": 1, "v1": 1, "v2": -3}, "relation": ">=", "constant": -3},
+            {"coefficients": {"v0": 2, "v1": 3, "v2": 1}, "relation": "<", "constant": 1},
+        ],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    evidence = obligation["evidence"]
+    assert evidence["vacuous_implication_rejected"] is True
+    assert evidence["portable_certificate_checker"] == \
+        "exact_integer_cg_cut_infeasibility/v1"
+    assert evidence["certificate_proof_domain"] == "integer"
+    assert evidence["portable_certificate_verified"] is True
+    certificate = evidence["portable_certificate"]
+    assert certificate["kind"] == "integer_cg_cut_infeasibility"
+    assert certificate["closed_premise_rows"] == ["premise_3:upper", "premise_4:lower"]
+    assert certificate["strict_premise_rows"] == \
+        ["premise_1:strict", "premise_2:strict", "premise_5:strict"]
+
+    def needs_staged_tier(cut):
+        multipliers = [int(value) for value
+                       in cut["closed_multipliers"] + cut["strict_multipliers"]]
+        return max(multipliers) >= 3 or sum(1 for value in multipliers if value) >= 4
+
+    assert certificate["cuts"]
+    assert any(needs_staged_tier(cut) for cut in certificate["cuts"])
+    assert verify_integer_cg_cut_infeasibility(
+        spec["obligations"][0]["statement"], certificate) is True
+
+
+def test_iterated_cut_closure_closes_the_free_z_diamond():
+    from fractions import Fraction
+    from researchclaw.pipeline.formal_proof import verify_integer_iterated_cg_cut_infeasibility
+    # Real-feasible, integer-infeasible (the diamond bands force x + y = 1
+    # and x - y = 0 for integers, so x = y = 1/2), and unbounded: z carries
+    # no premises, so the relaxation has no finite box and the bounded-box
+    # enumeration honestly refuses. Congruence is blind (no equality rows),
+    # and the single-round cut pool admits no refutation witness — the
+    # rank-one closure keeps the real point (1/2, 1/2, t). The iterated
+    # layer feeds the single-row band cuts back as rows and closes the
+    # class at rank two (x <= 0 and x >= 1). Because the single-round
+    # witness search is unsat, EVERY valid iterated witness must weight a
+    # round-two cut whose derivation consumes a round-one row — cuts over
+    # premise rows alone plus round-one rows span exactly the single-round
+    # search space — so that property is asserted instead of any
+    # solver-chosen multiplier.
+    spec = linear(
+        domain="integer",
+        variables=("x", "y", "z"),
+        premises=[
+            {"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+            {"coefficients": {"x": -1, "y": -1}, "relation": "<=", "constant": "-1/2"},
+            {"coefficients": {"x": 1, "y": -1}, "relation": "<=", "constant": "1/2"},
+            {"coefficients": {"x": -1, "y": 1}, "relation": "<=", "constant": "1/2"},
+        ],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    evidence = obligation["evidence"]
+    assert evidence["vacuous_implication_rejected"] is True
+    assert evidence["portable_certificate_checker"] == \
+        "exact_integer_iterated_cg_cut_infeasibility/v1"
+    assert evidence["certificate_proof_domain"] == "integer"
+    assert evidence["portable_certificate_verified"] is True
+    certificate = evidence["portable_certificate"]
+    assert certificate["kind"] == "integer_iterated_cg_cut_infeasibility"
+    assert certificate["closed_premise_rows"] == [
+        "premise_1:upper", "premise_2:upper", "premise_3:upper", "premise_4:upper"]
+    assert certificate["strict_premise_rows"] == []
+    for entry in certificate["round1_cuts"]:
+        assert sum(int(value) for value in entry["closed_multipliers"]
+                   + entry["strict_multipliers"]) == 1
+    round1_width = len(certificate["round1_cuts"])
+    assert any(
+        Fraction(multiplier) != 0
+        and any(int(value) != 0 for value in cut["closed_multipliers"][:round1_width])
+        for multiplier, cut in zip(certificate["cut_multipliers"], certificate["cuts"]))
+    assert verify_integer_iterated_cg_cut_infeasibility(
+        spec["obligations"][0]["statement"], certificate) is True
+
+
+def test_iterated_cut_verifier_rejects_forgeries():
+    spec = linear(
+        domain="integer",
+        variables=("x", "y", "z"),
+        premises=[
+            {"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+            {"coefficients": {"x": -1, "y": -1}, "relation": "<=", "constant": "-1/2"},
+            {"coefficients": {"x": 1, "y": -1}, "relation": "<=", "constant": "1/2"},
+            {"coefficients": {"x": -1, "y": 1}, "relation": "<=", "constant": "1/2"},
+        ],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    certificate = compile_theory(spec)["obligations"][0]["evidence"]["portable_certificate"]
+    from researchclaw.pipeline.formal_proof import (FormalProofError,
+                                                    verify_integer_iterated_cg_cut_infeasibility)
+
+    def forge(mutate, message):
+        tampered = json.loads(json.dumps(certificate))
+        mutate(tampered)
+        with pytest.raises(FormalProofError, match=message):
+            verify_integer_iterated_cg_cut_infeasibility(statement, tampered)
+
+    # Round one is pinned to one unit multiplier on a single premise row;
+    # its derived row must re-derive exactly.
+    def non_unit_round1(c):
+        c["round1_cuts"][0]["closed_multipliers"][0] = "2"
+
+    def fractional_round1(c):
+        c["round1_cuts"][0]["closed_multipliers"][0] = "1/2"
+
+    def wrong_round1_row(c):
+        c["round1_cuts"][0]["derived_constant"] = str(
+            int(c["round1_cuts"][0]["derived_constant"]) - 1)
+
+    # Round two multipliers index the merged space (round-one rows first,
+    # then premises); they stay integral and must re-derive the declared cut.
+    def wrong_round2_rounding(c):
+        c["cuts"][0]["derived_constant"] = str(
+            int(c["cuts"][0]["derived_constant"]) - 1)
+
+    def fractional_round2(c):
+        c["cuts"][0]["closed_multipliers"][0] = "3/2"
+
+    def round2_length_mismatch(c):
+        c["cuts"][0]["closed_multipliers"].append("0")
+
+    # The witness must lean on the iterated structure and re-check exactly.
+    def round2_less_witness(c):
+        c["cut_multipliers"] = ["0" for _ in c["cut_multipliers"]]
+
+    def tampered_combined_constant(c):
+        c["combined_constant"] = "-2"
+
+    def hash_theft(c):
+        c["statement_hash"] = "0" * 64
+
+    forge(non_unit_round1, "must be one unit multiplier")
+    forge(fractional_round1, "must be nonnegative integers")
+    forge(wrong_round1_row, "differs from the multiplier combination")
+    forge(wrong_round2_rounding, "differs from the multiplier combination")
+    forge(fractional_round2, "must be integers")
+    forge(round2_length_mismatch, "must be nonnegative and complete")
+    forge(round2_less_witness, "must use at least one round-two cut row")
+    forge(tampered_combined_constant, "do not derive a CG contradiction")
+    forge(hash_theft, "Invalid iterated CG cut certificate identity")
+    with pytest.raises(FormalProofError, match="require the integer domain"):
+        verify_integer_iterated_cg_cut_infeasibility(dict(statement, domain="real"), certificate)
+
+
 def test_feasible_box_rejects_infeasibility_forgery():
     spec = linear(
         domain="integer", variables=("x",),
@@ -1055,6 +1514,303 @@ def test_feasible_box_rejects_infeasibility_forgery():
         verify_bounded_integer_infeasibility(statement, base)
     with pytest.raises(FormalProofError, match="Declared integer bounds differ"):
         verify_bounded_integer_infeasibility(statement, dict(base, bounds={"x": {"lower": 0, "upper": 1}}))
+
+
+def test_single_cut_fast_path_closes_the_wide_box_timeout_survivor():
+    # Measured in the round-64 member search (2000 systems): this 8-row
+    # wide-box system is real-feasible and integer-infeasible, but its
+    # full cut pool (~2600 cuts) pushed the witness LP past the dispatch
+    # budget, so the system stayed honestly unresolved although two
+    # single-row cuts already refute it (v0+2v1+v2 <= 0 and
+    # -(v0+v1+v2) <= -1 combine with -v1 <= 0 into 0 <= -1). The
+    # single-cut fast pass closes it in milliseconds, and because that
+    # pass searches only single-row derivations, every frozen cut carries
+    # exactly one unit multiplier.
+    from fractions import Fraction
+    from researchclaw.pipeline.formal_proof import verify_integer_cg_cut_infeasibility
+    spec = linear(
+        domain="integer", variables=("v0", "v1", "v2"),
+        premises=[
+            {"coefficients": {"v0": 1}, "relation": "<=", "constant": 75},
+            {"coefficients": {"v0": -1}, "relation": "<=", "constant": 1},
+            {"coefficients": {"v1": 1}, "relation": "<=", "constant": 54},
+            {"coefficients": {"v1": -1}, "relation": "<=", "constant": 0},
+            {"coefficients": {"v2": 1}, "relation": "<=", "constant": 48},
+            {"coefficients": {"v2": -1}, "relation": "<=", "constant": 5},
+            {"coefficients": {"v0": 2, "v1": 4, "v2": 2}, "relation": "<=", "constant": 1},
+            {"coefficients": {"v0": 4, "v1": 4, "v2": 4}, "relation": ">=", "constant": 1},
+        ],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    evidence = obligation["evidence"]
+    assert evidence["vacuous_implication_rejected"] is True
+    assert evidence["portable_certificate_checker"] == \
+        "exact_integer_cg_cut_infeasibility/v1"
+    assert evidence["certificate_proof_domain"] == "integer"
+    assert evidence["portable_certificate_verified"] is True
+    certificate = evidence["portable_certificate"]
+    assert certificate["kind"] == "integer_cg_cut_infeasibility"
+    assert certificate["closed_premise_rows"] == \
+        [f"premise_{index}:upper" for index in range(1, 8)] + ["premise_8:lower"]
+    for cut in certificate["cuts"]:
+        weights = [Fraction(value) for value in cut["closed_multipliers"]] \
+            + [Fraction(value) for value in cut["strict_multipliers"]]
+        assert sum(weights) == 1
+        assert sum(1 for value in weights if value) == 1
+    verify_integer_cg_cut_infeasibility(spec["obligations"][0]["statement"], certificate)
+
+
+def test_witness_search_retries_after_resource_unknown(monkeypatch):
+    # Round-64 hardening: a witness LP that answers unknown under the
+    # caller's budget is retried once under the raised fixed budget,
+    # while an unsat answer stays final. The staged-pool fixture's
+    # witness needs combination cuts, so both the fast single-row pass
+    # and the full-pool pass must run; a caller solver that always
+    # answers unknown makes that deterministic, and only the retry
+    # recovers the witness. With the retry budget itself exhausted the
+    # search degrades to honest None — never a crash, never a claim.
+    import z3
+    from researchclaw.pipeline.formal_proof import (
+        _alternative_rows, _cg_cut_pool, _cg_cut_witness, _cg_scale_row,
+        validate_linear_statement,
+    )
+
+    class UnknownSolver:
+        def __init__(self):
+            self.constraints = []
+
+        def add(self, *constraints):
+            self.constraints.extend(constraints)
+
+        def check(self):
+            return z3.unknown
+
+    spec = linear(
+        domain="integer", variables=("v0", "v1", "v2"),
+        premises=[
+            {"coefficients": {"v0": 3, "v1": 3, "v2": 1}, "relation": "<", "constant": 1},
+            {"coefficients": {"v0": 2, "v1": 2, "v2": -3}, "relation": "<", "constant": 0},
+            {"coefficients": {"v0": -3, "v1": -3, "v2": -1}, "relation": "<=", "constant": 1},
+            {"coefficients": {"v0": 1, "v1": 1, "v2": -3}, "relation": ">=", "constant": -3},
+            {"coefficients": {"v0": 2, "v1": 3, "v2": 1}, "relation": "<", "constant": 1},
+        ],
+        conclusion={"coefficients": {"v0": 1}, "relation": ">=", "constant": 0})
+    statement = spec["obligations"][0]["statement"]
+    normalized = validate_linear_statement(statement)
+    variables = normalized["variables"]
+    closed_rows, strict_rows = _alternative_rows(normalized)
+    closed_scaled = [_cg_scale_row(coefficients, bound, variables)
+                     for _, coefficients, bound in closed_rows]
+    strict_scaled = [_cg_scale_row(coefficients, bound, variables)
+                     for _, coefficients, bound in strict_rows]
+    pool = _cg_cut_pool(closed_scaled, strict_scaled)
+    assert len(pool) > len(closed_rows) + len(strict_rows)
+
+    witness = _cg_cut_witness(pool, closed_scaled, strict_scaled, variables,
+                              UnknownSolver, _exact_z3_value, z3)
+    assert witness is not None
+    monkeypatch.setattr(
+        "researchclaw.pipeline.formal_proof._CG_WITNESS_RETRY_TIMEOUT_MS", 1)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.formal_proof._CG_WITNESS_RETRY_RLIMIT", 1)
+    assert _cg_cut_witness(pool, closed_scaled, strict_scaled, variables,
+                           UnknownSolver, _exact_z3_value, z3) is None
+
+
+def _exact_z3_value(value):
+    import z3
+    return z3.IntVal(value.numerator) if value.denominator == 1 \
+        else z3.RealVal(f"{value.numerator}/{value.denominator}")
+
+
+def test_oversized_row_scale_certifies_exactly():
+    # Round-64 probe: z3 model fractions extract exactly at any size
+    # (the extraction converts numerator and denominator as strings, not
+    # through machine words), so a band whose lower row carries 2**70
+    # -scale coefficients still certifies and verifies — no exception
+    # escapes the attach path, and the witness needs a multiplier whose
+    # numerator or denominator exceeds any machine word.
+    spec = linear(
+        domain="integer", variables=("x", "y", "z"),
+        premises=[
+            {"coefficients": {"x": 1, "y": 1, "z": 1}, "relation": "<=",
+             "constant": "9/10"},
+            {"coefficients": {"x": -(2 ** 70), "y": -(2 ** 70), "z": -(2 ** 70)},
+             "relation": "<=", "constant": -(2 ** 69)},
+        ],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    evidence = obligation["evidence"]
+    assert evidence["vacuous_implication_rejected"] is True
+    assert evidence["portable_certificate_verified"] is True
+    certificate = evidence["portable_certificate"]
+    assert certificate["kind"] == "integer_cg_cut_infeasibility"
+
+
+def test_focused_iteration_pool_closes_the_extra_row_diamond():
+    from fractions import Fraction
+    from researchclaw.pipeline.formal_proof import verify_integer_iterated_cg_cut_infeasibility
+    # Round-65 member: the free-z diamond plus one extra closed row on the
+    # free variable. The merged iteration space is ten rows — beyond the
+    # staged pool's eight-row enumeration limit — so round two used to
+    # degenerate to a singles-only pool and the class stayed honestly
+    # unresolved even with unlimited solver budget. The focused round-two
+    # pool (combinations drawn from the fed-back cut rows) closes it. As in
+    # the round-63 fixture, the single-round witness search is unsat, so
+    # every valid iterated witness must weight a round-two cut whose
+    # derivation consumes a round-one row; the merged-width property is
+    # asserted too because the focused pool's multipliers index the full
+    # merged space.
+    spec = linear(
+        domain="integer",
+        variables=("x", "y", "z"),
+        premises=[
+            {"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+            {"coefficients": {"x": -1, "y": -1}, "relation": "<=", "constant": "-1/2"},
+            {"coefficients": {"x": 1, "y": -1}, "relation": "<=", "constant": "5/2"},
+            {"coefficients": {"x": -1, "y": 1}, "relation": "<=", "constant": "-3/2"},
+            {"coefficients": {"z": 1}, "relation": ">=", "constant": "-1"},
+        ],
+        conclusion={"coefficients": {"x": 1}, "relation": ">=", "constant": 0})
+    obligation = compile_theory(spec)["obligations"][0]
+    assert obligation["status"] == "unresolved"
+    evidence = obligation["evidence"]
+    assert evidence["vacuous_implication_rejected"] is True
+    assert evidence["portable_certificate_checker"] == \
+        "exact_integer_iterated_cg_cut_infeasibility/v1"
+    assert evidence["certificate_proof_domain"] == "integer"
+    assert evidence["portable_certificate_verified"] is True
+    certificate = evidence["portable_certificate"]
+    assert certificate["kind"] == "integer_iterated_cg_cut_infeasibility"
+    assert certificate["closed_premise_rows"] == [
+        "premise_1:upper", "premise_2:upper", "premise_3:upper",
+        "premise_4:upper", "premise_5:lower"]
+    assert certificate["strict_premise_rows"] == []
+    for entry in certificate["round1_cuts"]:
+        assert sum(int(value) for value in entry["closed_multipliers"]
+                   + entry["strict_multipliers"]) == 1
+    round1_width = len(certificate["round1_cuts"])
+    assert round1_width == 5
+    for cut in certificate["cuts"]:
+        assert len(cut["closed_multipliers"]) == round1_width + 5
+    assert any(
+        Fraction(multiplier) != 0
+        and any(int(value) != 0 for value in cut["closed_multipliers"][:round1_width])
+        for multiplier, cut in zip(certificate["cut_multipliers"], certificate["cuts"]))
+    assert verify_integer_iterated_cg_cut_infeasibility(
+        spec["obligations"][0]["statement"], certificate) is True
+
+
+def test_focused_pool_enumerates_only_cut_row_combinations():
+    from researchclaw.pipeline.formal_proof import (
+        _alternative_rows, _cg_cut_pool, _cg_focused_cut_pool,
+        _cg_rounded_cut, _cg_scale_row, validate_linear_statement)
+    # The focused round-two pool keeps single-row cuts over the whole merged
+    # space but draws multi-row derivations only from the round-one cut
+    # rows, with multiplier vectors still indexing the full merged space.
+    # The plain pool on the same too-wide space stays singles-only — the
+    # degeneration that motivated the focused variant.
+    premises = [
+        {"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+        {"coefficients": {"x": -1, "y": -1}, "relation": "<=", "constant": "-1/2"},
+        {"coefficients": {"x": 1, "y": -1}, "relation": "<=", "constant": "5/2"},
+        {"coefficients": {"x": -1, "y": 1}, "relation": "<=", "constant": "-3/2"},
+        {"coefficients": {"z": 1}, "relation": ">=", "constant": "-1"},
+    ]
+    statement = {"kind": "linear_arithmetic", "domain": "integer",
+                 "variables": ["x", "y", "z"], "premises": premises,
+                 "conclusion": {"coefficients": {"x": 1},
+                                "relation": ">=", "constant": 0}}
+    normalized = validate_linear_statement(statement)
+    closed_rows, strict_rows = _alternative_rows(normalized)
+    variables = normalized["variables"]
+    closed_scaled = [_cg_scale_row(coefficients, constant, variables)
+                     for _, coefficients, constant in closed_rows]
+    strict_scaled = [_cg_scale_row(coefficients, constant, variables)
+                     for _, coefficients, constant in strict_rows]
+    premise_rows = ([(coefficients, bound, False)
+                     for coefficients, bound in closed_scaled]
+                    + [(coefficients, bound, True)
+                       for coefficients, bound in strict_scaled])
+    round1 = []
+    for index in range(len(premise_rows)):
+        multipliers = [0] * len(premise_rows)
+        multipliers[index] = 1
+        cut = _cg_rounded_cut(premise_rows, multipliers)
+        if cut is not None:
+            round1.append(cut)
+    assert len(round1) == 5
+    merged = [(cut[0], cut[1]) for cut in round1] + closed_scaled
+    assert len(merged) + len(strict_scaled) > 8
+    pool = _cg_focused_cut_pool(merged, strict_scaled, len(round1))
+    assert pool
+    assert any(sum(closed) + sum(strict) > 1 for closed, strict, _ in pool)
+    for closed_mults, strict_mults, _ in pool:
+        assert len(closed_mults) == len(merged)
+        if sum(closed_mults) + sum(strict_mults) > 1:
+            assert sum(closed_mults[len(round1):]) == 0
+    degenerate = _cg_cut_pool(merged, strict_scaled)
+    assert degenerate
+    assert all(sum(closed) + sum(strict) == 1
+               for closed, strict, _ in degenerate)
+
+
+def test_iterated_gate_expansion_reaches_merged_sixteen():
+    import z3
+    from researchclaw.pipeline.formal_proof import (
+        _alternative_rows, _cg_iterated_cut_infeasibility_certificate,
+        validate_linear_statement,
+        verify_integer_iterated_cg_cut_infeasibility)
+
+    def unlimited():
+        return z3.SolverFor("QF_LIA")
+
+    def exact(value):
+        return z3.IntVal(value.numerator) if value.denominator == 1 \
+            else z3.RealVal(f"{value.numerator}/{value.denominator}")
+
+    # Two independent free-z diamonds: eight closed premises, so the merged
+    # space is sixteen rows and the iteration gate must admit it (the mint
+    # runs under an unlimited-budget factory here because the focused-pool
+    # witness LP is machine-dependently slow; the production-budget E2E
+    # path stays uncovered by design, matching the round-64 wb176 decision).
+    premises = [
+        {"coefficients": {"x": 1, "y": 1}, "relation": "<=", "constant": "3/2"},
+        {"coefficients": {"x": -1, "y": -1}, "relation": "<=", "constant": "-1/2"},
+        {"coefficients": {"x": 1, "y": -1}, "relation": "<=", "constant": "5/2"},
+        {"coefficients": {"x": -1, "y": 1}, "relation": "<=", "constant": "-3/2"},
+        {"coefficients": {"u": 1, "v": 1}, "relation": "<=", "constant": "1/2"},
+        {"coefficients": {"u": -1, "v": -1}, "relation": "<=", "constant": "-1/2"},
+        {"coefficients": {"u": 1, "v": -1}, "relation": "<=", "constant": "3/2"},
+        {"coefficients": {"u": -1, "v": 1}, "relation": "<=", "constant": "-1/2"},
+    ]
+    statement = {"kind": "linear_arithmetic", "domain": "integer",
+                 "variables": ["x", "y", "u", "v", "z"], "premises": premises,
+                 "conclusion": {"coefficients": {"x": 1},
+                                "relation": ">=", "constant": 0}}
+    normalized = validate_linear_statement(statement)
+    split = _alternative_rows(normalized)
+    certificate = _cg_iterated_cut_infeasibility_certificate(
+        statement, normalized, split, unlimited, exact, z3)
+    assert certificate is not None
+    assert certificate["kind"] == "integer_iterated_cg_cut_infeasibility"
+    assert len(certificate["round1_cuts"]) == 8
+    assert len(certificate["cuts"][0]["closed_multipliers"]) == 16
+    assert verify_integer_iterated_cg_cut_infeasibility(statement, certificate) is True
+
+    # One premise pair past the gate: ten premises round up to a merged
+    # space of twenty rows and the mint honestly refuses before any search.
+    wide = dict(statement)
+    wide["premises"] = premises + [
+        {"coefficients": {"z": 1}, "relation": "<=", "constant": "7"},
+        {"coefficients": {"z": -1}, "relation": "<=", "constant": "5"},
+    ]
+    wide_normalized = validate_linear_statement(wide)
+    wide_split = _alternative_rows(wide_normalized)
+    assert _cg_iterated_cut_infeasibility_certificate(
+        wide, wide_normalized, wide_split, unlimited, exact, z3) is None
 
 
 def test_disproved_implication_gets_a_portable_counterexample_witness(monkeypatch):
