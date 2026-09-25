@@ -5,9 +5,9 @@ server-reported model (never assumed equal to the requested display name),
 the endpoint, request parameters, token usage, fallback failures and
 duration. The runner writes one frozen ``llm_call_ledger.json`` per run.
 This is an auditable lower bound: calls made outside registered clients
-(raw API callers) are not counted, the registry evicts the oldest clients
-beyond a bound, and a run with zero recorded calls writes no artifact
-rather than implying zero cost.
+and raw callers that do not record themselves are still not counted, the
+registry evicts the oldest clients beyond a bound, and a run with zero
+recorded calls writes no artifact rather than implying zero cost.
 """
 from __future__ import annotations
 
@@ -23,6 +23,16 @@ from researchclaw.pipeline.evidence_store import content_hash
 # client lifetimes. The bound prevents unbounded process accumulation.
 _CLIENTS: deque = deque(maxlen=512)
 
+# Raw API callers (urllib endpoints outside LLMClient) append their own
+# records here, bounded like the client registry. A raw record is validated
+# eagerly so a malformed one fails at the caller instead of poisoning the
+# frozen ledger or surfacing only as an acceptance-time unreadable source.
+_RAW_RECORDS: deque = deque(maxlen=512)
+
+# Raw callers tag the endpoint family; records without the field are chat
+# calls (client records predate the split).
+_CALL_FAMILIES = ("chat", "embeddings")
+
 
 def register_client(client) -> None:
     records = getattr(client, "_call_records", None)
@@ -31,18 +41,43 @@ def register_client(client) -> None:
     _CLIENTS.append(records)
 
 
+def record_raw_chat_call(record: dict) -> None:
+    """Append one raw model-API call record to the run-level ledger.
+
+    Raw callers (PRM judge votes, session-end signals, embedding requests)
+    measure their own duration and endpoint-reported usage and record the
+    attempt here — succeeded or failed — so run-level cost accounting sees
+    them. Validation mirrors what :func:`validate_call_ledger` enforces so
+    a malformed record fails at the caller, never at freeze time.
+    """
+    if not isinstance(record, dict) or record.get("status") not in ("succeeded", "failed"):
+        raise ValueError("Raw LLM call record is malformed")
+    if not isinstance(record.get("fallback_failures"), list):
+        raise ValueError("Raw LLM call record is malformed")
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = record.get(field)
+        # bool is an int subclass; a boolean token count is malformed.
+        if value is not None and type(value) is not int:
+            raise ValueError("Raw LLM call record is malformed")
+    if record.get("call_family") not in _CALL_FAMILIES:
+        raise ValueError("Raw LLM call record is malformed")
+    _RAW_RECORDS.append(dict(record))
+
+
 def reset_call_ledger() -> None:
-    """Drop every registered client and its records (test isolation)."""
+    """Drop every registered client and raw record (test isolation)."""
     for records in _CLIENTS:
         records.clear()
     _CLIENTS.clear()
+    _RAW_RECORDS.clear()
 
 
 def collect_call_records() -> list[dict]:
-    """Snapshot every recorded chat call from registered clients."""
+    """Snapshot every recorded chat call from clients and raw callers."""
     records: list[dict] = []
     for client_records in _CLIENTS:
         records.extend(dict(record) for record in client_records)
+    records.extend(dict(record) for record in _RAW_RECORDS)
     return records
 
 
@@ -108,4 +143,5 @@ def write_call_ledger(root: Path) -> dict | None:
         json.dumps(ledger, indent=2), encoding="utf-8")
     for client_records in _CLIENTS:
         client_records.clear()
+    _RAW_RECORDS.clear()
     return ledger

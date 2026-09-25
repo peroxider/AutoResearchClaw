@@ -2143,7 +2143,9 @@ def _metaclaw_post_pipeline(
     # 3. Signal session end (fire-and-forget)
     try:
         from researchclaw.metaclaw_bridge.session import MetaClawSession
+        from researchclaw.llm.call_ledger import record_raw_chat_call
         import json as _json
+        import time as _time
         import urllib.request as _urllib_req
 
         session = MetaClawSession(run_id)
@@ -2159,9 +2161,24 @@ def _metaclaw_post_pipeline(
         headers = {"Content-Type": "application/json"}
         headers.update(end_headers)
         req = _urllib_req.Request(url, data=body, headers=headers)
+        _started = _time.monotonic()
         try:
             _urllib_req.urlopen(req, timeout=5)
-        except Exception:  # noqa: BLE001
-            pass  # Best-effort signal
+            _status, _error_type = "succeeded", None
+        except Exception as _exc:  # noqa: BLE001
+            _status, _error_type = "failed", type(_exc).__name__
+        # The signal is best-effort, but the attempt itself is cost: record
+        # it succeeded or failed so the chat ledger covers this raw caller.
+        record_raw_chat_call({
+            "status": _status, "requested_chain": ["session-end"],
+            "served_model": None, "endpoint": url,
+            "adapter": "raw_urllib", "call_family": "chat",
+            "purpose": "session_end_signal", "max_tokens": 1,
+            "temperature": None, "json_mode": False,
+            "prompt_tokens": None, "completion_tokens": None,
+            "total_tokens": None, "finish_reason": "", "truncated": False,
+            "fallback_failures": [], "error_type": _error_type,
+            "duration_seconds": round(_time.monotonic() - _started, 6),
+        })
     except Exception:  # noqa: BLE001
         pass

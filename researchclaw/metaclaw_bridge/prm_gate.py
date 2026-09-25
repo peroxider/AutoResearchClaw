@@ -58,6 +58,64 @@ Respond with ONLY "Score: 1", "Score: -1", or "Score: 0" on the first line,
 followed by a brief justification."""
 
 
+def _record_judge_attempt(
+    url: str,
+    model: str,
+    temperature: float,
+    started: float,
+    data: dict | None,
+    exc: Exception | None,
+) -> None:
+    """Append one raw judge call attempt to the run-level chat call ledger.
+
+    Every vote — succeeded or failed — is recorded with the serving
+    identity, endpoint-reported usage (absent stays None, never 0) and the
+    locally measured duration, so PRM gate cost is part of the auditable
+    lower bound instead of an invisible raw urllib caller.
+    """
+    from researchclaw.llm.call_ledger import record_raw_chat_call
+    import time as _time
+
+    duration = round(_time.monotonic() - started, 6)
+    if exc is not None:
+        record_raw_chat_call({
+            "status": "failed", "requested_chain": [model],
+            "served_model": None, "endpoint": url, "adapter": "raw_urllib",
+            "call_family": "chat", "purpose": "prm_judge",
+            "max_tokens": 512, "temperature": temperature, "json_mode": False,
+            "prompt_tokens": None, "completion_tokens": None,
+            "total_tokens": None, "finish_reason": "", "truncated": False,
+            "fallback_failures": [], "error_type": type(exc).__name__,
+            "duration_seconds": duration,
+        })
+        return
+    assert data is not None
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        usage = {}
+    tokens = {
+        field: usage.get(field)
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+    for field, value in tokens.items():
+        if value is not None and type(value) is not int:
+            tokens[field] = None
+    served = data.get("model")
+    record_raw_chat_call({
+        "status": "succeeded", "requested_chain": [model],
+        "served_model": served if isinstance(served, str) and served else None,
+        "endpoint": url, "adapter": "raw_urllib",
+        "call_family": "chat", "purpose": "prm_judge",
+        "max_tokens": 512, "temperature": temperature, "json_mode": False,
+        "prompt_tokens": tokens["prompt_tokens"],
+        "completion_tokens": tokens["completion_tokens"],
+        "total_tokens": tokens["total_tokens"],
+        "finish_reason": "", "truncated": False,
+        "fallback_failures": [], "error_type": None,
+        "duration_seconds": duration,
+    })
+
+
 def _single_judge_call(
     api_base: str,
     api_key: str,
@@ -67,6 +125,8 @@ def _single_judge_call(
     temperature: float,
 ) -> float | None:
     """Make a single PRM judge call and parse the score."""
+    import time as _time
+
     messages = [
         {"role": "system", "content": _JUDGE_SYSTEM},
         {
@@ -94,9 +154,16 @@ def _single_judge_call(
         },
     )
 
+    started = _time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
+    except Exception as exc:
+        _record_judge_attempt(url, model, temperature, started, None, exc)
+        logger.debug("PRM judge call failed", exc_info=True)
+        return None
+    _record_judge_attempt(url, model, temperature, started, data, None)
+    try:
         content = data["choices"][0]["message"]["content"]
         # Parse "Score: X"
         match = re.search(r"Score:\s*([+-]?[01])", content)
@@ -104,7 +171,7 @@ def _single_judge_call(
             return float(match.group(1))
         return None
     except Exception:
-        logger.debug("PRM judge call failed", exc_info=True)
+        logger.debug("PRM judge score parsing failed", exc_info=True)
         return None
 
 

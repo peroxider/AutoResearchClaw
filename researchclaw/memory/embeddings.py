@@ -130,7 +130,10 @@ class EmbeddingProvider:
 
     def _embed_api(self, text: str) -> list[float]:
         """Get embedding from OpenAI-compatible API."""
+        import time
         import urllib.request
+
+        from researchclaw.llm.call_ledger import record_raw_chat_call
 
         url = f"{self._api_base_url.rstrip('/')}/embeddings"
         payload = json.dumps({
@@ -146,13 +149,48 @@ class EmbeddingProvider:
                 "Authorization": f"Bearer {self._api_key}",
             },
         )
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
-                return data["data"][0]["embedding"]
+            embedding = data["data"][0]["embedding"]
         except Exception as exc:
+            record_raw_chat_call({
+                "status": "failed", "requested_chain": [self._model],
+                "served_model": None, "endpoint": url,
+                "adapter": "raw_urllib", "call_family": "embeddings",
+                "purpose": "embedding", "max_tokens": None,
+                "temperature": None, "json_mode": False,
+                "prompt_tokens": None, "completion_tokens": None,
+                "total_tokens": None, "finish_reason": "",
+                "truncated": False, "fallback_failures": [],
+                "error_type": type(exc).__name__,
+                "duration_seconds": round(time.monotonic() - started, 6),
+            })
             logger.warning("API embedding failed, falling back to TF-IDF: %s", exc)
             return self._embed_tfidf(text)
+        usage = data.get("usage") if isinstance(data, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        tokens = {field: usage.get(field)
+                  for field in ("prompt_tokens", "completion_tokens",
+                                "total_tokens")}
+        for field, value in tokens.items():
+            if value is not None and type(value) is not int:
+                tokens[field] = None
+        record_raw_chat_call({
+            "status": "succeeded", "requested_chain": [self._model],
+            "served_model": self._model, "endpoint": url,
+            "adapter": "raw_urllib", "call_family": "embeddings",
+            "purpose": "embedding", "max_tokens": None,
+            "temperature": None, "json_mode": False,
+            "prompt_tokens": tokens["prompt_tokens"],
+            "completion_tokens": tokens["completion_tokens"],
+            "total_tokens": tokens["total_tokens"],
+            "finish_reason": "", "truncated": False,
+            "fallback_failures": [], "error_type": None,
+            "duration_seconds": round(time.monotonic() - started, 6),
+        })
+        return embedding
 
     def _embed_local(self, text: str) -> list[float]:
         """Get embedding from local sentence-transformers model."""
