@@ -22,6 +22,16 @@ Known calibration: this host runs as root, so production ``--user <uid>:<gid>``
 puts a root shell in the container. The setuid-to-root probe is therefore
 conditional on the host uid; the binding control for a root user is the fully
 dropped capability set (``CapEff == 0``), which is asserted unconditionally.
+
+Round 59 added the seccomp and namespace audit probes: the formal flag set
+passes no seccomp option, so the probes verify that the daemon's default
+profile is active inside the formal container (and absent when only that opt
+is removed), that user-namespace creation is blocked there while the same
+capability-free call succeeds under ``seccomp=unconfined``, and that the
+user-facing namespaces are isolated from the host. User and cgroup
+namespaces equal the host — Docker's documented no-remap and cgroup-v1
+defaults are asserted as observed, and these probes verify kernel-observable
+facts on this daemon, not kernel-vulnerability-level escape certification.
 """
 import json
 import os
@@ -221,6 +231,102 @@ with open("/workspace/results.json", "w", encoding="utf-8") as handle:
                "spawn_error": spawn_error or "", "reaped": reaped}, handle)
 '''
 
+_SECURITY_PROBE = r'''
+import ctypes
+import json
+import os
+import subprocess
+import sys
+
+facts = {}
+
+# Kernel-enforced security state: CapBnd distinguishes a dropped bounding
+# set (cap-drop=ALL) from a merely empty effective set; Seccomp "2" means a
+# BPF filter is installed (Docker's default profile here, since the formal
+# flag set passes no seccomp option).
+cap_eff = cap_bnd = no_new_privs = seccomp = seccomp_filters = None
+with open("/proc/self/status", encoding="ascii") as handle:
+    for line in handle:
+        for key in ("CapEff", "CapBnd", "NoNewPrivs", "Seccomp", "Seccomp_filters"):
+            if line.startswith(key + ":"):
+                value = line.split()[1]
+                if key == "CapEff":
+                    cap_eff = value
+                elif key == "CapBnd":
+                    cap_bnd = value
+                elif key == "NoNewPrivs":
+                    no_new_privs = value
+                elif key == "Seccomp":
+                    seccomp = value
+                else:
+                    seccomp_filters = value
+facts.update(cap_eff=cap_eff, cap_bnd=cap_bnd, no_new_privs=no_new_privs,
+             seccomp=seccomp, seccomp_filters=seccomp_filters)
+facts["uid"] = os.getuid()
+facts["gid"] = os.getgid()
+try:
+    with open("/proc/self/uid_map", encoding="ascii") as handle:
+        facts["uid_map"] = handle.read().strip().replace("\n", " | ")
+except OSError as exc:
+    facts["uid_map"] = "unavailable errno=%s" % exc.errno
+
+# LSM profile: absent (errno 22) on hosts without a stacked AppArmor/SELinux.
+try:
+    with open("/proc/self/attr/current", encoding="ascii") as handle:
+        facts["lsm_current"] = handle.read().strip()
+except OSError as exc:
+    facts["lsm_current"] = "unavailable errno=%s" % exc.errno
+
+# Namespace identity via /proc/self/ns link targets (inode numbers).
+for ns in ("mnt", "pid", "net", "uts", "ipc", "user", "cgroup"):
+    try:
+        facts["ns_" + ns] = os.readlink("/proc/self/ns/" + ns)
+    except OSError as exc:
+        facts["ns_" + ns] = "unavailable errno=%s" % exc.errno
+
+# Behavioral unshare probes. os.unshare is absent from this image's python
+# build, so the child calls libc unshare(2) through ctypes. Each probe runs
+# in a CHILD process so a failure (or a successful namespace switch) cannot
+# disturb the rest of the collection. CLONE_NEWUSER needs no capability at
+# all, so a block there cannot be explained by the dropped capability set.
+# CLONE_NEWNS needs CAP_SYS_ADMIN, so its block in a cap-dropped container
+# is capability-explained and recorded for completeness only.
+CLONE_NEWNS = 0x00020000
+CLONE_NEWUSER = 0x10000000
+
+_CHILD_TEMPLATE = (
+    "import ctypes, os\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    "libc.unshare.restype = ctypes.c_int\n"
+    "libc.unshare.argtypes = [ctypes.c_int]\n"
+    "ctypes.set_errno(0)\n"
+    "if libc.unshare(%d) == 0:\n"
+    "    print('ok ns=' + os.readlink('/proc/self/ns/%s'))\n"
+    "else:\n"
+    "    print('blocked errno=%%d' %% ctypes.get_errno())\n"
+)
+
+
+def unshare_probe(flag, ns_name):
+    child = subprocess.run(
+        [sys.executable, "-c", _CHILD_TEMPLATE % (flag, ns_name)],
+        capture_output=True, text=True, timeout=30)
+    outcome = child.stdout.strip()
+    if not outcome:
+        outcome = "child-failed rc=%s %s" % (child.returncode, child.stderr.strip()[-120:])
+    return outcome
+
+
+facts["unshare_userns"] = unshare_probe(CLONE_NEWUSER, "user")
+facts["unshare_mountns"] = unshare_probe(CLONE_NEWNS, "mnt")
+
+out_path = os.environ.get("RC_PROBE_OUT", "/workspace/results.json")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(facts, handle, indent=1, sort_keys=True)
+print("wrote " + out_path)
+'''
+
 _BRIDGE_SERVER_PROBE = (
     "import socket\n"
     "server = socket.socket()\n"
@@ -312,6 +418,27 @@ def _docker(*args, check=True, timeout=120):
     if check and completed.returncode != 0:
         pytest.fail(f"docker {' '.join(args)} failed: {completed.stderr.strip()}")
     return completed.stdout
+
+
+def _unconfined_contrast(tmp_path):
+    """Run _SECURITY_PROBE in a container identical to formal except that
+    only ``--security-opt seccomp=unconfined`` replaces the default profile.
+
+    Raw docker, base image, no entrypoint. The image's default user is
+    non-root, so the contrast has an even smaller effective capability set
+    than the formal container (empty, with the default bounding set intact) —
+    which matters for the user-namespace discriminator below. The probe
+    output is written back through the bind mount; the directory is opened
+    up so the non-root container user can write into it.
+    """
+    hostdir = tmp_path / "contrast"
+    hostdir.mkdir()
+    os.chmod(hostdir, 0o777)
+    (hostdir / "secprobe.py").write_text(_SECURITY_PROBE, encoding="utf-8", newline="\n")
+    _docker("run", "--rm", "--security-opt", "seccomp=unconfined",
+            "-e", "RC_PROBE_OUT=/probe/results.json",
+            "-v", f"{hostdir}:/probe", BASE_IMAGE, "python3", "/probe/secprobe.py")
+    return json.loads((hostdir / "results.json").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +554,85 @@ def test_host_hf_home_cache_is_not_mounted_in_formal_mode(monkeypatch, formal_sa
     assert facts["env_hf_hub_cache"] == ""
     assert facts["hf_canary_read"] == ""
     assert all("huggingface" not in line.lower() for line in facts["mount_lines"])
+
+
+# ---------------------------------------------------------------------------
+# Round 59: seccomp and namespace audit probes on the real daemon
+# ---------------------------------------------------------------------------
+
+def test_formal_runs_under_the_docker_default_seccomp_filter(formal_sandbox, tmp_path):
+    # The production flag set passes no seccomp option, so whatever filter
+    # shows up inside the formal container is the daemon's default profile.
+    # The WSL2 host itself runs with Seccomp "0" (measured in the round-59
+    # observation), so the filter cannot be inherited from the host.
+    result, facts = _run_probe(formal_sandbox, tmp_path, _SECURITY_PROBE)
+    assert result.returncode == 0, result.stderr
+    assert facts["seccomp"] == "2"
+    assert int(facts["seccomp_filters"]) >= 1
+    assert facts["no_new_privs"] == "1"
+    assert facts["cap_eff"] == "0000000000000000"
+    # cap-drop=ALL zeroes even the bounding set, not just the effective set.
+    assert facts["cap_bnd"] == "0000000000000000"
+    assert facts["unshare_mountns"] == "blocked errno=1"
+    # LSM record-only: this WSL2 host stacks no AppArmor/SELinux profile, so
+    # the field reads "unavailable"; a hardened host would show its profile.
+    assert "lsm_current" in facts
+    # Control: removing ONLY the seccomp opt drops the filter, proving the
+    # formal flag set produces it and that the daemon does not filter
+    # everything regardless.
+    contrast = _unconfined_contrast(tmp_path)
+    assert contrast["seccomp"] == "0"
+    assert contrast["seccomp_filters"] == "0"
+    # In the contrast the mount-namespace call stays blocked: it needs
+    # CAP_SYS_ADMIN, which no default container process carries, so the
+    # mountns block is capability-explained everywhere and NOT attributable
+    # to the seccomp profile (the user-namespace probe is the discriminator).
+    assert contrast["unshare_mountns"] == "blocked errno=1"
+
+
+def test_formal_blocks_user_namespace_creation_but_the_kernel_allows_it(formal_sandbox, tmp_path):
+    # The docker-default seccomp profile blocks clone/unshare with namespace
+    # flags. Attribution argument: the contrast runs as the image's non-root
+    # user with an EMPTY effective capability set, and CLONE_NEWUSER needs no
+    # capability at all — so its success proves the kernel allows the
+    # capability-free unprivileged path on this host, and the formal
+    # container's EPERM on the same call cannot be explained by the dropped
+    # capability set. Only the seccomp profile remains as the cause.
+    result, facts = _run_probe(formal_sandbox, tmp_path, _SECURITY_PROBE)
+    assert result.returncode == 0, result.stderr
+    contrast = _unconfined_contrast(tmp_path)
+    if not contrast["unshare_userns"].startswith("ok ns=user:["):
+        # Kernel or sysctl disallows unprivileged user namespaces: the
+        # discriminator is unavailable on this host, record the evidence.
+        pytest.skip(f"kernel disallows unprivileged user namespaces: {contrast['unshare_userns']}")
+    assert facts["unshare_userns"].startswith("blocked errno=1")
+
+
+def test_formal_namespaces_are_isolated_from_the_host(formal_sandbox, tmp_path):
+    # The formal container must not share the host's mount, PID, network,
+    # UTS or IPC namespaces. User and cgroup namespaces are asserted equal
+    # to the host as Docker's documented defaults (no userns-remap; cgroup
+    # v1 daemons default to the host cgroup namespace) — recorded honestly
+    # rather than claimed as hardening.
+    try:
+        host_ns = {ns: os.readlink(f"/proc/self/ns/{ns}")
+                   for ns in ("mnt", "pid", "net", "uts", "ipc", "user", "cgroup")}
+    except OSError as exc:
+        pytest.skip(f"namespace comparison needs a Linux test process: {exc}")
+    result, facts = _run_probe(formal_sandbox, tmp_path, _SECURITY_PROBE)
+    assert result.returncode == 0, result.stderr
+    for ns in ("mnt", "pid", "net", "uts", "ipc"):
+        assert facts["ns_" + ns] != host_ns[ns]
+    assert facts["ns_user"] == host_ns["user"]
+    # A full identity map ("0 0 4294967295") confirms no user namespace was
+    # created for the container (userns-remap off is the daemon default).
+    assert facts["uid_map"].split() == ["0", "0", "4294967295"]
+    cgroup_version = _docker("info", "-f", "{{.CgroupVersion}}").strip()
+    if cgroup_version == "1":
+        assert facts["ns_cgroup"] == host_ns["cgroup"]
+    else:
+        # cgroup v2 daemons default to a private container cgroup namespace.
+        assert facts["ns_cgroup"] != host_ns["cgroup"]
 
 
 def test_control_daemon_networking_works_on_a_user_defined_bridge(tmp_path):
