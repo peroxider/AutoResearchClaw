@@ -62,6 +62,20 @@
 
 最终交付包携带账本、预算、代码清单和完整尝试目录。最终验收重新检查源码、预测、执行回执和 stdout/stderr 哈希，重算时长与成功单元；篡改预算报告或删除失败回执不能依靠手写 `complete` 通过。
 
+## 双运行独立复现比较
+
+两个正式矩阵分别完成后，可生成一个严格的双运行比较报告：
+
+```powershell
+& .venv/Scripts/python.exe -m researchclaw.experiment.reproduction_comparison <left-run> <right-run> --left-site site-a --right-site site-b --output reproduction_comparison.json
+```
+
+比较器先对两侧分别执行完整的可移植执行束复验，重新独立计算全部指标，并要求冻结 EvidenceStore 除“复验器所在 Python 版本”之外的科学身份、数值、单位、执行回执、评估器代码哈希和原始产物哈希与重算结果一致；覆盖报告也必须与重新推导结果逐字段相同。输入身份不直接比较包含绝对源路径的本地 `research_contract.version`，而是比较 brief、runtime、数据描述、冻结输出哈希及按“源文件名+内容哈希”归一化的可移植身份。协议版本和实验源码哈希必须相同。
+
+在没有预声明复现容差的 protocol v2 中，每个完整 EvidenceKey 的数值与单位必须精确相等。两侧记录集合缺项、源码/输入身份不同或任一数值不同都会得到 `mismatched`。报告还要求两条账本哈希不同，且两侧所有执行回执哈希不相交，因而直接复制一个完成目录不能获得 `matched`。依赖清单相同或不同都如实记录为 `environment_relation`；相同容器镜像在不同机器上运行仍可能显示 `same`。
+
+`--left-site`/`--right-site` 只是有界的操作者自声明标签，不是物理主机认证。不同收据可排除逐字复制，但拥有全部目录写权限的人仍能重造哈希链；报告因此明确不声称数字签名、远程证明或真实跨主机身份认证。它证明两个完整、可复验且记录不同的执行束对同一冻结研究身份得到精确一致指标，不证明科研结论正确或可泛化。
+
 ## 预算与隔离边界
 
 测量范围明确为 `formal_matrix_host_wall_time`：包括正式单元调用和结果采集，保留失败消耗；不含此前 CodeAgent 试跑、模型调用、宿主机包安装与所有 API 费用。第三十四轮开始，宿主机强制归档每个成功单元的 validation-only 调参披露，将实际 trial 数及逐单元计数写入 `protocol_budget.json`，并由运行级资源账本以 `validation_tuning_trials` 汇总；文件、哈希、收据计数或最终选型任一不一致都会失败关闭。
@@ -72,7 +86,7 @@ MethodSpec 声明 `validation` 时，另有[正式测试前的方法执行检查
 
 墙钟超时不等于 GPU 秒数、CPU 核时或费用计量。宿主机 subprocess 不提供测试标签的操作系统级权限隔离，也不宣称其超时能约束恶意创建的所有后代进程。第三十九轮收紧正式 Docker 路径：容器强制 `--network none`、只读根文件系统、丢弃全部 Linux capabilities、`no-new-privileges`、PID 上限和受限 `/tmp`；只挂载本单元 staging workspace，不挂载宿主 dataset/Hugging Face 缓存，也不转发 HF token。冻结 `isolation` 声明同时进入 `protocol_code.json`、start 事件和执行回执，可移植验证逐项核对。
 
-这仍不是对任意 Docker/内核漏洞或 GPU 驱动侧信道的证明；workspace 必须可写以保存预测和遥测，容器镜像内部仍包含其自身文件。当前测试以命令构造和故障注入验证门禁，本轮没有在真实 Docker daemon 中执行恶意逃逸测试。宿主机模式继续明确记录 `host_contract_only/v1` 与 `os_filesystem_isolation: unavailable`。
+这仍不是对任意 Docker/内核漏洞或 GPU 驱动侧信道的证明；workspace 必须可写以保存预测和遥测，容器镜像内部仍包含其自身文件。当前测试以命令构造和故障注入验证门禁，本轮没有在真实 Docker daemon 中执行恶意逃逸测试。宿主机模式明确记录 `host_guarded/v1` 与 `os_filesystem_isolation: unavailable`。
 
 ## 验证
 
@@ -81,3 +95,5 @@ MethodSpec 声明 `validation` 时，另有[正式测试前的方法执行检查
 定向测试还包括：成功恢复不重跑、失败保留和重试计费、超时耗尽、中断预留、并发锁、源码/预测/调参披露/回执/日志/账本/预算篡改、错误选型、重复 trial ID、非有限 validation 指标、合法前缀截断、旧指标作废、Docker 降级拒绝、正式隔离参数/挂载/token 检查及 Stage 12/13/15 集成。Docker 用 mock 验证后端约束，未启动真实容器；未调用付费模型。
 
 较大范围回归包含 executor、runner、Docker、repair、输入协议和验收，结果为 463 passed（部分最后补充检查另有定向回归）。后续继续方法/证明契约、依赖与资源计量、文献证据、写作与图像验收及端到端基准，不能将本轮完成等同于整份差距分析完成。
+
+第七十五轮双运行比较定向回归 8 项通过；协议执行、实验协议、独立评估、依赖清单与最终验收扩大回归 115 项通过。测试实际建立不同目录、分别执行两套 8 单元正式矩阵并重算指标；覆盖有效匹配、复制目录拒绝、源码身份变化、报告篡改和站点标签边界。两套执行仍位于同一物理 Windows 主机，没有把自声明标签写成真实跨主机认证。
