@@ -417,6 +417,30 @@ def test_declared_float_reference_distance_uses_compiled_page_anchors(tmp_path):
     assert passed["float_reference_distances"][0]["min_page_distance"] == 1
 
 
+def test_float_distance_and_reference_count_policies_compose(tmp_path: Path) -> None:
+    root = tmp_path / "delivery"
+    root.mkdir()
+    freeze_template(root, bundle(
+        tmp_path, max_float_reference_page_distance=1, max_references=2))
+    import fitz
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    (root / "references.bib").write_text(
+        "@article{a,title={A}}\n@article{b,title={B}}\n", encoding="utf-8")
+    (root / "paper.tex").write_text(
+        r"See Figure~\ref{fig:x}\label{arc-ref:fig:x}."
+        "\n" r"\begin{figure}\caption{X}\label{fig:x}\end{figure}", encoding="utf-8")
+    (root / "paper.aux").write_text(
+        r"\newlabel{arc-ref:fig:x}{{}{1}}" "\n" r"\newlabel{fig:x}{{1}{2}}",
+        encoding="utf-8")
+    result = inspect_constraints(root)
+    assert result["status"] == "passed"
+    assert result["references"] == 2
+    assert result["float_reference_distances"][0]["min_page_distance"] == 1
+
+
 def test_export_refresh_detects_external_template_change(study):
     from dataclasses import replace
     from researchclaw.adapters import AdapterBundle

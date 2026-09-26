@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -30,13 +32,23 @@ DEFAULT_POLL_INTERVAL_SEC = 2.0
 DEFAULT_TIMEOUT_SEC = 86400  # 24 hours
 
 
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    """Publish JSON only after its complete bytes are written in this directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_waiting(hitl_dir: Path, waiting: WaitingState) -> Path:
     """Write waiting state for external tools to discover."""
     hitl_dir.mkdir(parents=True, exist_ok=True)
     path = hitl_dir / "waiting.json"
-    path.write_text(
-        json.dumps(waiting.to_dict(), indent=2), encoding="utf-8"
-    )
+    _write_json_atomic(path, waiting.to_dict())
     return path
 
 
@@ -44,9 +56,7 @@ def write_response(hitl_dir: Path, human_input: HumanInput) -> Path:
     """Write a response file (used by ``attach``, ``approve``, etc)."""
     hitl_dir.mkdir(parents=True, exist_ok=True)
     path = hitl_dir / "response.json"
-    path.write_text(
-        json.dumps(human_input.to_dict(), indent=2), encoding="utf-8"
-    )
+    _write_json_atomic(path, human_input.to_dict())
     return path
 
 

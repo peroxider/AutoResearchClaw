@@ -86,6 +86,40 @@ class TestFileWait:
         t.join()
         assert result.action == HumanAction.REJECT
 
+    def test_poll_never_observes_a_partially_written_response(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        hitl_dir = tmp_path / "hitl"
+        hitl_dir.mkdir(parents=True)
+        started = threading.Event()
+        release = threading.Event()
+        original_write_text = Path.write_text
+
+        def slow_temporary_write(path, data, *args, **kwargs):
+            if path.name.startswith(".response.json."):
+                original_write_text(path, "", *args, **kwargs)
+                started.set()
+                assert release.wait(timeout=2)
+            return original_write_text(path, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", slow_temporary_write)
+        writer = threading.Thread(target=lambda: write_response(
+            hitl_dir, HumanInput(action=HumanAction.REJECT, message="complete")))
+        writer.start()
+        assert started.wait(timeout=2)
+        observed = []
+        poller = threading.Thread(target=lambda: observed.append(poll_for_response(
+            hitl_dir, poll_interval_sec=0.01, timeout_sec=2)))
+        poller.start()
+        time.sleep(0.05)
+        assert poller.is_alive()
+        assert not (hitl_dir / "response.json").exists()
+        release.set()
+        writer.join(timeout=2)
+        poller.join(timeout=2)
+        assert not writer.is_alive()
+        assert not poller.is_alive()
+        assert observed[0].action == HumanAction.REJECT
+
     def test_poll_timeout_auto_proceed(self, tmp_path: Path) -> None:
         hitl_dir = tmp_path / "hitl"
         hitl_dir.mkdir(parents=True)

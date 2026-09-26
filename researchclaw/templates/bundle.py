@@ -465,19 +465,19 @@ def inspect_constraints(root: Path) -> dict:
                     raise ValueError("float environment analysis incomplete")
                 if len(set(float_labels)) != len(float_labels):
                     raise ValueError("duplicate float labels")
-                references: dict[str, list[str]] = {}
+                float_references: dict[str, list[str]] = {}
                 for target, marker_target in re.findall(
                         r"\\ref\{([^{}]+)\}\\label\{arc-ref:([^{}]+)\}", source):
                     if target != marker_target:
                         raise ValueError("reference marker target mismatch")
-                    references.setdefault(target, []).append("arc-ref:" + marker_target)
+                    float_references.setdefault(target, []).append("arc-ref:" + marker_target)
                 float_reference_distances = []
                 for label in float_labels:
-                    if label not in pages_by_label or not references.get(label):
+                    if label not in pages_by_label or not float_references.get(label):
                         raise ValueError("float page or reference marker unavailable")
-                    reference_pages = [pages_by_label[marker] for marker in references[label]
+                    reference_pages = [pages_by_label[marker] for marker in float_references[label]
                                        if marker in pages_by_label]
-                    if len(reference_pages) != len(references[label]):
+                    if len(reference_pages) != len(float_references[label]):
                         raise ValueError("reference marker page unavailable")
                     float_page = pages_by_label[label]
                     if pages is not None and (not 1 <= float_page <= pages
