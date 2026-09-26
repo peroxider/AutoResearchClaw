@@ -52,9 +52,18 @@ def review_image_semantics(*, reviewer: Any, image_bytes: bytes, diagram_request
         raise SemanticImageReviewError("Independent vision reviewer is unavailable")
     if not isinstance(diagram_request, str) or not diagram_request.strip():
         raise SemanticImageReviewError("Diagram request is unavailable")
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime_type = "image/png"
+    elif image_bytes.startswith(b"\xff\xd8\xff"):
+        mime_type = "image/jpeg"
+    elif image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        mime_type = "image/webp"
+    else:
+        raise SemanticImageReviewError("Reviewed image has an unsupported signature")
     response = reviewer.chat_image(
         "Declared diagram request:\n" + diagram_request,
         image_bytes,
+        mime_type=mime_type,
         max_tokens=2048,
         temperature=0,
         json_mode=True,
@@ -109,9 +118,10 @@ def review_image_semantics(*, reviewer: Any, image_bytes: bytes, diagram_request
     return {**record, "version": _version(record)}
 
 
-def verify_semantic_image_review(record: dict[str, Any], *, image_bytes: bytes,
-                                 diagram_request: str, generator_model: str | None) -> dict[str, Any]:
-    """Verify frozen review identity and its binding to the accepted image."""
+def verify_semantic_image_review_record(record: dict[str, Any], *, image_bytes: bytes,
+                                        diagram_request: str,
+                                        generator_model: str | None) -> dict[str, Any]:
+    """Verify any frozen verdict and its binding to the reviewed inputs."""
     if not isinstance(record, dict) or set(record) != {
             "schema_version", "checker", "image_sha256", "request_sha256", "generator_model",
             "reviewer_model", "status", "semantic_score", "aesthetic_score", "issues",
@@ -135,13 +145,28 @@ def verify_semantic_image_review(record: dict[str, Any], *, image_bytes: bytes,
             or record["image_sha256"] != hashlib.sha256(image_bytes).hexdigest()
             or record["request_sha256"] != hashlib.sha256(diagram_request.encode("utf-8")).hexdigest()
             or record["generator_model"] != generator_model
-            or record["status"] != "passed"
+            or record["status"] not in {"passed", "failed"}
             or not isinstance(record["reviewer_model"], str) or not record["reviewer_model"]
             or (generator_model and record["reviewer_model"].casefold() == generator_model.casefold())
-            or type(record["semantic_score"]) is not int or not 7 <= record["semantic_score"] <= 10
-            or type(record["aesthetic_score"]) is not int or not 7 <= record["aesthetic_score"] <= 10
+            or type(record["semantic_score"]) is not int or not 1 <= record["semantic_score"] <= 10
+            or type(record["aesthetic_score"]) is not int or not 1 <= record["aesthetic_score"] <= 10
             or not valid_issues
-            or any(issue["severity"] == "critical" for issue in issues)
             or not isinstance(record["repair_prompt"], str)):
+        raise SemanticImageReviewError("Frozen image review is invalid")
+    objectively_passed = (record["semantic_score"] >= 7 and record["aesthetic_score"] >= 7
+                          and not any(issue["severity"] == "critical" for issue in issues))
+    if ((record["status"] == "passed") != objectively_passed
+            or (not objectively_passed and not record["repair_prompt"].strip())):
+        raise SemanticImageReviewError("Frozen image review verdict is contradictory")
+    return record
+
+
+def verify_semantic_image_review(record: dict[str, Any], *, image_bytes: bytes,
+                                 diagram_request: str, generator_model: str | None) -> dict[str, Any]:
+    """Verify that a frozen, input-bound review supports publication."""
+    verify_semantic_image_review_record(
+        record, image_bytes=image_bytes, diagram_request=diagram_request,
+        generator_model=generator_model)
+    if record["status"] != "passed":
         raise SemanticImageReviewError("Frozen image review does not support publication")
     return record

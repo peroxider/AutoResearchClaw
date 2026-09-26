@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import io
 from types import SimpleNamespace
 
 import pytest
 
 from researchclaw.agents.figure_agent.semantic_image_review import (
     SemanticImageReviewError, review_image_semantics, verify_semantic_image_review,
+    verify_semantic_image_review_record,
 )
+from tests.test_framework_diagram import _PNG_BYTES
 
 
 class Reviewer:
@@ -29,15 +32,29 @@ def verdict(**changes):
 
 def test_independent_reviewer_receives_actual_bytes_and_freezes_identity():
     reviewer = Reviewer(verdict())
-    result = review_image_semantics(reviewer=reviewer, image_bytes=b"actual-png",
+    result = review_image_semantics(reviewer=reviewer, image_bytes=_PNG_BYTES,
                                     diagram_request="A -> B", generator_model="image-generator")
     assert result["status"] == "passed" and result["reviewer_model"] == "independent-vision"
     assert result["generator_model"] == "image-generator"
-    assert reviewer.calls[0][1] == b"actual-png"
+    assert reviewer.calls[0][1] == _PNG_BYTES
+    assert reviewer.calls[0][2]["mime_type"] == "image/png"
     assert reviewer.calls[0][2]["temperature"] == 0 and reviewer.calls[0][2]["json_mode"] is True
-    assert verify_semantic_image_review(result, image_bytes=b"actual-png",
+    assert verify_semantic_image_review(result, image_bytes=_PNG_BYTES,
                                         diagram_request="A -> B",
                                         generator_model="image-generator") == result
+
+
+@pytest.mark.parametrize(("image_format", "mime_type"), [
+    ("JPEG", "image/jpeg"), ("WEBP", "image/webp"),
+])
+def test_independent_reviewer_uses_the_image_wire_mime(image_format, mime_type):
+    from PIL import Image
+    output = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(output, format=image_format)
+    reviewer = Reviewer(verdict())
+    review_image_semantics(reviewer=reviewer, image_bytes=output.getvalue(),
+                           diagram_request="A -> B", generator_model="generator")
+    assert reviewer.calls[0][2]["mime_type"] == mime_type
 
 
 def test_failed_review_requires_and_preserves_bounded_repair_instruction():
@@ -45,9 +62,16 @@ def test_failed_review_requires_and_preserves_bounded_repair_instruction():
     result = review_image_semantics(
         reviewer=Reviewer(verdict(status="failed", semantic_score=4, issues=[issue],
                                   repair_prompt="Add only the declared A to B edge.")),
-        image_bytes=b"png", diagram_request="A -> B", generator_model="generator")
+        image_bytes=_PNG_BYTES, diagram_request="A -> B", generator_model="generator")
     assert result["status"] == "failed"
     assert result["repair_prompt"] == "Add only the declared A to B edge."
+    assert verify_semantic_image_review_record(
+        result, image_bytes=_PNG_BYTES, diagram_request="A -> B",
+        generator_model="generator") == result
+    with pytest.raises(SemanticImageReviewError, match="does not support publication"):
+        verify_semantic_image_review(
+            result, image_bytes=_PNG_BYTES, diagram_request="A -> B",
+            generator_model="generator")
 
 
 @pytest.mark.parametrize("result", [
@@ -59,32 +83,32 @@ def test_failed_review_requires_and_preserves_bounded_repair_instruction():
 ])
 def test_contradictory_or_malformed_verdicts_fail_closed(result):
     with pytest.raises(SemanticImageReviewError):
-        review_image_semantics(reviewer=Reviewer(result), image_bytes=b"png",
+        review_image_semantics(reviewer=Reviewer(result), image_bytes=_PNG_BYTES,
                                diagram_request="A -> B", generator_model="generator")
 
 
 def test_generator_model_cannot_review_its_own_image():
     with pytest.raises(SemanticImageReviewError, match="own output"):
-        review_image_semantics(reviewer=Reviewer(verdict(), model="same-model"), image_bytes=b"png",
+        review_image_semantics(reviewer=Reviewer(verdict(), model="same-model"), image_bytes=_PNG_BYTES,
                                diagram_request="A -> B", generator_model="same-model")
 
 
 def test_missing_visual_capability_and_invalid_json_fail_closed():
     with pytest.raises(SemanticImageReviewError, match="unavailable"):
-        review_image_semantics(reviewer=object(), image_bytes=b"png",
+        review_image_semantics(reviewer=object(), image_bytes=_PNG_BYTES,
                                diagram_request="A -> B", generator_model="generator")
     reviewer = Reviewer(verdict())
     reviewer.chat_image = lambda *args, **kwargs: SimpleNamespace(content="not-json", model="vision")
     with pytest.raises(SemanticImageReviewError, match="invalid JSON"):
-        review_image_semantics(reviewer=reviewer, image_bytes=b"png",
+        review_image_semantics(reviewer=reviewer, image_bytes=_PNG_BYTES,
                                diagram_request="A -> B", generator_model="generator")
 
 
 def test_frozen_review_rejects_tampering_and_changed_image():
-    result = review_image_semantics(reviewer=Reviewer(verdict()), image_bytes=b"png",
+    result = review_image_semantics(reviewer=Reviewer(verdict()), image_bytes=_PNG_BYTES,
                                     diagram_request="A -> B", generator_model="generator")
     with pytest.raises(SemanticImageReviewError):
-        verify_semantic_image_review({**result, "semantic_score": 10}, image_bytes=b"png",
+        verify_semantic_image_review({**result, "semantic_score": 10}, image_bytes=_PNG_BYTES,
                                      diagram_request="A -> B", generator_model="generator")
     with pytest.raises(SemanticImageReviewError):
         verify_semantic_image_review(result, image_bytes=b"changed",
@@ -102,12 +126,12 @@ def test_frozen_review_rejects_tampering_and_changed_image():
 def test_frozen_review_rejects_self_consistent_invalid_fields(mutation):
     from researchclaw.agents.figure_agent import semantic_image_review as module
 
-    result = review_image_semantics(reviewer=Reviewer(verdict()), image_bytes=b"png",
+    result = review_image_semantics(reviewer=Reviewer(verdict()), image_bytes=_PNG_BYTES,
                                     diagram_request="A -> B", generator_model="generator")
     forged = {**result, **mutation}
     payload = dict(forged)
     payload.pop("version")
     forged["version"] = module._version(payload)
     with pytest.raises(SemanticImageReviewError):
-        verify_semantic_image_review(forged, image_bytes=b"png",
+        verify_semantic_image_review(forged, image_bytes=_PNG_BYTES,
                                      diagram_request="A -> B", generator_model="generator")
