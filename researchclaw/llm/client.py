@@ -11,6 +11,7 @@ Features:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -242,7 +243,7 @@ class LLMClient:
 
     def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int | None = None,
@@ -340,6 +341,46 @@ class LLMClient:
             f"All models failed. Last error: {last_error}"
         ) from last_error
 
+    def chat_image(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        *,
+        mime_type: str = "image/png",
+        max_tokens: int | None = None,
+        temperature: float = 0,
+        json_mode: bool = True,
+        system: str | None = None,
+    ) -> LLMResponse:
+        """Send one bounded image to an OpenAI-compatible vision endpoint.
+
+        The call uses :meth:`chat`, so model identity, endpoint, token usage,
+        failures, and duration enter the normal call ledger. Anthropic's
+        separate adapter is rejected until it has an equivalent audited wire
+        implementation.
+        """
+        if self._anthropic is not None:
+            raise ValueError("Image review is unsupported by the Anthropic adapter")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Image review prompt must be nonempty text")
+        if not isinstance(image_bytes, bytes) or not image_bytes:
+            raise ValueError("Image review requires nonempty bytes")
+        if len(image_bytes) > 10_000_000:
+            raise ValueError("Image review input exceeds 10 MB")
+        if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise ValueError("Unsupported image review MIME type")
+        data_url = "data:" + mime_type + ";base64," + base64.b64encode(image_bytes).decode("ascii")
+        return self.chat(
+            [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_mode=json_mode,
+            system=system,
+        )
+
     def preflight(self) -> tuple[bool, str]:
         """Quick connectivity check - one minimal chat call.
 
@@ -386,7 +427,7 @@ class LLMClient:
     def _call_with_retry(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int,
         temperature: float,
         json_mode: bool,
@@ -496,7 +537,7 @@ class LLMClient:
     def _raw_call(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int,
         temperature: float,
         json_mode: bool,
@@ -660,16 +701,34 @@ class LLMClient:
         return body
 
     def _messages_to_responses_input(
-        self, messages: list[dict[str, str]]
+        self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for message in messages:
             role = str(message.get("role", "user") or "user")
-            content = str(message.get("content", "") or "")
+            content = message.get("content", "")
+            if isinstance(content, str):
+                content_items = [{"type": "input_text", "text": content}]
+            elif isinstance(content, list):
+                content_items = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        raise ValueError("Invalid multimodal message part")
+                    if part.get("type") == "text" and isinstance(part.get("text"), str):
+                        content_items.append({"type": "input_text", "text": part["text"]})
+                    elif part.get("type") == "image_url" and isinstance(part.get("image_url"), dict):
+                        url = part["image_url"].get("url")
+                        if not isinstance(url, str) or not url.startswith("data:image/"):
+                            raise ValueError("Responses image input must be a data URL")
+                        content_items.append({"type": "input_image", "image_url": url})
+                    else:
+                        raise ValueError("Unsupported multimodal message part")
+            else:
+                raise ValueError("Message content must be text or a part list")
             items.append(
                 {
                     "role": role,
-                    "content": [{"type": "input_text", "text": content}],
+                    "content": content_items,
                 }
             )
         return items

@@ -46,4 +46,6 @@ control_flow:
 
 已用实际 SVG/PNG/PDF 测试确定性、字符保留、真假分支、回环和跨页 continuation；已人工查看一个生成的流程图。第四十三轮的 `matplotlib_geometry/v1` 是机器几何检查，不是人类审美、图意理解或整稿视觉认证；全稿缩放后的字号、复杂交叉边可读性和全文视觉质量仍需生产稿逐页验收。
 
-第四十五轮已为既有 Stage 22 direct/hybrid 图像模型路径补齐 API 实际 prompt、逐提供方尝试、选定 provider/model、未修改原图/候选图和最终图的哈希证据链；direct 原图单独保存，fallback 明确没有原图。该路径尚未成为共源 DiagramSpec 的正式出版主路径；模型原始输出的独立语义/审美评审与局部修复仍待后续接入。
+第四十五轮已为既有 Stage 22 direct/hybrid 图像模型路径补齐 API 实际 prompt、逐提供方尝试、选定 provider/model、未修改原图/候选图和最终图的哈希证据链；direct 原图单独保存，fallback 明确没有原图。第五十一轮增加可重导的光栅出版门禁。第六十九轮又接入独立视觉模型评审：OpenAI-compatible Chat Completions 与 Responses 两种线格式都把最终图像字节作为有界 data URL 输入，评审模型必须与生成模型的服务端 ID 不同，并给出语义分、审美分、逐项问题和修复指令；分数与 verdict 矛盾、畸形响应或同模型自评一律失败关闭。direct 图失败时只允许一次带原图引用的定向修复，修复调用进入图像账本，修复后必须重新通过光栅与独立视觉评审；hybrid 最终合成图未通过时删除候选并以零模型影响重建确定性语义图。通过记录冻结为 `framework_diagram_semantic_review.json`，绑定最终图、实际请求、生成模型和评审模型；模型图缺该记录会被最终投稿验收阻断。
+
+当前多模态评审适配 OpenAI-compatible 协议，单图上限 10 MB，支持 PNG/JPEG/WebP；Anthropic 独立适配器尚无等价的已审计图像线格式，显式拒绝。没有配置独立 reviewer 时仍可保留研究期图像产物，但不能以模型图获得正式投稿状态。测试用可控视觉 reviewer 验证协议、反例、一次修复和 hybrid 降级；未调用真实视觉服务，因此这些测试不构成真实模型审美能力认证。该路径尚未成为共源 DiagramSpec 的正式出版主路径，独立模型评审也不替代人类整稿视觉复核。

@@ -882,6 +882,87 @@ def test_orchestrator_uses_first_successful_provider(tmp_path: Path) -> None:
     ]
 
 
+def test_direct_model_image_gets_one_bounded_independent_repair(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class Provider:
+        name = "openai_compatible"
+
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _GOOD_PNG_BYTES
+
+        def generate_with_reference(self, prompt, reference_image, *, aspect_ratio, size):
+            assert "missing declared edge" in prompt
+            assert reference_image == _GOOD_PNG_BYTES
+            return _reviewable_png()
+
+    class Reviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_image(self, prompt, image_bytes, **kwargs):
+            self.calls += 1
+            result = ({"status": "failed", "semantic_score": 4, "aesthetic_score": 8,
+                       "issues": [{"dimension": "semantic", "severity": "critical",
+                                   "message": "missing declared edge"}],
+                       "repair_prompt": "Add only the missing declared edge."}
+                      if self.calls == 1 else
+                      {"status": "passed", "semantic_score": 9, "aesthetic_score": 8,
+                       "issues": [], "repair_prompt": ""})
+            return SimpleNamespace(content=json.dumps(result), model="independent-vision")
+
+    monkeypatch.setattr(fd, "build_framework_diagram_providers", lambda **kwargs: [Provider()])
+    cfg = _config_with_framework_diagram(provider="openai_compatible", render_mode="direct")
+    artifacts, png = fd.generate_framework_diagram_artifacts(
+        paper_text="# Test", config=cfg, output_dir=tmp_path, llm=None,
+        visual_reviewer=Reviewer())
+    assert png is not None and png.read_bytes() == _reviewable_png()
+    assert "framework_diagram_semantic_review.json" in artifacts
+    review = json.loads((tmp_path / "framework_diagram_semantic_review.json").read_text("utf-8"))
+    assert review["status"] == "passed" and review["reviewer_model"] == "independent-vision"
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert [row["mode"] for row in manifest["generation_attempts"]] == ["prompt", "semantic_repair"]
+    assert fd.verify_framework_diagram_artifacts(tmp_path) == manifest
+
+
+def test_repaired_image_review_failure_does_not_invent_a_failed_image_call(
+        tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class Provider:
+        name = "openai_compatible"
+
+        def generate(self, *args, **kwargs):
+            return _GOOD_PNG_BYTES
+
+        def generate_with_reference(self, *args, **kwargs):
+            return _reviewable_png()
+
+    class Reviewer:
+        calls = 0
+
+        def chat_image(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(model="independent-vision", content=json.dumps({
+                    "status": "failed", "semantic_score": 3, "aesthetic_score": 8,
+                    "issues": [{"dimension": "semantic", "severity": "critical",
+                                "message": "wrong edge"}], "repair_prompt": "Fix the edge."}))
+            return SimpleNamespace(model="independent-vision", content="not-json")
+
+    monkeypatch.setattr(fd, "build_framework_diagram_providers", lambda **kwargs: [Provider()])
+    cfg = _config_with_framework_diagram(provider="openai_compatible", render_mode="direct")
+    fd.generate_framework_diagram_artifacts(
+        paper_text="# Test", config=cfg, output_dir=tmp_path,
+        llm=None, visual_reviewer=Reviewer())
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert manifest["provider"] == "matplotlib"
+    assert [(row["mode"], row["status"]) for row in manifest["generation_attempts"]] == [
+        ("prompt", "succeeded"), ("semantic_repair", "succeeded")]
+
+
 def test_orchestrator_hybrid_locks_semantics_and_records_candidate(
     tmp_path: Path,
 ) -> None:
@@ -944,6 +1025,38 @@ def test_orchestrator_hybrid_locks_semantics_and_records_candidate(
         (tmp_path / "framework_diagram_visual_candidate.png").read_bytes()).hexdigest()
     assert manifest["generation_attempts"] == [
         {"provider": "grsai_gpt_images", "mode": "reference", "status": "succeeded"}]
+
+
+def test_hybrid_reviewer_failure_removes_all_model_influence(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from researchclaw.agents.figure_agent import framework_diagram as fd
+
+    class Provider:
+        name = "grsai_gpt_images"
+
+        def generate_with_reference(self, prompt, reference_image, *, aspect_ratio, size):
+            return reference_image
+
+    class Reviewer:
+        def chat_image(self, *args, **kwargs):
+            return SimpleNamespace(model="independent-vision", content=json.dumps({
+                "status": "failed", "semantic_score": 9, "aesthetic_score": 4,
+                "issues": [{"dimension": "aesthetic", "severity": "critical",
+                            "message": "visual layer obscures hierarchy"}],
+                "repair_prompt": "Remove the distracting visual layer."}))
+
+    monkeypatch.setattr(fd, "build_framework_diagram_providers", lambda **kwargs: [Provider()])
+    cfg = _config_with_framework_diagram(provider="grsai_gpt_images", render_mode="hybrid")
+    artifacts, png = fd.generate_framework_diagram_artifacts(
+        paper_text="# Test\nInput to output", config=cfg, output_dir=tmp_path,
+        llm=None, visual_reviewer=Reviewer())
+    assert png is not None
+    assert "framework_diagram_visual_candidate.png" not in artifacts
+    assert "framework_diagram_semantic_review.json" not in artifacts
+    manifest = json.loads((tmp_path / "framework_diagram_generation.json").read_text("utf-8"))
+    assert manifest["provider"] is None and manifest["visual_candidate"] is None
+    assert manifest["original_output_sha256"] is None
+    assert fd.verify_framework_diagram_artifacts(tmp_path) == manifest
 
 
 def test_orchestrator_hybrid_refuses_a_degenerate_composite(

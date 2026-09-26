@@ -2866,11 +2866,13 @@ def _execute_export_publish(
 
         _chart_dir = stage_dir / "charts"
         _chart_dir.mkdir(parents=True, exist_ok=True)
+        from researchclaw.llm import build_reviewer_llm
         _framework_artifacts, _framework_png = generate_framework_diagram_artifacts(
             paper_text=final_paper,
             config=config,
             output_dir=_chart_dir,
             llm=llm,
+            visual_reviewer=build_reviewer_llm(config),
         )
         for _art in _framework_artifacts:
             if _art not in artifacts:

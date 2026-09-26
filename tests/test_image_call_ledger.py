@@ -36,7 +36,7 @@ from researchclaw.pipeline.resource_ledger import (
     validate_resource_ledger,
 )
 from tests.test_final_acceptance import write_json
-from tests.test_framework_diagram import _PNG_BYTES, _config_with_framework_diagram
+from tests.test_framework_diagram import _PNG_BYTES, _config_with_framework_diagram, _reviewable_png
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +131,7 @@ class _FailingProvider:
         raise RuntimeError("nope")
 
 
-def _generate_diagram_into(root: Path, providers) -> None:
+def _generate_diagram_into(root: Path, providers, *, visual_reviewer=None) -> None:
     """Run the real Stage 22 orchestrator with fake providers."""
     from researchclaw.agents.figure_agent import framework_diagram as fd
 
@@ -150,7 +150,8 @@ def _generate_diagram_into(root: Path, providers) -> None:
         monkeypatch.setattr(fd, "build_framework_diagram_providers",
                             lambda **kw: providers)
         artifacts, png_path = fd.generate_framework_diagram_artifacts(
-            paper_text="# Test\n", config=cfg, output_dir=root / "charts", llm=None)
+            paper_text="# Test\n", config=cfg, output_dir=root / "charts", llm=None,
+            visual_reviewer=visual_reviewer)
     finally:
         monkeypatch.undo()
     assert png_path is not None and png_path.is_file()
@@ -471,6 +472,44 @@ def test_acceptance_requires_ledger_for_provider_attempts(tmp_path: Path) -> Non
     report = assess_delivery(root, target_status="research_complete")
     assert "image_model_calls_missing_run_ledger" in _issue_reasons(report)
     assert report["dimensions"]["resources"] == "failed"
+
+
+def test_acceptance_rejects_unreviewed_publishable_model_image(tmp_path: Path) -> None:
+    class ReviewableProvider(_GoodProvider):
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _reviewable_png()
+
+    root = _write_delivery(tmp_path)
+    _generate_diagram_into(root, [ReviewableProvider()])
+    assert write_image_call_ledger(root) is not None
+    _bind_review(root)
+    report = assess_delivery(root, target_status="research_complete")
+    assert "framework_diagram_independent_visual_review_missing" in _issue_reasons(report)
+    assert report["dimensions"]["figures"] == "failed"
+
+
+def test_acceptance_accepts_publishable_model_image_with_bound_independent_review(
+        tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    class ReviewableProvider(_GoodProvider):
+        def generate(self, prompt, *, aspect_ratio, size):
+            return _reviewable_png()
+
+    class Reviewer:
+        def chat_image(self, prompt, image_bytes, **kwargs):
+            return SimpleNamespace(model="independent-vision", content=json.dumps({
+                "status": "passed", "semantic_score": 9, "aesthetic_score": 8,
+                "issues": [], "repair_prompt": ""}))
+
+    root = _write_delivery(tmp_path)
+    _generate_diagram_into(root, [ReviewableProvider()], visual_reviewer=Reviewer())
+    assert write_image_call_ledger(root) is not None
+    _bind_review(root)
+    report = assess_delivery(root, target_status="research_complete")
+    reasons = _issue_reasons(report)
+    assert "framework_diagram_independent_visual_review_missing" not in reasons
+    assert "invalid_or_stale_framework_diagram_evidence" not in reasons
 
 
 def test_acceptance_accepts_a_contained_ledger(tmp_path: Path) -> None:

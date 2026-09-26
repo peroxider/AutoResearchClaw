@@ -1357,6 +1357,16 @@ def verify_framework_diagram_artifacts(output_dir: Path) -> dict:
         if manifest["semantic_lock"] != {"labels": True, "nodes": True, "arrows": True,
                                          "module_boundaries": True}:
             raise FrameworkDiagramVerificationError("Hybrid semantic lock is incomplete")
+    semantic_review_path = output_dir / "framework_diagram_semantic_review.json"
+    if semantic_review_path.is_file():
+        from researchclaw.agents.figure_agent.semantic_image_review import verify_semantic_image_review
+        try:
+            semantic_review = json.loads(semantic_review_path.read_text(encoding="utf-8"))
+            verify_semantic_image_review(
+                semantic_review, image_bytes=artifact_data,
+                diagram_request=prompt.decode("utf-8"), generator_model=manifest["model"])
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+            raise FrameworkDiagramVerificationError("Invalid framework diagram semantic review") from exc
     return manifest
 
 
@@ -1411,6 +1421,7 @@ def generate_framework_diagram_artifacts(
     config: Any,
     output_dir: Path,
     llm: Any = None,
+    visual_reviewer: Any = None,
 ) -> tuple[list[str], Path | None]:
     """Build the framework-diagram artifacts in ``output_dir``.
 
@@ -1429,6 +1440,9 @@ def generate_framework_diagram_artifacts(
     figure_cfg = config.experiment.figure_agent
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # A rerun without an independent reviewer must not inherit an earlier
+    # review for different bytes or a different request.
+    (output_dir / "framework_diagram_semantic_review.json").unlink(missing_ok=True)
 
     if not framework_cfg.enabled:
         logger.info("framework_diagram: disabled via config — skipping")
@@ -1602,6 +1616,39 @@ def generate_framework_diagram_artifacts(
                 "publication review — refusing to embed a degenerate diagram")
             png_path.unlink(missing_ok=True)
             return artifacts, None
+        semantic_review = None
+        if candidate_provider is not None and visual_reviewer is not None:
+            from researchclaw.agents.figure_agent.semantic_image_review import (
+                SemanticImageReviewError, review_image_semantics,
+            )
+            generator_model = (framework_cfg.grsai_model
+                               if candidate_provider == "grsai_gpt_images"
+                               else getattr(framework_cfg, "model", None))
+            try:
+                semantic_review = review_image_semantics(
+                    reviewer=visual_reviewer, image_bytes=png_path.read_bytes(),
+                    diagram_request=image_prompt, generator_model=generator_model)
+            except SemanticImageReviewError as exc:
+                logger.warning("framework_diagram: hybrid independent review failed (%s)", exc)
+            if semantic_review is None or semantic_review["status"] != "passed":
+                # The deterministic semantic layer is already publishable.
+                # Remove all influence from a rejected or unreviewable model
+                # candidate and rebuild from that authoritative layer.
+                candidate_bytes = None
+                candidate_provider = None
+                candidate_path.unlink(missing_ok=True)
+                if candidate_path.name in artifacts:
+                    artifacts.remove(candidate_path.name)
+                _compose_hybrid_framework(
+                    semantic_layer=reference_bytes, candidate=None,
+                    output_path=png_path, influence=0)
+                image_review = review_model_image(png_path.read_bytes())
+                semantic_review = None
+        if semantic_review is not None:
+            semantic_path = output_dir / "framework_diagram_semantic_review.json"
+            semantic_path.write_text(json.dumps(semantic_review, ensure_ascii=False, indent=2),
+                                     encoding="utf-8")
+            artifacts.append(semantic_path.name)
         generated_via = (
             f"hybrid:{candidate_provider}"
             if candidate_provider
@@ -1677,7 +1724,9 @@ def generate_framework_diagram_artifacts(
     image_review: dict[str, Any] | None = None
     generation_attempts: list[dict[str, Any]] = []
     original_path = output_dir / "framework_diagram_model_original.png"
+    semantic_review: dict[str, Any] | None = None
     for provider in providers:
+        semantic_review = None
         started = time.monotonic()
         try:
             image_bytes = provider.generate(
@@ -1707,6 +1756,49 @@ def generate_framework_diagram_artifacts(
                     provider.name, ", ".join(review["issues"]),
                 )
                 continue
+            generator_model = (framework_cfg.grsai_model if provider.name == "grsai_gpt_images"
+                               else getattr(framework_cfg, "model", None))
+            if visual_reviewer is not None:
+                from researchclaw.agents.figure_agent.semantic_image_review import (
+                    SemanticImageReviewError, review_image_semantics,
+                )
+                try:
+                    semantic_review = review_image_semantics(
+                        reviewer=visual_reviewer, image_bytes=image_bytes,
+                        diagram_request=image_prompt, generator_model=generator_model)
+                except SemanticImageReviewError as exc:
+                    logger.warning("framework_diagram: independent image review failed (%s)", exc)
+                    continue
+                if semantic_review["status"] != "passed":
+                    repair = getattr(provider, "generate_with_reference", None)
+                    if not callable(repair):
+                        continue
+                    repair_started = time.monotonic()
+                    try:
+                        repaired = repair(
+                            "Repair this diagram without changing undeclared content. "
+                            + semantic_review["repair_prompt"], image_bytes,
+                            aspect_ratio=framework_cfg.aspect_ratio, size=framework_cfg.size)
+                    except Exception as exc:  # noqa: BLE001
+                        generation_attempts.append(_record_image_attempt(
+                            provider, "semantic_repair", repair_started, None, exc))
+                        continue
+                    generation_attempts.append(_record_image_attempt(
+                        provider, "semantic_repair", repair_started, repaired, None))
+                    repaired_raster_review = review_model_image(repaired)
+                    if repaired_raster_review["status"] != "passed":
+                        continue
+                    try:
+                        repaired_review = review_image_semantics(
+                            reviewer=visual_reviewer, image_bytes=repaired,
+                            diagram_request=image_prompt, generator_model=generator_model)
+                    except SemanticImageReviewError as exc:
+                        logger.warning("framework_diagram: repaired image review failed (%s)", exc)
+                        continue
+                    if repaired_review["status"] != "passed":
+                        continue
+                    image_bytes, semantic_review = repaired, repaired_review
+                    review = repaired_raster_review
             original_path.write_bytes(image_bytes)
             png_path.write_bytes(image_bytes)
             generated_via = provider.name
@@ -1715,6 +1807,7 @@ def generate_framework_diagram_artifacts(
 
     # 3. Fall back to matplotlib
     if generated_via is None:
+        semantic_review = None
         try:
             _render_traditional_framework_diagram(
                 image_prompt or paper_text,
@@ -1749,6 +1842,11 @@ def generate_framework_diagram_artifacts(
         if original_path.exists():
             artifacts.append(original_path.name)
         artifacts.append(png_path.name)
+        if semantic_review is not None:
+            semantic_path = output_dir / "framework_diagram_semantic_review.json"
+            semantic_path.write_text(json.dumps(semantic_review, ensure_ascii=False, indent=2),
+                                     encoding="utf-8")
+            artifacts.append(semantic_path.name)
         manifest_path = output_dir / "framework_diagram_generation.json"
         manifest = {
             "schema_version": 3,

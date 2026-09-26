@@ -236,7 +236,11 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
     if framework_image.is_file() or framework_manifest.is_file():
         from researchclaw.agents.figure_agent.framework_diagram import verify_framework_diagram_artifacts
         try:
-            verify_framework_diagram_artifacts(framework_dir)
+            framework = verify_framework_diagram_artifacts(framework_dir)
+            if (framework.get("provider") not in {None, "matplotlib"}
+                    and not (framework_dir / "framework_diagram_semantic_review.json").is_file()):
+                issue("figures", "framework_diagram_independent_visual_review_missing",
+                      "charts/framework_diagram_semantic_review.json")
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             issue("figures", "invalid_or_stale_framework_diagram_evidence",
                   "charts/framework_diagram_generation.json")
