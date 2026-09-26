@@ -13,6 +13,64 @@ import sys
 from pathlib import Path
 
 
+def apply_rng_policy(request):
+    """Apply the driver-owned seed policy before project source is importable."""
+    policy = request.get("runtime_policy", {})
+    seed = policy.get("seed")
+    enforce = policy.get("enforce_torch_determinism")
+    if type(seed) is not int or not 0 <= seed <= 2**32 - 1 or type(enforce) is not bool:
+        raise ValueError("Invalid method probe runtime policy")
+    result = {"seed": seed, "python": "applied", "numpy": "unavailable",
+              "torch": "unavailable", "cuda_all": "unavailable",
+              "enforce_torch_determinism": enforce}
+    random.seed(seed)
+    try:
+        import numpy
+        numpy.random.seed(seed)
+        result["numpy"] = "applied"
+    except ImportError:
+        pass
+    except Exception as exc:
+        result["numpy"] = "error:" + type(exc).__name__
+    try:
+        import torch
+        torch.manual_seed(seed)
+        result["torch"] = "applied"
+        if bool(torch.cuda.is_available()):
+            torch.cuda.manual_seed_all(seed)
+            result["cuda_all"] = "applied"
+        else:
+            result["cuda_all"] = "not_available"
+        if enforce:
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+    except Exception as exc:
+        result["torch"] = "error:" + type(exc).__name__
+        result["cuda_all"] = "error:" + type(exc).__name__
+    return result
+
+
+def reseed_for_call(policy):
+    """Reset every available RNG immediately before one declared call."""
+    seed = policy["seed"]
+    random.seed(seed)
+    if "numpy" in sys.modules:
+        sys.modules["numpy"].random.seed(seed)
+    if "torch" in sys.modules:
+        torch = sys.modules["torch"]
+        manual_seed = getattr(torch, "manual_seed", None)
+        if callable(manual_seed):
+            manual_seed(seed)
+        cuda = getattr(torch, "cuda", None)
+        available = getattr(cuda, "is_available", None)
+        seed_all = getattr(cuda, "manual_seed_all", None)
+        if callable(available) and bool(available()) and callable(seed_all):
+            seed_all(seed)
+
+
 def numeric(value, depth=0, budget=None):
     if budget is None:
         budget = [256]
@@ -110,12 +168,7 @@ def execute_calls(request, source):
             module = importlib.import_module(module_name)
             if Path(module.__file__).resolve() != path.resolve():
                 raise ValueError("Imported module does not match the mapped source file")
-            # Common seeds reduce incidental differences; global state is not certified isolated.
-            random.seed(0)
-            if "numpy" in sys.modules:
-                sys.modules["numpy"].random.seed(0)
-            if "torch" in sys.modules:
-                sys.modules["torch"].manual_seed(0)
+            reseed_for_call(request["runtime_policy"])
             parts = call["code_symbol"].split(".")
             target = getattr(module, parts[0])
             if len(parts) == 2:
@@ -141,7 +194,7 @@ def _fresh_call(base, request, call, index):
     child_call = dict(call)
     child_call.pop("mode", None)
     child_request = {"schema_version": request["schema_version"], "method_version": request["method_version"],
-                     "calls": [child_call]}
+                     "runtime_policy": request["runtime_policy"], "calls": [child_call]}
     request_path, output_path = base / f"fresh-{index}-request.json", base / f"fresh-{index}-output.json"
     request_path.write_text(json.dumps(child_request, allow_nan=False), encoding="utf-8")
     completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child",
@@ -166,13 +219,17 @@ def main():
     base = Path(__file__).resolve().parent
     if len(sys.argv) == 4 and sys.argv[1] == "--child":
         request = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        rng_policy = apply_rng_policy(request)
         state = runtime_state()
+        state["rng_policy"] = rng_policy
         observations = execute_calls(request, base / "source")
         Path(sys.argv[3]).write_text(json.dumps({"schema_version": 1, "observations": observations,
                                                 "runtime": state}, allow_nan=False), encoding="utf-8")
         return
     request = json.loads((base / "request.json").read_text(encoding="utf-8"))
+    rng_policy = apply_rng_policy(request)
     state = runtime_state()
+    state["rng_policy"] = rng_policy
     normal = {**request, "calls": [call for call in request["calls"] if call.get("mode") != "fresh_process"]}
     normal_rows = {row["id"]: row for row in execute_calls(normal, base / "source")}
     fresh_states, observations = [], []

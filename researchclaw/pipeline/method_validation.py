@@ -21,10 +21,10 @@ LIMITATIONS = [
     "Finite differences are local numerical checks, not a derivative proof.",
     "Autograd gradients are computed on the frozen forward code inside the probe process and cross-checked against host finite differences; this is not a derivative proof or a backend certification.",
     "In-process determinism checks cover repeated calls within one probe process only.",
-    "Fresh-process determinism checks cover two new interpreters on the configured host with fixed common seeds; they do not certify cross-host or cross-device reproducibility.",
-    "Device inventory records runtime availability and deterministic settings before project imports; it does not prove that method code used a device or executed deterministically on it.",
+    "Fresh-process determinism checks cover two new interpreters on the configured host with a frozen driver-owned RNG policy; they do not certify cross-host or cross-device reproducibility.",
+    "Device inventory records runtime availability, applied seed backends, and deterministic settings before project imports; it does not prove that method code used a device or executed deterministically on it.",
     "Toggle checks compare outputs; they do not prove component removal or general effectiveness.",
-    "Method-wide equivalence, stochastic state isolation and scientific validity remain unresolved.",
+    "Method-wide equivalence, adversarial mutation of process-global RNG state, and scientific validity remain unresolved.",
     "A host subprocess is not OS isolation; hashes detect changes, not a malicious host or code forgery.",
 ]
 
@@ -245,7 +245,13 @@ def build_request(method):
     # Determinism repeats are appended last so every other call ran in between.
     for cid, call in deferred:
         add(cid, "repeat", call)
-    request = {"schema_version": 1, "method_version": method["version"], "calls": calls}
+    enforce_determinism = any(
+        case["kind"] == "device_inventory" and case["require_torch_determinism"]
+        for case in plan["cases"])
+    request = {"schema_version": 1, "method_version": method["version"],
+               "runtime_policy": {"seed": 0,
+                                  "enforce_torch_determinism": enforce_determinism},
+               "calls": calls}
     if any(case["kind"] == "process_determinism" for case in plan["cases"]):
         request["fresh_process_timeout_seconds"] = max(1, plan["timeout_seconds"] // 2)
     return request
@@ -262,7 +268,8 @@ def validate_runtime(value):
         raise WorkbenchError("Unsupported runtime inventory schema")
 
     def state(item):
-        _fields(item, {"process_id", "python_version", "implementation", "platform", "environment", "torch"})
+        _fields(item, {"process_id", "python_version", "implementation", "platform",
+                       "environment", "torch", "rng_policy"})
         if (type(item["process_id"]) is not int or item["process_id"] <= 0
                 or any(not _bounded_text(item[key]) for key in ("python_version", "implementation", "platform"))):
             raise WorkbenchError("Invalid runtime process identity")
@@ -271,6 +278,19 @@ def validate_runtime(value):
         _fields(environment, names)
         if any(value is not None and not _bounded_text(value) for value in environment.values()):
             raise WorkbenchError("Invalid runtime environment inventory")
+        rng = item["rng_policy"]
+        _fields(rng, {"seed", "python", "numpy", "torch", "cuda_all",
+                      "enforce_torch_determinism"})
+        if (rng["seed"] != 0 or rng["python"] != "applied"
+                or type(rng["enforce_torch_determinism"]) is not bool):
+            raise WorkbenchError("Invalid runtime RNG policy")
+        allowed_rng = {"applied", "unavailable", "not_available"}
+        for key in ("numpy", "torch", "cuda_all"):
+            status_value = rng[key]
+            if (not _bounded_text(status_value, 100)
+                    or not (status_value in allowed_rng
+                            or re.fullmatch(r"error:[A-Za-z_]\w*", status_value))):
+                raise WorkbenchError("Invalid runtime RNG backend status")
         torch = item["torch"]
         torch_fields = {"status", "version", "cuda_available", "cuda_device_count", "cuda_devices",
                         "mps_available", "deterministic_algorithms", "cudnn_deterministic",
@@ -339,6 +359,15 @@ def assess(method, observations):
             or not isinstance(observations["observations"], list)):
         raise WorkbenchError("Invalid method probe observations")
     runtime = validate_runtime(observations["runtime"]) if "runtime" in observations else None
+    if runtime is not None:
+        expected_policy = request["runtime_policy"]
+        runtime_states = [runtime["controller"],
+                          *(entry["state"] for entry in runtime["fresh_processes"])]
+        if any(state["rng_policy"]["seed"] != expected_policy["seed"]
+               or state["rng_policy"]["enforce_torch_determinism"]
+               != expected_policy["enforce_torch_determinism"]
+               for state in runtime_states):
+            raise WorkbenchError("Runtime RNG policy differs from the declared request")
     rows = observations["observations"]
     if [r.get("id") for r in rows if isinstance(r, dict)] != [c["id"] for c in request["calls"]]:
         raise WorkbenchError("Probe observations do not cover the exact ordered invocation set")
@@ -409,6 +438,17 @@ def assess(method, observations):
                      "status": "passed" if deterministic else "failed",
                      "required": case["require_torch_determinism"],
                      "observed": torch["deterministic_algorithms"], "torch_status": torch["status"]},
+                    {"comparison": "rng_seed_policy",
+                     "status": "passed" if (
+                         runtime["controller"]["rng_policy"]["python"] == "applied"
+                         and (torch["status"] != "available"
+                              or runtime["controller"]["rng_policy"]["torch"] == "applied")
+                         and (case["minimum_cuda_devices"] == 0
+                              or runtime["controller"]["rng_policy"]["cuda_all"] == "applied")
+                         and runtime["controller"]["rng_policy"]["enforce_torch_determinism"]
+                         == case["require_torch_determinism"]
+                     ) else "failed",
+                     "policy": runtime["controller"]["rng_policy"]},
                 ])
             elif case["kind"] == "autodiff":
                 arg_shape, coordinates = tensor(case["call"]["kwargs"][case["argument"]])

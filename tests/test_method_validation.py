@@ -3,11 +3,13 @@ import json
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from researchclaw.config import ExperimentConfig, SandboxConfig
 from researchclaw.experiment.method_validation_runner import run_validation
+from researchclaw.experiment.method_probe import apply_rng_policy
 from researchclaw.experiment.protocol_runner import run_matrix, verify_execution_bundle
 from researchclaw.experiment.sandbox import SandboxResult
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
@@ -484,6 +486,24 @@ def device_inventory_case(**overrides):
     return case
 
 
+def test_rng_policy_applies_torch_and_all_cuda_device_controls(monkeypatch):
+    calls = []
+    cudnn = SimpleNamespace(deterministic=False, benchmark=True)
+    cuda = SimpleNamespace(
+        is_available=lambda: True,
+        manual_seed_all=lambda seed: calls.append(("cuda_all", seed)))
+    torch = SimpleNamespace(
+        manual_seed=lambda seed: calls.append(("torch", seed)), cuda=cuda,
+        use_deterministic_algorithms=lambda enabled: calls.append(("deterministic", enabled)),
+        backends=SimpleNamespace(cudnn=cudnn))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    result = apply_rng_policy({
+        "runtime_policy": {"seed": 0, "enforce_torch_determinism": True}})
+    assert result["torch"] == "applied" and result["cuda_all"] == "applied"
+    assert calls == [("torch", 0), ("cuda_all", 0), ("deterministic", True)]
+    assert cudnn.deterministic is True and cudnn.benchmark is False
+
+
 def runtime_state(pid, *, torch_status="unavailable", cuda_count=0, deterministic=False):
     available = torch_status == "available"
     devices = [{"index": index, "name": f"GPU {index}", "capability": [8, 0],
@@ -492,6 +512,11 @@ def runtime_state(pid, *, torch_status="unavailable", cuda_count=0, deterministi
             "platform": "test", "environment": {"CUDA_VISIBLE_DEVICES": None,
                                                    "CUBLAS_WORKSPACE_CONFIG": None,
                                                    "CUDA_LAUNCH_BLOCKING": None},
+            "rng_policy": {"seed": 0, "python": "applied", "numpy": "applied",
+                           "torch": "applied" if available else "unavailable",
+                           "cuda_all": "applied" if cuda_count else (
+                               "not_available" if available else "unavailable"),
+                           "enforce_torch_determinism": deterministic},
             "torch": {"status": torch_status, "version": "test" if available else None,
                       "cuda_available": cuda_count > 0 if available else None,
                       "cuda_device_count": cuda_count if available else None,
@@ -622,6 +647,20 @@ def test_determinism_detects_state_pollution_across_calls(tmp_path, runtime_meth
         run_validation(root, method, code, cfg)
 
 
+def test_determinism_reseeds_python_rng_before_each_declared_call(tmp_path, runtime_method):
+    runtime_method["validation"]["cases"] = [determinism_case()]
+    model = MODEL.replace(
+        "from pathlib import Path", "import random\nfrom pathlib import Path").replace(
+        "return [v * self.factor + int(enabled) for v in x]",
+        "return [random.random() for _ in x]")
+    root, method, code, cfg = prepared(tmp_path, runtime_method, model=model)
+    report = run_validation(root, method, code, cfg)
+    assert report["status"] == "passed"
+    rows = json.loads((root / "evidence_artifacts/method_validation/observations.json").read_text())[
+        "observations"]
+    assert rows[0]["value"] == rows[1]["value"]
+
+
 def test_determinism_repeat_is_appended_after_every_other_call(runtime_method):
     golden = runtime_method["validation"]["cases"][0]
     runtime_method["validation"]["cases"] = [determinism_case(), golden]
@@ -707,8 +746,12 @@ def test_device_inventory_records_pre_source_runtime_without_forged_torch(tmp_pa
     assert report["status"] == "passed" and report["coverage"]["tested_steps"] == []
     assert build_request(method)["calls"] == []
     torch = report["runtime_environment"]["controller"]["torch"]
+    rng = report["runtime_environment"]["controller"]["rng_policy"]
     assert torch["version"] != "fixture"
     assert torch["status"] in {"available", "unavailable"} or torch["status"].startswith("error:")
+    assert rng["seed"] == 0 and rng["python"] == "applied"
+    assert rng["numpy"] in {"applied", "unavailable"} or rng["numpy"].startswith("error:")
+    assert rng["enforce_torch_determinism"] is False
     assert report["checks"][0]["checks"][0]["available"]["cpu"] is True
 
 
@@ -717,15 +760,27 @@ def test_device_requirements_are_checked_from_runtime_inventory(runtime_method):
         required_devices=["cpu", "cuda"], minimum_cuda_devices=2,
         require_torch_determinism=True)]
     method = compile_method(runtime_method)
+    assert build_request(method)["runtime_policy"] == {
+        "seed": 0, "enforce_torch_determinism": True}
     passing_runtime = runtime_inventory()
     passing_runtime["controller"] = runtime_state(100, torch_status="available", cuda_count=2,
                                                   deterministic=True)
     passed = assess(method, {"schema_version": 1, "observations": [], "runtime": passing_runtime})
     assert passed[0]["status"] == "passed"
+    assert passed[0]["checks"][-1]["comparison"] == "rng_seed_policy"
+    assert passed[0]["checks"][-1]["status"] == "passed"
+    missing_cuda_seed = copy.deepcopy(passing_runtime)
+    missing_cuda_seed["controller"]["rng_policy"]["cuda_all"] = "not_available"
+    unseeded = assess(method, {"schema_version": 1, "observations": [],
+                               "runtime": missing_cuda_seed})
+    assert unseeded[0]["status"] == "failed"
+    assert unseeded[0]["checks"][-1]["comparison"] == "rng_seed_policy"
     passing_runtime["controller"]["torch"]["deterministic_algorithms"] = False
     failed = assess(method, {"schema_version": 1, "observations": [], "runtime": passing_runtime})
     assert failed[0]["status"] == "failed"
-    assert failed[0]["checks"][-1]["comparison"] == "torch_deterministic_algorithms"
+    assert next(item for item in failed[0]["checks"]
+                if item["comparison"] == "torch_deterministic_algorithms")["status"] == "failed"
+    assert failed[0]["checks"][-1]["comparison"] == "rng_seed_policy"
 
 
 def test_fresh_process_timeout_and_runtime_schema_are_strict(runtime_method):
@@ -741,3 +796,7 @@ def test_fresh_process_timeout_and_runtime_schema_are_strict(runtime_method):
     malformed["controller"]["torch"]["cuda_available"] = False
     with pytest.raises(WorkbenchError, match="device claims"):
         assess(method, {"schema_version": 1, "observations": rows, "runtime": malformed})
+    wrong_seed = runtime_inventory(fresh=(("portable:first", 101), ("portable:repeat", 102)))
+    wrong_seed["fresh_processes"][1]["state"]["rng_policy"]["seed"] = 7
+    with pytest.raises(WorkbenchError, match="RNG policy"):
+        assess(method, {"schema_version": 1, "observations": rows, "runtime": wrong_seed})
