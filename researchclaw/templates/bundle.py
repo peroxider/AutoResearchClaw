@@ -38,6 +38,8 @@ DEFAULT = {
     "required_sections": [], "banned_sections": [], "max_references": None,
     "min_page_ink_percent": None, "max_sparse_pages": None,
     "max_float_reference_page_distance": None,
+    "min_float_caption_characters": None,
+    "min_float_reference_context_characters": None,
     "columns": None,
 }
 GENERIC = r"""\documentclass[11pt]{article}
@@ -119,7 +121,8 @@ def _policy(data: dict) -> dict:
         if type(result[key]) is not bool:
             raise TemplateError(f"{key} must be boolean")
     for key in ("max_pages", "max_main_pages", "max_title_characters", "max_abstract_characters",
-                "max_figures", "max_tables", "max_references", "min_page_ink_percent"):
+                "max_figures", "max_tables", "max_references", "min_page_ink_percent",
+                "min_float_caption_characters", "min_float_reference_context_characters"):
         if result[key] is not None and (type(result[key]) is not int or result[key] < 1):
             raise TemplateError(f"{key} must be a positive integer or null")
     if result["min_page_ink_percent"] is not None and result["min_page_ink_percent"] > 100:
@@ -346,6 +349,36 @@ def render_frame(root: Path, title: str) -> tuple[str, str, dict]:
     return prefix, suffix, {**compiled["policy"], "columns": compiled["columns"]}
 
 
+def _tex_command_arguments(source: str, command: str) -> list[str]:
+    """Return balanced mandatory arguments for a simple TeX command."""
+    results = []
+    for match in re.finditer(r"\\" + re.escape(command) + r"\*?(?:\[[^\]]*\])?\s*\{", source):
+        start = match.end()
+        depth, index = 1, start
+        while index < len(source) and depth:
+            if source[index] == "\\":
+                index += 2
+                continue
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+            index += 1
+        if depth:
+            raise ValueError("unbalanced TeX command argument")
+        results.append(source[start:index - 1])
+    return results
+
+
+def _visible_tex_characters(source: str) -> int:
+    """Conservatively count non-space content while retaining command arguments."""
+    visible = re.sub(r"\\(?:ref|label)\{[^{}]*\}", " ", source)
+    visible = re.sub(r"\\[A-Za-z@]+\*?(?:\[[^\]]*\])?", " ", visible)
+    visible = re.sub(r"\\[^A-Za-z@]", " ", visible)
+    visible = visible.translate(str.maketrans("", "", "{}$"))
+    return len(re.sub(r"\s+", "", visible))
+
+
 def inspect_constraints(root: Path) -> dict:
     """Check actual PDF page counts. Missing compilation never passes a limit."""
     record = verify_template(root)
@@ -358,6 +391,7 @@ def inspect_constraints(root: Path) -> dict:
     page_ink_percent: list[float] | None = None
     sparse_pages: list[int] | None = None
     float_reference_distances: list[dict] | None = None
+    float_semantic_checks: list[dict] | None = None
     pdf = root / "paper.pdf"
     if pdf.is_file():
         try:
@@ -442,6 +476,65 @@ def inspect_constraints(root: Path) -> dict:
         source = re.sub(r"(?m)(?<!\\)%.*$", "", source)
         figures = len(re.findall(r"\\begin\{figure\*?\}", source))
         tables = len(re.findall(r"\\begin\{(?:table\*?|longtable)\}", source))
+        if (policy["min_float_caption_characters"] is not None
+                or policy["min_float_reference_context_characters"] is not None):
+            try:
+                float_bodies = re.findall(
+                    r"\\begin\{(figure\*?|table\*?|longtable)\}(.*?)\\end\{\1\}",
+                    source, flags=re.DOTALL)
+                if len(float_bodies) != figures + tables:
+                    raise ValueError("float environment analysis incomplete")
+                source_without_floats = re.sub(
+                    r"\\begin\{(figure\*?|table\*?|longtable)\}.*?\\end\{\1\}",
+                    "\n\n", source, flags=re.DOTALL)
+                float_semantic_checks = []
+                for _, body in float_bodies:
+                    labels = re.findall(
+                        r"\\label\{((?:fig:|tab:|arc-results-)[^{}]+)\}", body)
+                    captions = _tex_command_arguments(body, "caption")
+                    if len(labels) != 1:
+                        raise ValueError("float needs one supported label")
+                    if (policy["min_float_caption_characters"] is not None
+                            and len(captions) != 1):
+                        raise ValueError("float needs one caption")
+                    label = labels[0]
+                    caption_characters = (_visible_tex_characters(captions[0])
+                                          if len(captions) == 1 else None)
+                    contexts = None
+                    if policy["min_float_reference_context_characters"] is not None:
+                        marker = re.compile(
+                            r"\\ref\{" + re.escape(label) + r"\}\\label\{arc-ref:"
+                            + re.escape(label) + r"\}")
+                        contexts = []
+                        for match in marker.finditer(source_without_floats):
+                            before = source_without_floats[:match.start()]
+                            after = source_without_floats[match.end():]
+                            left_matches = list(re.finditer(r"\n\s*\n", before))
+                            left = left_matches[-1].end() if left_matches else 0
+                            right_match = re.search(r"\n\s*\n", after)
+                            right = match.end() + (right_match.start() if right_match else len(after))
+                            paragraph = (source_without_floats[left:match.start()]
+                                         + source_without_floats[match.end():right])
+                            contexts.append(_visible_tex_characters(paragraph))
+                        if not contexts:
+                            raise ValueError("float reference context unavailable")
+                    float_semantic_checks.append({
+                        "label": label,
+                        "caption_characters": caption_characters,
+                        "reference_context_characters": contexts,
+                        "max_reference_context_characters": max(contexts) if contexts else None,
+                    })
+                if (policy["min_float_caption_characters"] is not None
+                        and any(row["caption_characters"] < policy["min_float_caption_characters"]
+                                for row in float_semantic_checks)):
+                    issues.append("min_float_caption_characters_unmet")
+                if (policy["min_float_reference_context_characters"] is not None
+                        and any(row["max_reference_context_characters"]
+                                < policy["min_float_reference_context_characters"]
+                                for row in float_semantic_checks)):
+                    issues.append("min_float_reference_context_characters_unmet")
+            except (ValueError, TypeError):
+                issues.append("float_semantic_analysis_unavailable")
         if policy["max_float_reference_page_distance"] is not None:
             aux = root / "paper.aux"
             try:
@@ -492,8 +585,12 @@ def inspect_constraints(root: Path) -> dict:
                     issues.append("max_float_reference_page_distance_exceeded")
             except (OSError, ValueError):
                 issues.append("float_reference_analysis_unavailable")
-    elif policy["max_float_reference_page_distance"] is not None:
-        issues.append("float_reference_analysis_unavailable")
+    else:
+        if policy["max_float_reference_page_distance"] is not None:
+            issues.append("float_reference_analysis_unavailable")
+        if (policy["min_float_caption_characters"] is not None
+                or policy["min_float_reference_context_characters"] is not None):
+            issues.append("float_semantic_analysis_unavailable")
     for field, actual in (("max_title_characters", title_characters),
                           ("max_abstract_characters", abstract_characters),
                           ("max_figures", figures), ("max_tables", tables),
@@ -508,5 +605,6 @@ def inspect_constraints(root: Path) -> dict:
             "banned_sections_present": banned_present,
             "page_ink_percent": page_ink_percent, "sparse_pages": sparse_pages,
             "float_reference_distances": float_reference_distances,
+            "float_semantic_checks": float_semantic_checks,
             "status": "passed" if not issues else "failed", "issues": issues,
-            "scope": "declared structural, raster-density, and compiled float-distance constraints; content anonymity and visual quality require full review"}
+            "scope": "declared structural, raster-density, float-description, and compiled float-distance constraints; semantic correctness, content anonymity, and visual quality require full review"}

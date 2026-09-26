@@ -32,6 +32,8 @@ export:
   "min_page_ink_percent": 5,
   "max_sparse_pages": 1,
   "max_float_reference_page_distance": 1,
+  "min_float_caption_characters": 40,
+  "min_float_reference_context_characters": 60,
   "appendix_roles": ["theory", "results"],
   "highlights_required": true
 }
@@ -44,6 +46,8 @@ export:
 `min_page_ink_percent` 与 `max_sparse_pages` 是必须成对声明的可选规则：前者是正整数百分比且不超过 100，后者是允许低于该阈值的物理页数。检查器把最终 PDF 每页以灰度渲染，并把每页像素数限制在 100 万以内；灰度值低于 245 的像素计作墨迹，低于声明阈值的页以从 1 开始的页码写入 `sparse_pages`，每页覆盖率写入 `page_ink_percent`。声明规则后，PDF 缺失、不可读或光栅分析失败都会失败关闭；稀疏页数超过预算则产生 `max_sparse_pages_exceeded`。
 
 `max_float_reference_page_distance` 是可选的非负整数，限制系统生成图表与其正文引用之间的最近编译页距。渲染器在每个系统生成图像前写入可见的 `Figure~\ref{...}` 和确定性引用锚点，结果表的既有引用也带同类锚点。检查器逐个解析 `figure`、`figure*`、`table`、`table*` 与 `longtable` 环境，要求每个环境恰有一个受支持的 `fig:`、`tab:` 或 `arc-results-` 标签，再从最终编译的 `paper.aux` 取得浮动体页和引用锚点页；页码必须为十进制整数且落在最终 PDF 页数内。每项结果写入 `float_reference_distances`。缺 `.aux`、缺标签、缺引用、重复标签、锚点不匹配或页码越界均产生 `float_reference_analysis_unavailable`，最近页距超过声明值则产生 `max_float_reference_page_distance_exceeded`。
+
+`min_float_caption_characters` 与 `min_float_reference_context_characters` 是彼此独立的可选正整数。前者要求每个受支持浮动体恰有一个 caption，并对平衡花括号内的最终 TeX 内容做保守的非空白字符计数；命令名与 TeX 语法字符不计入，命令参数中的可见文字保留。后者要求每个浮动体至少有一个带确定性 `arc-ref` 锚点的正文引用，并统计引用所在段落除去引用命令后的可见字符；多个引用取信息量最大的一个与下限比较。逐图表实测写入 `float_semantic_checks`。结构无法完整解析、缺受支持标签或声明所需的 caption/引用时产生 `float_semantic_analysis_unavailable`；低于阈值分别产生 `min_float_caption_characters_unmet` 与 `min_float_reference_context_characters_unmet`。该门禁拒绝只有 “See Figure” 或过短标题的机械占位文本，但字符量不等于语义正确、充分解释或审美质量；阈值必须来自用户确认的模板规则。
 
 这些规则来自用户模板包的声明，不把默认值当成已经查证的期刊政策。支持的附录角色是 methods、theory、experiments、results、related_work、discussion；abstract、introduction、conclusion 保留在正文。
 

@@ -99,6 +99,10 @@ def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
     {"min_page_ink_percent": 5, "max_sparse_pages": True},
     {"max_float_reference_page_distance": -1},
     {"max_float_reference_page_distance": True},
+    {"min_float_caption_characters": 0},
+    {"min_float_caption_characters": True},
+    {"min_float_reference_context_characters": -1},
+    {"min_float_reference_context_characters": 1.5},
     {"required_sections": ["nonsense"]}, {"required_sections": ["methods", "methods"]},
     {"banned_sections": "methods"}, {"required_sections": [True]},
     {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
@@ -421,7 +425,9 @@ def test_float_distance_and_reference_count_policies_compose(tmp_path: Path) -> 
     root = tmp_path / "delivery"
     root.mkdir()
     freeze_template(root, bundle(
-        tmp_path, max_float_reference_page_distance=1, max_references=2))
+        tmp_path, max_float_reference_page_distance=1, max_references=2,
+        min_float_caption_characters=1,
+        min_float_reference_context_characters=5))
     import fitz
     with fitz.open() as pdf:
         pdf.new_page()
@@ -439,6 +445,88 @@ def test_float_distance_and_reference_count_policies_compose(tmp_path: Path) -> 
     assert result["status"] == "passed"
     assert result["references"] == 2
     assert result["float_reference_distances"][0]["min_page_distance"] == 1
+    assert result["float_semantic_checks"][0]["caption_characters"] == 1
+
+
+def test_declared_float_caption_and_reference_context_are_measured(tmp_path: Path) -> None:
+    root = tmp_path / "delivery"
+    root.mkdir()
+    freeze_template(root, bundle(
+        tmp_path, min_float_caption_characters=20,
+        min_float_reference_context_characters=30))
+    import fitz
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    (root / "paper.tex").write_text(
+        "The comparison exposes the stability mechanism under severe shift; see "
+        r"Figure~\ref{fig:x}\label{arc-ref:fig:x}."
+        "\n\n"
+        r"\begin{figure}\caption{Stability under \textbf{severe distribution shift}}"
+        r"\label{fig:x}\end{figure}", encoding="utf-8")
+    result = inspect_constraints(root)
+    assert result["status"] == "passed"
+    assert result["float_semantic_checks"] == [{
+        "label": "fig:x",
+        "caption_characters": len("Stabilityunderseveredistributionshift"),
+        "reference_context_characters": [
+            len("Thecomparisonexposesthestabilitymechanismundersevereshift;seeFigure~.")],
+        "max_reference_context_characters": len(
+            "Thecomparisonexposesthestabilitymechanismundersevereshift;seeFigure~."),
+    }]
+
+
+def test_float_semantic_policy_rejects_thin_or_unparseable_context(tmp_path: Path) -> None:
+    root = tmp_path / "delivery"
+    root.mkdir()
+    freeze_template(root, bundle(
+        tmp_path, min_float_caption_characters=12,
+        min_float_reference_context_characters=12))
+    import fitz
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(root / "paper.pdf")
+    (root / "paper.tex").write_text(
+        r"See \ref{fig:x}\label{arc-ref:fig:x}."
+        "\n\n" r"\begin{figure}\caption{Tiny}\label{fig:x}\end{figure}",
+        encoding="utf-8")
+    thin = inspect_constraints(root)
+    assert "min_float_caption_characters_unmet" in thin["issues"]
+    assert "min_float_reference_context_characters_unmet" in thin["issues"]
+
+    (root / "paper.tex").write_text(
+        r"Context without the required marker."
+        "\n\n" r"\begin{figure}\caption{A sufficiently detailed caption}\label{fig:x}\end{figure}",
+        encoding="utf-8")
+    unavailable = inspect_constraints(root)
+    assert "float_semantic_analysis_unavailable" in unavailable["issues"]
+
+
+def test_float_caption_and_reference_context_policies_are_independent(tmp_path: Path) -> None:
+    import fitz
+
+    caption_root = tmp_path / "caption"
+    caption_root.mkdir()
+    freeze_template(caption_root, bundle(tmp_path, min_float_caption_characters=4))
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(caption_root / "paper.pdf")
+    (caption_root / "paper.tex").write_text(
+        r"\begin{figure}\caption{Enough}\label{fig:x}\end{figure}", encoding="utf-8")
+    assert inspect_constraints(caption_root)["status"] == "passed"
+
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    freeze_template(context_root, bundle(tmp_path, min_float_reference_context_characters=10))
+    with fitz.open() as pdf:
+        pdf.new_page()
+        pdf.save(context_root / "paper.pdf")
+    (context_root / "paper.tex").write_text(
+        r"Detailed mechanism discussion precedes Figure~\ref{fig:x}\label{arc-ref:fig:x}."
+        "\n\n" r"\begin{figure}\label{fig:x}\end{figure}", encoding="utf-8")
+    result = inspect_constraints(context_root)
+    assert result["status"] == "passed"
+    assert result["float_semantic_checks"][0]["caption_characters"] is None
 
 
 def test_export_refresh_detects_external_template_change(study):
