@@ -8,7 +8,7 @@ import yaml
 from researchclaw.adapters import AdapterBundle
 from researchclaw.pipeline.evidence_store import EvidenceKey, EvidenceStore, content_hash, file_hash
 from researchclaw.pipeline.experiment_protocol import (
-    ProtocolError, audit_coverage, compile_protocol,
+    ProtocolError, audit_coverage, compile_protocol, get_reproduction_policy,
     load_protocol,
 )
 from researchclaw.pipeline.independent_evaluator import evaluate_predictions
@@ -67,6 +67,8 @@ def test_protocol_freezes_full_product_and_explicit_baselines(inputs, spec):
     assert protocol["allocation"]["required_cells"] == 8
     assert protocol["allocation"]["reserved_seconds"] == 80
     assert protocol["allocation"]["actual_usage_status"] == "unmeasured"
+    assert "reproduction" not in protocol["spec"]
+    assert get_reproduction_policy(protocol) == {"mode": "exact", "metrics": {}}
     assert len({c["cell_id"] for c in protocol["cells"]}) == 8
     assert len(protocol["comparisons"]) == 4
     index = {c["cell_id"]: c for c in protocol["cells"]}
@@ -78,6 +80,48 @@ def test_protocol_freezes_full_product_and_explicit_baselines(inputs, spec):
         assert base["key"]["method"] == ("Z_base" if comparison["question"] == "rq_main" else "A_full")
     assert prepare_inputs(inputs[0], root) == contract
     assert "Frozen experiment protocol" in public_context(contract, root)
+
+
+def test_protocol_freezes_bounded_reproduction_tolerance_before_execution(inputs, spec):
+    spec["reproduction"] = {"metrics": {"accuracy": {
+        "absolute_tolerance": 0.001,
+        "relative_tolerance": 0,
+        "rationale": "Allow documented floating-point variation across accelerators.",
+    }}}
+    _, _, protocol, _ = freeze(inputs, spec)
+    policy = get_reproduction_policy(protocol)
+    assert policy["mode"] == "tolerance"
+    assert policy["metrics"]["accuracy"]["absolute_tolerance"] == 0.001
+
+
+@pytest.mark.parametrize("policy", [
+    {"metrics": {}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 0, "relative_tolerance": 0,
+                                "rationale": "Both zero"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": True, "relative_tolerance": 0,
+                                "rationale": "Boolean masquerade"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": float("nan"), "relative_tolerance": 0,
+                                "rationale": "Non-finite"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 0, "relative_tolerance": 1.01,
+                                "rationale": "Unbounded relative tolerance"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": -0.1, "relative_tolerance": 0,
+                                "rationale": "Negative absolute tolerance"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 1_000_001, "relative_tolerance": 0,
+                                "rationale": "Unbounded absolute tolerance"}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 0.1, "relative_tolerance": 0,
+                                "rationale": ""}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 0.1, "relative_tolerance": 0,
+                                "rationale": "x" * 1001}}},
+    {"metrics": {"accuracy": {"absolute_tolerance": 0.1, "relative_tolerance": 0,
+                                "rationale": "valid"},
+                 "mse": {"absolute_tolerance": 0.1, "relative_tolerance": 0,
+                         "rationale": "undeclared metric"}}},
+])
+def test_invalid_reproduction_policy_is_rejected_before_execution(inputs, spec, policy):
+    contract = prepare_inputs(inputs[0], inputs[1])
+    spec["reproduction"] = policy
+    with pytest.raises(ProtocolError, match="Reproduction|reproduction"):
+        compile_protocol(spec, contract["datasets"], max_cell_seconds=300)
 
 
 @pytest.mark.parametrize("mutation", [

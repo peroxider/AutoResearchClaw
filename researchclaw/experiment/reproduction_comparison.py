@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import uuid
 from dataclasses import asdict
@@ -10,7 +11,9 @@ from pathlib import Path
 
 from researchclaw.experiment.protocol_runner import verify_execution_bundle
 from researchclaw.pipeline.evidence_store import EvidenceStore, content_hash, file_hash
-from researchclaw.pipeline.experiment_protocol import ProtocolError, audit_coverage, load_protocol
+from researchclaw.pipeline.experiment_protocol import (
+    ProtocolError, audit_coverage, get_reproduction_policy, load_protocol,
+)
 from researchclaw.pipeline.independent_evaluator import evaluate_manifest
 from researchclaw.research_inputs import verify_bundle_contract
 
@@ -37,6 +40,21 @@ def _write(path: Path, value: dict) -> None:
 def _records_by_key(store: EvidenceStore) -> dict[str, tuple[str, object]]:
     return {content_hash(asdict(record.key)): (result_id, record)
             for result_id, record in store.records.items()}
+
+
+def compare_reproduction_values(policy: dict, metric: str,
+                                left: float, right: float) -> tuple[bool, float | None, float]:
+    """Apply an exact or execution-predeclared symmetric numeric tolerance."""
+    difference = abs(left - right)
+    if policy["mode"] == "exact":
+        allowed = 0.0
+    else:
+        rule = policy["metrics"][metric]
+        allowed = (rule["absolute_tolerance"]
+                   + rule["relative_tolerance"] * max(abs(left), abs(right)))
+    if not math.isfinite(difference):
+        return False, None, allowed
+    return difference <= allowed, difference, allowed
 
 
 def _load_bundle(root: Path) -> dict:
@@ -112,13 +130,18 @@ def _build_report(left: dict, right: dict, left_site: str, right_site: str) -> d
         and left["contract_identity"] == right["contract_identity"]
         and left["code_sha256"] == right["code_sha256"]
     )
+    same_protocol = left["protocol"]["version"] == right["protocol"]["version"]
+    policy = (get_reproduction_policy(left["protocol"])
+              if same_protocol else {"mode": "exact", "metrics": {}})
     pairs = []
     mismatches = []
     for key_hash in shared:
         left_id, left_record = left["records"][key_hash]
         right_id, right_record = right["records"][key_hash]
-        exact = (left_record.value == right_record.value
-                 and left_record.unit == right_record.unit)
+        units_match = left_record.unit == right_record.unit
+        value_match, difference, allowed = compare_reproduction_values(
+            policy, left_record.key.metric, left_record.value, right_record.value)
+        matched_value = units_match and value_match
         row = {
             "key": asdict(left_record.key),
             "left_result_id": left_id,
@@ -126,10 +149,12 @@ def _build_report(left: dict, right: dict, left_site: str, right_site: str) -> d
             "left_value": left_record.value,
             "right_value": right_record.value,
             "unit": left_record.unit if left_record.unit == right_record.unit else None,
-            "exact_match": exact,
+            "absolute_difference": difference,
+            "allowed_difference": allowed,
+            "value_match": matched_value,
         }
         pairs.append(row)
-        if not exact:
+        if not matched_value:
             mismatches.append(key_hash)
     left_receipts = {record.execution for _, record in left["records"].values()}
     right_receipts = {record.execution for _, record in right["records"].values()}
@@ -145,8 +170,8 @@ def _build_report(left: dict, right: dict, left_site: str, right_site: str) -> d
         "status": "matched" if matched else "mismatched",
         "scope": _SCOPE,
         "protocol_version": (left["protocol"]["version"]
-                             if left["protocol"]["version"] == right["protocol"]["version"]
-                             else None),
+                             if same_protocol else None),
+        "reproduction_policy": policy if same_protocol else None,
         "identities_match": identities_match,
         "execution_evidence_distinct": execution_evidence_distinct,
         "environment_relation": (
@@ -171,7 +196,7 @@ def _build_report(left: dict, right: dict, left_site: str, right_site: str) -> d
         "missing_right": missing_right,
         "mismatches": mismatches,
         "limitations": [
-            "Exact equality is required because no tolerance is predeclared in protocol v2.",
+            "Exact equality is required unless a bounded tolerance and rationale were frozen before execution.",
             "Distinct hash-bound receipts reject a copied bundle but are not host authentication.",
             "This comparison does not establish scientific validity or generalization.",
         ],

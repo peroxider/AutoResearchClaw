@@ -7,6 +7,7 @@ review; a complete matrix does not establish those properties.
 from __future__ import annotations
 
 import json
+import math
 import re
 import statistics
 from dataclasses import asdict
@@ -57,6 +58,41 @@ def _positive(value: Any, name: str) -> int:
     return value
 
 
+def _reproduction_policy(value: Any, metrics: set[str]) -> dict:
+    policy = _object(value, {"metrics"}, {"metrics"}, "reproduction policy")
+    rules = policy["metrics"]
+    if not isinstance(rules, dict) or set(rules) != metrics:
+        raise ProtocolError("Reproduction policy must cover every declared metric exactly")
+    normalized = {}
+    for metric, rule in rules.items():
+        _identifier(metric)
+        _object(rule, {"absolute_tolerance", "relative_tolerance", "rationale"},
+                {"absolute_tolerance", "relative_tolerance", "rationale"},
+                "reproduction metric rule")
+        absolute, relative = rule["absolute_tolerance"], rule["relative_tolerance"]
+        if (type(absolute) not in {int, float} or not math.isfinite(absolute)
+                or not 0 <= absolute <= 1_000_000
+                or type(relative) not in {int, float} or not math.isfinite(relative)
+                or not 0 <= relative <= 1 or absolute == relative == 0):
+            raise ProtocolError("Reproduction tolerances must be finite, bounded and nonzero")
+        rationale = _text(rule["rationale"], "reproduction tolerance rationale")
+        if len(rationale) > 1000:
+            raise ProtocolError("Reproduction tolerance rationale exceeds 1000 characters")
+        normalized[metric] = {
+            "absolute_tolerance": absolute,
+            "relative_tolerance": relative,
+            "rationale": rationale,
+        }
+    return {"metrics": normalized}
+
+
+def get_reproduction_policy(protocol: dict) -> dict:
+    """Return the frozen comparison policy; absent v2 policy means exact equality."""
+    declared = protocol.get("spec", {}).get("reproduction")
+    return ({"mode": "exact", "metrics": {}} if declared is None
+            else {"mode": "tolerance", "metrics": declared["metrics"]})
+
+
 def _json_value(value: Any) -> None:
     if isinstance(value, dict):
         if any(not isinstance(k, str) for k in value):
@@ -76,7 +112,7 @@ def _json_value(value: Any) -> None:
 
 def compile_protocol(spec: dict, datasets: list[dict], *, max_cell_seconds: int) -> dict:
     """Expand dataset x RQ x method x seed before any result is observed."""
-    _object(spec, {"schema_version", "methods", "questions", "seeds", "budget"},
+    _object(spec, {"schema_version", "methods", "questions", "seeds", "budget", "reproduction"},
             {"schema_version", "methods", "questions", "seeds", "budget"}, "protocol")
     if type(spec["schema_version"]) is not int or spec["schema_version"] != 1:
         raise ProtocolError("Unsupported input protocol schema")
@@ -114,6 +150,10 @@ def compile_protocol(spec: dict, datasets: list[dict], *, max_cell_seconds: int)
             if parent["parameters"] == method["parameters"]:
                 raise ProtocolError("Ablation must declare a changed configuration")
     available = {d["manifest"]["dataset"]: d for d in datasets}
+    if "reproduction" in spec:
+        spec = dict(spec)
+        spec["reproduction"] = _reproduction_policy(
+            spec["reproduction"], {d["manifest"]["metric"] for d in datasets})
     cells, comparisons, questions, used_methods, used_data = [], [], set(), set(), set()
     analysis_draws = 0
     for question in _list(spec["questions"], "questions"):

@@ -65,6 +65,21 @@ questions:
 
 `parameters` 必须是有限 JSON 值。完整方法声明的哈希成为 EvidenceKey 的 `config`；方法、描述、参数、消融声明变化都会改变身份。
 
+### 预声明复现容差
+
+未配置时，两个独立正式矩阵只能用数值和单位精确相等获得复现匹配。若预期不同硬件或数学库会产生可接受的浮点差异，可以在协议中执行前声明逐指标规则：
+
+```yaml
+reproduction:
+  metrics:
+    accuracy:
+      absolute_tolerance: 0.001
+      relative_tolerance: 0
+      rationale: Allow documented floating-point variation across accelerators.
+```
+
+规则必须恰好覆盖所有数据集声明的指标，不允许遗漏或增加未使用指标。绝对/相对容差须为非布尔有限数，分别限制在 `[0, 1000000]` 与 `[0, 1]`，且不能同时为零；每项必须给出不超过 1000 字符的非空理由。容差随原始 `spec` 进入协议版本哈希，正式执行后修改会改变 protocol version 并使既有回执失效。双运行比较使用对称阈值 `absolute_tolerance + relative_tolerance × max(|left|, |right|)`，仍要求完整 EvidenceKey、单位、输入、协议和实验源码身份一致。阈值只是预声明的复现判据，不说明该偏差在科学上一定可忽略；理由仍需领域审查。
+
 ## 分配与实际用量的区别
 
 - 所有单元使用相同 `per_cell_seconds` 和 `tuning_trials` 配额。每个单元的时间配额包含其训练、验证调参和推理；调参次数不是额外乘数。
@@ -108,5 +123,7 @@ Stage 14 输出 `experiment_coverage.json`，包括缺失、无效、未声明�
 ```
 
 未调用付费模型、未完整生成论文，也没有执行真实科研矩阵。本轮测试的预测/执行记录是明确标记的 fixture，不构成真实实验结果。
+
+第七十六轮补充执行前复现容差策略：实验协议与双运行比较联合回归 59 项通过。反例覆盖空指标映射、双零阈值、布尔伪装、NaN、相对容差越界、空理由和多余指标；真实双矩阵集成覆盖同源码、同协议身份下的有界数值差。测试仍是工程 fixture，不构成跨硬件科研复现实验。
 
 后续需要实现宿主机逐单元调度和预算账本、验证集选择与最终测试解锁、失败尝试不可丢弃的执行记录、资源与环境公平性审核、消融实现轨迹、外部数据适配以及 MethodSpec/TheoryBundle。
