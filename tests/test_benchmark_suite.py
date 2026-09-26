@@ -36,7 +36,8 @@ def suite_fixture(tmp_path):
         })
         gold_cases.append({
             "case_id": case_id,
-            "expected_disposition": "honest_negative" if index == 4 else "reject",
+            "expected_disposition": ("accept" if index == 0 else
+                                     "honest_negative" if index == 4 else "reject"),
             "rubric": f"Private gold rubric for {case_id}",
         })
     plan = {"schema_version": 1, "min_repeats": 2,

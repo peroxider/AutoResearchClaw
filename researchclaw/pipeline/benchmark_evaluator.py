@@ -1,0 +1,368 @@
+"""Evaluate completed ARC benchmark runs against private blind assessments."""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import uuid
+from collections import defaultdict
+from pathlib import Path
+
+from researchclaw.pipeline.benchmark_suite import (
+    BenchmarkSuiteError, verify_benchmark_suite,
+)
+from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.resource_ledger import (
+    ResourceLedgerError, validate_resource_ledger,
+)
+
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DISPOSITIONS = {"accept", "reject", "honest_negative"}
+
+
+class BenchmarkEvaluationError(ValueError):
+    pass
+
+
+def _load(path: Path, name: str) -> dict:
+    try:
+        if path.stat().st_size > 10_000_000:
+            raise BenchmarkEvaluationError(f"{name} exceeds 10 MB")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except BenchmarkEvaluationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise BenchmarkEvaluationError(f"{name} is unreadable: {type(exc).__name__}") from exc
+    if not isinstance(value, dict):
+        raise BenchmarkEvaluationError(f"{name} must be an object")
+    return value
+
+
+def _write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_stable(path: Path, name: str) -> tuple[dict, str]:
+    try:
+        before = file_hash(path)
+        value = _load(path, name)
+        after = file_hash(path)
+    except OSError as exc:
+        raise BenchmarkEvaluationError(f"{name} is unreadable: {type(exc).__name__}") from exc
+    if before != after:
+        raise BenchmarkEvaluationError(f"{name} changed while it was being evaluated")
+    return value, before
+
+
+def _safe_run(results_root: Path, relative: object) -> Path:
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise BenchmarkEvaluationError("Benchmark run path is malformed")
+    candidate = results_root / relative
+    path = candidate.resolve()
+    if not path.is_relative_to(results_root) or candidate.is_symlink() or not path.is_dir():
+        raise BenchmarkEvaluationError("Benchmark run path is missing or unsafe")
+    return path
+
+
+def _validate_acceptance(path: Path, digest: object) -> dict:
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise BenchmarkEvaluationError("Acceptance digest is malformed")
+    value = _load(path, "Final acceptance")
+    ranks = {"exploratory": 0, "research_complete": 1, "submission_candidate": 2}
+    if (file_hash(path) != digest or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1
+            or value.get("checker") != "final_acceptance/v1"
+            or value.get("artifact_status") not in ranks
+            or value.get("target_status") not in ranks
+            or type(value.get("target_met")) is not bool
+            or value["target_met"] != (
+                ranks[value["artifact_status"]] >= ranks[value["target_status"]])):
+        raise BenchmarkEvaluationError("Final acceptance is malformed or changed")
+    return value
+
+
+def _visible_usage(ledger: dict) -> tuple[int, int]:
+    calls = tokens = 0
+    for row in ledger["rows"]:
+        if row.get("kind") not in {"llm_chat", "llm_embeddings", "image_generation"}:
+            continue
+        if type(row.get("calls")) is int:
+            calls += row["calls"]
+        if type(row.get("tokens")) is int:
+            tokens += row["tokens"]
+    return calls, tokens
+
+
+def _validate_receipt(path: Path, digest: object, *, suite: dict,
+                      case: dict, visible_calls: int, visible_tokens: int) -> dict:
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise BenchmarkEvaluationError("Runner receipt digest is malformed")
+    receipt = _load(path, "Runner receipt")
+    fields = {"schema_version", "recorder", "suite_version", "case_id",
+              "input_sha256", "budget", "started_at", "finished_at",
+              "wall_seconds", "model_calls", "total_tokens"}
+    if (set(receipt) != fields or file_hash(path) != digest
+            or type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1
+            or receipt["recorder"] != "arc-benchmark-runner/v1"
+            or receipt["suite_version"] != suite["version"]
+            or receipt["case_id"] != case["case_id"]
+            or receipt["input_sha256"] != case["input_sha256"]
+            or receipt["budget"] != suite["plan"]["budget"]):
+        raise BenchmarkEvaluationError("Runner receipt identity is malformed or changed")
+    started, finished, wall = (receipt[name] for name in
+                               ("started_at", "finished_at", "wall_seconds"))
+    if (any(type(value) not in {int, float} or not math.isfinite(value)
+            for value in (started, finished, wall))
+            or started < 0 or finished < started or wall < 0
+            or not math.isclose(wall, finished - started, rel_tol=0, abs_tol=1e-6)
+            or type(receipt["model_calls"]) is not int or receipt["model_calls"] < visible_calls
+            or type(receipt["total_tokens"]) is not int or receipt["total_tokens"] < visible_tokens):
+        raise BenchmarkEvaluationError("Runner receipt usage is malformed or undercounts evidence")
+    return receipt
+
+
+def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[str, dict]:
+    if (set(manifest) != {"schema_version", "suite_version", "cases"}
+            or type(manifest.get("schema_version")) is not int
+            or manifest["schema_version"] != 1
+            or manifest.get("suite_version") != suite["version"]
+            or not isinstance(manifest.get("cases"), list)):
+        raise BenchmarkEvaluationError("Benchmark result manifest is malformed")
+    declared = {case["case_id"]: case for case in suite["plan"]["cases"]}
+    results = {}
+    seen_runs: set[Path] = set()
+    fields = {"case_id", "run_dir", "receipt_sha256", "acceptance_sha256",
+              "resource_ledger_sha256"}
+    for item in manifest["cases"]:
+        if (not isinstance(item, dict) or set(item) != fields
+                or item.get("case_id") not in declared or item["case_id"] in results):
+            raise BenchmarkEvaluationError("Benchmark result case is malformed")
+        run = _safe_run(results_root, item["run_dir"])
+        if run in seen_runs:
+            raise BenchmarkEvaluationError("Benchmark run directory is reused across cases")
+        seen_runs.add(run)
+        resource_path = run / "resource_ledger.json"
+        if (not isinstance(item["resource_ledger_sha256"], str)
+                or _SHA256.fullmatch(item["resource_ledger_sha256"]) is None
+                or not resource_path.is_file()
+                or file_hash(resource_path) != item["resource_ledger_sha256"]):
+            raise BenchmarkEvaluationError("Resource ledger is missing or changed")
+        ledger = _load(resource_path, "Resource ledger")
+        try:
+            validate_resource_ledger(run, ledger)
+        except (ResourceLedgerError, OSError, ValueError) as exc:
+            raise BenchmarkEvaluationError(
+                f"Resource ledger failed portable validation: {type(exc).__name__}") from exc
+        visible_calls, visible_tokens = _visible_usage(ledger)
+        acceptance = _validate_acceptance(
+            run / "final_acceptance.json", item["acceptance_sha256"])
+        receipt = _validate_receipt(
+            run / "benchmark_case_receipt.json", item["receipt_sha256"],
+            suite=suite, case=declared[item["case_id"]],
+            visible_calls=visible_calls, visible_tokens=visible_tokens)
+        results[item["case_id"]] = {
+            "manifest": item, "acceptance": acceptance, "receipt": receipt,
+            "visible_calls": visible_calls, "visible_tokens": visible_tokens,
+        }
+    if set(results) != set(declared):
+        raise BenchmarkEvaluationError("Result manifest must cover every suite case exactly")
+    return results
+
+
+def _validate_assessment(value: dict, suite: dict, results: dict[str, dict]) -> dict[str, dict]:
+    if (set(value) != {"schema_version", "suite_version", "assessor_id", "blinded", "cases"}
+            or type(value.get("schema_version")) is not int or value["schema_version"] != 1
+            or value.get("suite_version") != suite["version"]
+            or not isinstance(value.get("assessor_id"), str)
+            or _SAFE_ID.fullmatch(value["assessor_id"]) is None
+            or value.get("blinded") is not True or not isinstance(value.get("cases"), list)):
+        raise BenchmarkEvaluationError("Private assessment is malformed or not blinded")
+    assessments = {}
+    fields = {"case_id", "acceptance_sha256", "observed_disposition",
+              "critical_errors", "revision_minutes", "revision_edits", "rationale"}
+    for row in value["cases"]:
+        if (not isinstance(row, dict) or set(row) != fields
+                or row.get("case_id") not in results or row["case_id"] in assessments
+                or row.get("acceptance_sha256") != results[row["case_id"]]["manifest"]["acceptance_sha256"]
+                or row.get("observed_disposition") not in _DISPOSITIONS
+                or type(row.get("critical_errors")) is not int
+                or not 0 <= row["critical_errors"] <= 1000
+                or type(row.get("revision_minutes")) not in {int, float}
+                or not math.isfinite(row["revision_minutes"])
+                or not 0 <= row["revision_minutes"] <= 100_000
+                or type(row.get("revision_edits")) is not int
+                or not 0 <= row["revision_edits"] <= 1_000_000
+                or not isinstance(row.get("rationale"), str)
+                or not 0 < len(row["rationale"]) <= 2000):
+            raise BenchmarkEvaluationError("Private assessment case is malformed")
+        assessments[row["case_id"]] = row
+    if set(assessments) != set(results):
+        raise BenchmarkEvaluationError("Private assessment must cover every result exactly")
+    return assessments
+
+
+def _aggregate(rows: list[dict]) -> dict:
+    count = len(rows)
+    reject = [row for row in rows if row["expected_disposition"] == "reject"]
+    accept = [row for row in rows if row["expected_disposition"] == "accept"]
+    negative = [row for row in rows if row["expected_disposition"] == "honest_negative"]
+    return {
+        "cases": count,
+        "correct_dispositions": sum(row["correct"] for row in rows),
+        "disposition_accuracy": (sum(row["correct"] for row in rows) / count if count else None),
+        "error_acceptances": sum(row["error_acceptance"] for row in rows),
+        "reject_cases": len(reject),
+        "error_acceptance_rate": (sum(row["error_acceptance"] for row in reject) / len(reject)
+                                  if reject else None),
+        "accept_cases": len(accept),
+        "false_rejections": sum(row["false_rejection"] for row in accept),
+        "false_rejection_rate": (sum(row["false_rejection"] for row in accept) / len(accept)
+                                 if accept else None),
+        "honest_negative_cases": len(negative),
+        "honest_negative_accuracy": (sum(row["correct"] for row in negative) / len(negative)
+                                     if negative else None),
+        "critical_errors": sum(row["critical_errors"] for row in rows),
+        "mean_revision_minutes": (sum(row["revision_minutes"] for row in rows) / count
+                                  if count else None),
+        "mean_revision_edits": (sum(row["revision_edits"] for row in rows) / count
+                                if count else None),
+        "budget_exceeded": sum(row["budget_status"] == "exceeded" for row in rows),
+    }
+
+
+def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
+                               plan_path: Path, gold_path: Path,
+                               results_root: Path, result_manifest_path: Path,
+                               assessment_path: Path) -> dict:
+    """Build a scored report from complete runs and a bound private assessment."""
+    public_root = Path(public_root).resolve()
+    plan_path = Path(plan_path).resolve()
+    gold_path = Path(gold_path).resolve()
+    results_root = Path(results_root).resolve()
+    result_manifest_path = Path(result_manifest_path).resolve()
+    assessment_path = Path(assessment_path).resolve()
+    if not result_manifest_path.is_relative_to(results_root):
+        raise BenchmarkEvaluationError("Result manifest must be inside the results root")
+    if assessment_path.is_relative_to(public_root):
+        raise BenchmarkEvaluationError("Private assessment must be outside the public root")
+    try:
+        verify_benchmark_suite(suite_report, public_root, plan_path, gold_path)
+    except BenchmarkSuiteError as exc:
+        raise BenchmarkEvaluationError(str(exc)) from exc
+    gold_document, gold_sha256 = _load_stable(gold_path, "Private gold")
+    if gold_sha256 != suite_report["private_gold_sha256"]:
+        raise BenchmarkEvaluationError("Private gold differs from the frozen suite")
+    gold = {row["case_id"]: row for row in gold_document["cases"]}
+    manifest_document, manifest_sha256 = _load_stable(
+        result_manifest_path, "Result manifest")
+    results = _validate_results(
+        suite_report, results_root, manifest_document)
+    assessment_document, assessment_sha256 = _load_stable(
+        assessment_path, "Private assessment")
+    assessments = _validate_assessment(assessment_document, suite_report, results)
+    cases_by_id = {case["case_id"]: case for case in suite_report["plan"]["cases"]}
+    budget = suite_report["plan"]["budget"]
+    rows = []
+    for case_id in sorted(results):
+        case, result, assessment = cases_by_id[case_id], results[case_id], assessments[case_id]
+        expected = gold[case_id]["expected_disposition"]
+        observed = assessment["observed_disposition"]
+        receipt = result["receipt"]
+        exceeded = (receipt["wall_seconds"] > budget["wall_seconds"]
+                    or receipt["model_calls"] > budget["model_calls"]
+                    or receipt["total_tokens"] > budget["total_tokens"])
+        rows.append({
+            "case_id": case_id, "task_family": case["task_family"],
+            "scenario": case["scenario"], "repeat_index": case["repeat_index"],
+            "expected_disposition": expected, "observed_disposition": observed,
+            "correct": observed == expected,
+            "error_acceptance": expected == "reject" and observed == "accept",
+            "false_rejection": expected == "accept" and observed != "accept",
+            "critical_errors": assessment["critical_errors"],
+            "revision_minutes": assessment["revision_minutes"],
+            "revision_edits": assessment["revision_edits"],
+            "artifact_status": result["acceptance"]["artifact_status"],
+            "wall_seconds": receipt["wall_seconds"],
+            "model_calls": receipt["model_calls"], "total_tokens": receipt["total_tokens"],
+            "visible_ledger_calls": result["visible_calls"],
+            "visible_ledger_tokens": result["visible_tokens"],
+            "budget_status": "exceeded" if exceeded else "within",
+            "assessment_rationale": assessment["rationale"],
+            "receipt_sha256": result["manifest"]["receipt_sha256"],
+            "acceptance_sha256": result["manifest"]["acceptance_sha256"],
+            "resource_ledger_sha256": result["manifest"]["resource_ledger_sha256"],
+        })
+    by_family: dict[str, list] = defaultdict(list)
+    by_scenario: dict[str, list] = defaultdict(list)
+    for row in rows:
+        by_family[row["task_family"]].append(row)
+        by_scenario[row["scenario"]].append(row)
+    report = {
+        "schema_version": 1, "checker": "arc-benchmark-evaluation/v1",
+        "suite_version": suite_report["version"],
+        "assessor": {"id": assessment_document["assessor_id"],
+                     "blinded": True, "assessment_sha256": assessment_sha256},
+        "result_manifest_sha256": manifest_sha256,
+        "private_gold_sha256": gold_sha256,
+        "cases": rows,
+        "overall": _aggregate(rows),
+        "by_task_family": {name: _aggregate(group) for name, group in sorted(by_family.items())},
+        "by_stress_scenario": {name: _aggregate(group)
+                               for name, group in sorted(by_scenario.items())},
+        "limitations": [
+            "Runner and assessor identities are self-declared; no remote attestation is provided.",
+            "Resource-ledger counts are an audited lower bound; runner receipt supplies enforced totals.",
+            "Final acceptance is schema- and digest-bound here; its source bundle must retain normal portable verification.",
+            "Revision minutes and edits are blinded assessor records, not independently timed UI events.",
+            "Finite-suite rates do not guarantee arbitrary-paper quality.",
+        ],
+    }
+    report["version"] = content_hash(report)
+    return report
+
+
+def verify_benchmark_evaluation(report: dict, **inputs) -> dict:
+    expected = build_benchmark_evaluation(**inputs)
+    if not isinstance(report, dict) or report != expected:
+        raise BenchmarkEvaluationError("Benchmark evaluation differs from frozen evidence")
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Evaluate completed ARC benchmark runs")
+    parser.add_argument("--suite-report", type=Path, required=True)
+    parser.add_argument("--public-root", type=Path, required=True)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--private-gold", type=Path, required=True)
+    parser.add_argument("--results-root", type=Path, required=True)
+    parser.add_argument("--result-manifest", type=Path, required=True)
+    parser.add_argument("--private-assessment", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    suite = _load(args.suite_report, "Suite report")
+    report = build_benchmark_evaluation(
+        suite_report=suite, public_root=args.public_root, plan_path=args.plan,
+        gold_path=args.private_gold, results_root=args.results_root,
+        result_manifest_path=args.result_manifest,
+        assessment_path=args.private_assessment)
+    output = args.output.resolve()
+    protected = {path.resolve() for path in (
+        args.suite_report, args.plan, args.private_gold,
+        args.result_manifest, args.private_assessment)}
+    if output in protected:
+        raise BenchmarkEvaluationError("Evaluation output cannot overwrite frozen input evidence")
+    _write(output, report)
+    print(json.dumps({"cases": report["overall"]["cases"],
+                      "disposition_accuracy": report["overall"]["disposition_accuracy"]},
+                     sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
