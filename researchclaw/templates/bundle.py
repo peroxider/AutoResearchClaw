@@ -37,6 +37,7 @@ DEFAULT = {
     "max_figures": None, "max_tables": None,
     "required_sections": [], "banned_sections": [], "max_references": None,
     "min_page_ink_percent": None, "max_sparse_pages": None,
+    "max_float_reference_page_distance": None,
     "columns": None,
 }
 GENERIC = r"""\documentclass[11pt]{article}
@@ -128,6 +129,9 @@ def _policy(data: dict) -> dict:
         raise TemplateError("max_sparse_pages must be a nonnegative integer or null")
     if (result["min_page_ink_percent"] is None) != (result["max_sparse_pages"] is None):
         raise TemplateError("min_page_ink_percent and max_sparse_pages must be declared together")
+    distance = result["max_float_reference_page_distance"]
+    if distance is not None and (type(distance) is not int or distance < 0):
+        raise TemplateError("max_float_reference_page_distance must be a nonnegative integer or null")
     roles = result["appendix_roles"]
     if (not isinstance(roles, list) or any(not isinstance(r, str) or r not in ROLE_NAMES for r in roles)
             or len(set(roles)) != len(roles)):
@@ -353,6 +357,7 @@ def inspect_constraints(root: Path) -> dict:
     banned_present: list[str] | None = None
     page_ink_percent: list[float] | None = None
     sparse_pages: list[int] | None = None
+    float_reference_distances: list[dict] | None = None
     pdf = root / "paper.pdf"
     if pdf.is_file():
         try:
@@ -380,7 +385,7 @@ def inspect_constraints(root: Path) -> dict:
                                     if value < policy["min_page_ink_percent"]]
                     if len(sparse_pages) > policy["max_sparse_pages"]:
                         issues.append("max_sparse_pages_exceeded")
-        except (ImportError, OSError, ValueError, RuntimeError):
+        except (ImportError, MemoryError, OSError, OverflowError, ValueError, RuntimeError):
             issues.append("pdf_page_count_unavailable")
             if policy["min_page_ink_percent"] is not None:
                 issues.append("pdf_sparse_page_analysis_unavailable")
@@ -437,6 +442,58 @@ def inspect_constraints(root: Path) -> dict:
         source = re.sub(r"(?m)(?<!\\)%.*$", "", source)
         figures = len(re.findall(r"\\begin\{figure\*?\}", source))
         tables = len(re.findall(r"\\begin\{(?:table\*?|longtable)\}", source))
+        if policy["max_float_reference_page_distance"] is not None:
+            aux = root / "paper.aux"
+            try:
+                aux_source = aux.read_text(encoding="utf-8", errors="replace")
+                matches = re.findall(
+                    r"\\newlabel\{([^{}]+)\}\{\{[^{}]*\}\{([0-9]+)\}", aux_source)
+                if len({label for label, _ in matches}) != len(matches):
+                    raise ValueError("duplicate aux labels")
+                pages_by_label = {label: int(page) for label, page in matches}
+                float_bodies = re.findall(
+                    r"\\begin\{(figure\*?|table\*?|longtable)\}(.*?)\\end\{\1\}",
+                    source, flags=re.DOTALL)
+                float_labels = []
+                for _, body in float_bodies:
+                    labels = re.findall(
+                        r"\\label\{((?:fig:|tab:|arc-results-)[^{}]+)\}", body)
+                    if len(labels) != 1:
+                        raise ValueError("float needs exactly one supported label")
+                    float_labels.extend(labels)
+                if len(float_bodies) != figures + tables:
+                    raise ValueError("float environment analysis incomplete")
+                if len(set(float_labels)) != len(float_labels):
+                    raise ValueError("duplicate float labels")
+                references: dict[str, list[str]] = {}
+                for target, marker_target in re.findall(
+                        r"\\ref\{([^{}]+)\}\\label\{arc-ref:([^{}]+)\}", source):
+                    if target != marker_target:
+                        raise ValueError("reference marker target mismatch")
+                    references.setdefault(target, []).append("arc-ref:" + marker_target)
+                float_reference_distances = []
+                for label in float_labels:
+                    if label not in pages_by_label or not references.get(label):
+                        raise ValueError("float page or reference marker unavailable")
+                    reference_pages = [pages_by_label[marker] for marker in references[label]
+                                       if marker in pages_by_label]
+                    if len(reference_pages) != len(references[label]):
+                        raise ValueError("reference marker page unavailable")
+                    float_page = pages_by_label[label]
+                    if pages is not None and (not 1 <= float_page <= pages
+                                              or any(not 1 <= page <= pages for page in reference_pages)):
+                        raise ValueError("aux page outside final PDF")
+                    distance = min(abs(float_page - page) for page in reference_pages)
+                    float_reference_distances.append({
+                        "label": label, "float_page": float_page,
+                        "reference_pages": reference_pages, "min_page_distance": distance})
+                if any(row["min_page_distance"] > policy["max_float_reference_page_distance"]
+                       for row in float_reference_distances):
+                    issues.append("max_float_reference_page_distance_exceeded")
+            except (OSError, ValueError):
+                issues.append("float_reference_analysis_unavailable")
+    elif policy["max_float_reference_page_distance"] is not None:
+        issues.append("float_reference_analysis_unavailable")
     for field, actual in (("max_title_characters", title_characters),
                           ("max_abstract_characters", abstract_characters),
                           ("max_figures", figures), ("max_tables", tables),
@@ -450,5 +507,6 @@ def inspect_constraints(root: Path) -> dict:
             "required_sections_missing": required_missing,
             "banned_sections_present": banned_present,
             "page_ink_percent": page_ink_percent, "sparse_pages": sparse_pages,
+            "float_reference_distances": float_reference_distances,
             "status": "passed" if not issues else "failed", "issues": issues,
-            "scope": "declared structural and raster-density constraints; content anonymity and visual quality require full review"}
+            "scope": "declared structural, raster-density, and compiled float-distance constraints; content anonymity and visual quality require full review"}

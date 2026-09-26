@@ -583,7 +583,7 @@ def verify_assets(root: Path) -> dict:
 
 def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
     """Return paired fragments from the same checked specification."""
-    from researchclaw.pipeline.manuscript import _md, _tex
+    from researchclaw.pipeline.manuscript import _float_reference, _md, _tex
     spec = verify_assets(root)["spec"]
     fragments = {}
     md, tex = "", ""
@@ -625,7 +625,8 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
                          else "True/false arrows are declared decisions; dashed edges are loops. ")
             caption = (f"Declared {diagram['kind']} of {diagram['method_id']}.{page} " + semantics
                        + "Continuation annotations preserve cross-page edges. Node colors distinguish training and inference. "
-                         "Code equivalence and termination are unverified.")
+                          "Code equivalence and termination are unverified.")
+            tex += _float_reference("Figure", "fig:" + diagram["id"]) + " presents the corresponding checked artifact.\n\n"
             md += f"![{_md(caption)}](publication_assets/{diagram['id']}.png)\n\n"
             tex += ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
                     + diagram["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + diagram["id"] + "}\n\\end{figure}\n")
@@ -637,6 +638,7 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
             caption = (f"Frozen split for {diagram['dataset']}. Counts and split strategy come from the verified "
                        "ResearchContract. Test labels remain in a host-only evidence artifact; this file separation "
                        "does not establish operating-system isolation.")
+            tex += _float_reference("Figure", "fig:" + diagram["id"]) + " presents the corresponding checked artifact.\n\n"
             md += f"![{_md(caption)}](publication_assets/{diagram['id']}.png)\n\n"
             tex += ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
                     + diagram["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + diagram["id"] + "}\n\\end{figure}\n")
@@ -647,7 +649,9 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
                    "Arrows show declared inputs, comparisons and host evaluation flow; they do not establish "
                    "causality, implementation fidelity or scientific validity.")
         md = f"![{_md(caption)}](publication_assets/{overview['id']}.png)\n\n"
-        tex = ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
+        tex = (_float_reference("Figure", "fig:" + overview["id"])
+               + " presents the corresponding checked artifact.\n\n"
+               + "\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
                + overview["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + overview["id"] + "}\n\\end{figure}\n")
         fragments["introduction"] = md, tex
     md, tex = "", ""
@@ -700,6 +704,7 @@ def render_asset_sections(root: Path) -> dict[str, tuple[str, str]]:
             caption = (f"{figure['question']} on {figure['dataset']}: {figure['candidate']} versus {figure['baseline']}, "
                        f"metric {figure['metric']} in {figure['unit']}. Each point is a training seed; "
                        "the difference is candidate minus baseline. No population uncertainty or significance is implied.")
+        tex += _float_reference("Figure", "fig:" + figure["id"]) + " presents the corresponding checked artifact.\n\n"
         md += f"![{_md(caption)}](publication_assets/{figure['id']}.png)\n\n"
         tex += ("\\begin{figure}[!htbp]\n\\centering\n\\includegraphics[width=\\linewidth,height=0.8\\textheight,keepaspectratio]{publication_assets/"
                 + figure["id"] + ".pdf}\n\\caption{" + _tex(caption) + "}\\label{fig:" + figure["id"] + "}\n\\end{figure}\n")

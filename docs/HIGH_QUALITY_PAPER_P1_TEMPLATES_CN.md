@@ -29,6 +29,9 @@ export:
   "max_abstract_characters": 2000,
   "max_figures": 8,
   "max_tables": 6,
+  "min_page_ink_percent": 5,
+  "max_sparse_pages": 1,
+  "max_float_reference_page_distance": 1,
   "appendix_roles": ["theory", "results"],
   "highlights_required": true
 }
@@ -37,6 +40,10 @@ export:
 引擎支持 `pdflatex` 和 `xelatex`；书目后端支持 `bibtex` 和显式 `biber`，需要相应可执行文件已安装。单/双栏可由明确的文档类选项推断，样式包内部决定栏数时应显式声明。页数、标题/摘要字符数和图表数量上限为正整数或 null；匿名和 highlights 字段必须为布尔值。正文页数指附录前的物理 PDF 页，包含出现在该区域的参考文献，不自动推断某个期刊对字数、参考文献和附录的特殊豁免。
 
 标题字符上限在生成 TeX 框架前检查；摘要字符数从权威 ManuscriptIR 的 abstract blocks 重算；图和表的数量从最终 `paper.tex` 中的 `figure/figure*`、`table/table*/longtable` 环境重算，普通注释中的伪环境不计数。这些实际值进入 `template_constraints.json`，最终验收和 submission.zip 准备都会复核。字符数是 Unicode code point 数，不等同于任意期刊的自然语言词数；需要词数、彩页、补充材料或参考文献豁免等规则时仍须增加对应的显式检查器。
+
+`min_page_ink_percent` 与 `max_sparse_pages` 是必须成对声明的可选规则：前者是正整数百分比且不超过 100，后者是允许低于该阈值的物理页数。检查器把最终 PDF 每页以灰度渲染，并把每页像素数限制在 100 万以内；灰度值低于 245 的像素计作墨迹，低于声明阈值的页以从 1 开始的页码写入 `sparse_pages`，每页覆盖率写入 `page_ink_percent`。声明规则后，PDF 缺失、不可读或光栅分析失败都会失败关闭；稀疏页数超过预算则产生 `max_sparse_pages_exceeded`。
+
+`max_float_reference_page_distance` 是可选的非负整数，限制系统生成图表与其正文引用之间的最近编译页距。渲染器在每个系统生成图像前写入可见的 `Figure~\ref{...}` 和确定性引用锚点，结果表的既有引用也带同类锚点。检查器逐个解析 `figure`、`figure*`、`table`、`table*` 与 `longtable` 环境，要求每个环境恰有一个受支持的 `fig:`、`tab:` 或 `arc-results-` 标签，再从最终编译的 `paper.aux` 取得浮动体页和引用锚点页；页码必须为十进制整数且落在最终 PDF 页数内。每项结果写入 `float_reference_distances`。缺 `.aux`、缺标签、缺引用、重复标签、锚点不匹配或页码越界均产生 `float_reference_analysis_unavailable`，最近页距超过声明值则产生 `max_float_reference_page_distance_exceeded`。
 
 这些规则来自用户模板包的声明，不把默认值当成已经查证的期刊政策。支持的附录角色是 methods、theory、experiments、results、related_work、discussion；abstract、introduction、conclusion 保留在正文。
 
@@ -78,6 +85,6 @@ export:
 
 ## 验证边界
 
-测试使用真实生成的多页 PDF 检查物理页数、附录定位、重复标题及作者元数据；另覆盖导入、版本失效、特殊入口、双栏资源、数值跨度、highlights 和编译命令。它们验证解析和门禁，不等于真实期刊样式的版面验收。
+测试使用真实生成的多页 PDF 检查物理页数、附录定位、重复标题及作者元数据；三页合成 PDF 还覆盖了两页空白时拒绝、仅一页空白时通过以及从最终像素重算覆盖率。四页合成 PDF 与编译锚点覆盖缺 `.aux`、无标签、跨两页拒绝和相邻页通过；稿件回归同时核对系统生成图像和结果表引用锚点。另覆盖导入、版本失效、特殊入口、双栏资源、数值跨度、highlights 和编译命令。这些规则能发现大面积留白、近空页和受支持图表的编译页距，但不判断版式审美、图文语义、引用内容是否充分，也不理解任意第三方 TeX 宏；它们不等于真实期刊样式或生产论文的完整内容与视觉验收。
 
-第十轮已用临时 MiKTeX Portable 运行 pdflatex/xelatex × 单/双栏真实整稿工程样例，并用 Poppler 渲染全部页面检查。第三十五轮增加 Biber 路由、统一资源绑定和模板资源校验；当前主机未安装可调用的 Biber/TeX，因此只用可控编译替身验证后端选择、禁止 BibTeX 替换和 `.bbl` 必需产物，尚未完成真实 Biber 整稿编译。通用 DiagramSpec 与矢量后备已接入；图像模型评审路线、生产论文的完整 PDF 内容/视觉审查、专业图表和期刊特有格式要求仍是持续目标的一部分。测试样稿及 fixture 评审不等于科学有效性证明。
+第十轮已用临时 MiKTeX Portable 运行 pdflatex/xelatex × 单/双栏真实整稿工程样例，并用 Poppler 渲染全部页面检查。第三十五轮增加 Biber 路由、统一资源绑定和模板资源校验；第五十轮又在具备工具链的机器上完成 pdflatex/xelatex × 单/双栏 × BibTeX/Biber 的真实整稿编译与归档重建。本轮主机未安装可调用的 TeX/Biber，未新增真实编译证据。通用 DiagramSpec 与矢量后备已接入；图像模型评审路线、生产论文的完整 PDF 内容/视觉审查、专业图表和期刊特有格式要求仍是持续目标的一部分。测试样稿及 fixture 评审不等于科学有效性证明。

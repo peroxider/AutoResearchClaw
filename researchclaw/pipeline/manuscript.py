@@ -501,6 +501,11 @@ def _result_tables(records: list[dict], *, columns: int, first_table: int = 1) -
     return md, tex, claims, table_number
 
 
+def _float_reference(kind: str, label: str) -> str:
+    """Render a visible reference plus a deterministic page anchor for layout checks."""
+    return f"{kind}~\\ref{{{label}}}\\label{{arc-ref:{label}}}"
+
+
 def render_manuscript(root: Path, report: dict) -> tuple[dict, dict]:
     catalog = validate_manuscript(root, report)
     from researchclaw.pipeline.publication_assets import render_asset_sections
@@ -562,7 +567,8 @@ def render_manuscript(root: Path, report: dict) -> tuple[dict, dict]:
                     if claims:
                         md += "Numerical results: " + ", ".join(f"Table R{i}" for i in range(first_table, table_number)) + ".\n\n"
                         tex += "Numerical results: " + ", ".join(
-                            f"Table~\\ref{{arc-results-{i}}}" for i in range(first_table, table_number)) + ".\n\n"
+                            _float_reference("Table", f"arc-results-{i}")
+                            for i in range(first_table, table_number)) + ".\n\n"
                     for claim in claims:
                         for name, offset in (("paper_final.md", len(md)), ("paper.tex", len(tex))):
                             claim["spans"][name] = {bound: value + offset for bound, value in claim["spans"][name].items()}

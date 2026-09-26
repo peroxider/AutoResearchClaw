@@ -97,6 +97,8 @@ def test_frozen_and_materialized_style_changes_are_both_detected(tmp_path):
     {"min_page_ink_percent": 5}, {"max_sparse_pages": 1},
     {"min_page_ink_percent": 5, "max_sparse_pages": -1},
     {"min_page_ink_percent": 5, "max_sparse_pages": True},
+    {"max_float_reference_page_distance": -1},
+    {"max_float_reference_page_distance": True},
     {"required_sections": ["nonsense"]}, {"required_sections": ["methods", "methods"]},
     {"banned_sections": "methods"}, {"required_sections": [True]},
     {"appendix_roles": ["abstract"]}, {"anonymous": "yes"}, {"unknown_rule": True},
@@ -214,6 +216,8 @@ def test_appendix_and_highlights_preserve_numeric_spans_in_both_formats(study):
     assert texts["paper_final.md"].index("# Appendix") > texts["paper_final.md"].index("## Conclusion")
     assert r"\begin{table*}" in texts["paper.tex"] and r"\begin{longtable}" not in texts["paper.tex"]
     assert r"\begin{figure*}" in texts["paper.tex"]
+    assert r"\ref{fig:" in texts["paper.tex"] and r"\label{arc-ref:fig:" in texts["paper.tex"]
+    assert r"\ref{arc-results-1}\label{arc-ref:arc-results-1}" in texts["paper.tex"]
     assert "zero difference" in (root / "highlights.md").read_text(encoding="utf-8")
     for claim in bindings["numeric"]:
         for name, span in claim["spans"].items():
@@ -375,6 +379,42 @@ def test_declared_sparse_page_budget_is_recomputed_from_final_pdf_pixels(tmp_pat
     passed = inspect_constraints(root)
     assert passed["status"] == "passed"
     assert passed["sparse_pages"] == [2]
+
+
+def test_declared_float_reference_distance_uses_compiled_page_anchors(tmp_path):
+    import fitz
+    root = tmp_path / "run"
+    freeze_template(root, bundle(tmp_path, max_float_reference_page_distance=1))
+    (root / "paper.tex").write_text(
+        r"See Figure~\ref{fig:one}\label{arc-ref:fig:one}."
+        r"\begin{figure}\caption{One}\label{fig:one}\end{figure}", encoding="utf-8")
+    with fitz.open() as pdf:
+        for _ in range(4):
+            pdf.new_page()
+        pdf.save(root / "paper.pdf")
+
+    assert "float_reference_analysis_unavailable" in inspect_constraints(root)["issues"]
+    (root / "paper.tex").write_text(
+        r"See a figure.\begin{figure}\caption{Unlabelled}\end{figure}", encoding="utf-8")
+    assert "float_reference_analysis_unavailable" in inspect_constraints(root)["issues"]
+    (root / "paper.tex").write_text(
+        r"See Figure~\ref{fig:one}\label{arc-ref:fig:one}."
+        r"\begin{figure}\caption{One}\label{fig:one}\end{figure}", encoding="utf-8")
+    (root / "paper.aux").write_text(
+        r"\newlabel{arc-ref:fig:one}{{1}{1}}" "\n"
+        r"\newlabel{fig:one}{{1}{3}}" "\n", encoding="utf-8")
+    failed = inspect_constraints(root)
+    assert failed["float_reference_distances"] == [{
+        "label": "fig:one", "float_page": 3,
+        "reference_pages": [1], "min_page_distance": 2}]
+    assert "max_float_reference_page_distance_exceeded" in failed["issues"]
+
+    (root / "paper.aux").write_text(
+        r"\newlabel{arc-ref:fig:one}{{1}{2}}" "\n"
+        r"\newlabel{fig:one}{{1}{3}}" "\n", encoding="utf-8")
+    passed = inspect_constraints(root)
+    assert passed["status"] == "passed"
+    assert passed["float_reference_distances"][0]["min_page_distance"] == 1
 
 
 def test_export_refresh_detects_external_template_change(study):
