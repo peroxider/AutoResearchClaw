@@ -7,7 +7,7 @@ import pytest
 
 from researchclaw.pipeline.benchmark_suite import (
     STRESS_SCENARIOS, TASK_FAMILIES, BenchmarkSuiteError,
-    freeze_benchmark_suite, verify_benchmark_suite,
+    freeze_benchmark_suite, verify_benchmark_suite, verify_public_benchmark_suite,
 )
 from researchclaw.pipeline.evidence_store import file_hash
 
@@ -130,3 +130,43 @@ def test_report_is_recomputed_after_self_consistent_tamper(tmp_path):
         verify_benchmark_suite(changed, public, plan_path, gold_path)
     with pytest.raises(BenchmarkSuiteError, match="overwrite"):
         freeze_benchmark_suite(public, plan_path, gold_path, plan_path)
+
+
+def test_public_runner_identity_is_frozen_without_exposing_private_gold(tmp_path):
+    public, plan_path, gold_path, plan = suite_fixture(tmp_path)
+    adapter = public / "runner_adapter.py"
+    adapter.write_text("print('fixture adapter')\n", encoding="utf-8")
+    plan["runner"] = {
+        "adapter": "runner_adapter.py", "adapter_sha256": file_hash(adapter),
+        "environment_allowlist": ["OPENAI_API_KEY"],
+    }
+    write_json(plan_path, plan)
+    report = freeze_benchmark_suite(public, plan_path, gold_path)
+    assert verify_public_benchmark_suite(report, public, plan_path) == report
+    gold_path.write_text("changed after public freeze", encoding="utf-8")
+    # Public runner verification never reads or locates private gold.
+    assert verify_public_benchmark_suite(report, public, plan_path) == report
+    with pytest.raises(BenchmarkSuiteError):
+        verify_benchmark_suite(report, public, plan_path, gold_path)
+
+
+@pytest.mark.parametrize("runner", [
+    {"adapter": "missing.py", "adapter_sha256": "0" * 64,
+     "environment_allowlist": []},
+    {"adapter": "runner_adapter.py", "adapter_sha256": "0" * 64,
+     "environment_allowlist": ["bad-name"]},
+    {"adapter": "runner_adapter.py", "adapter_sha256": "0" * 64,
+     "environment_allowlist": ["TOKEN", "TOKEN"]},
+    {"adapter": "runner_adapter.py", "adapter_sha256": "0" * 64,
+     "environment_allowlist": ["ARC_BENCHMARK_CASE"]},
+])
+def test_runner_identity_and_environment_allowlist_fail_closed(tmp_path, runner):
+    public, plan_path, gold_path, plan = suite_fixture(tmp_path)
+    adapter = public / "runner_adapter.py"
+    adapter.write_text("print('fixture')", encoding="utf-8")
+    runner["adapter_sha256"] = (file_hash(adapter)
+                                if runner["adapter"] == "runner_adapter.py" else "0" * 64)
+    plan["runner"] = runner
+    write_json(plan_path, plan)
+    with pytest.raises(BenchmarkSuiteError):
+        freeze_benchmark_suite(public, plan_path, gold_path)

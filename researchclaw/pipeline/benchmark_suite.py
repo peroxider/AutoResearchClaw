@@ -21,10 +21,19 @@ STRESS_SCENARIOS = (
 )
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_RUNNER_RESERVED_ENV = {
+    "PYTHONIOENCODING", "ARC_BENCHMARK_CASE", "ARC_BENCHMARK_INPUT",
+    "ARC_BENCHMARK_RUN_DIR", "ARC_BENCHMARK_BUDGET",
+}
 _SCOPE = (
     "coverage and blind-input fixture for fixed-budget model evaluation; "
     "no model outcomes are claimed"
 )
+_LIMITATIONS = [
+    "Private-gold separation is a filesystem layout contract, not access-control proof.",
+    "Ready means coverage-complete inputs; it does not mean any model was evaluated.",
+    "Finite benchmark results cannot guarantee arbitrary-paper quality.",
+]
 
 
 class BenchmarkSuiteError(ValueError):
@@ -64,6 +73,23 @@ def _validate_budget(value: object) -> dict:
     return dict(value)
 
 
+def _validate_runner(root: Path, value: object) -> dict:
+    fields = {"adapter", "adapter_sha256", "environment_allowlist"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise BenchmarkSuiteError("Benchmark runner fields are malformed")
+    adapter = _safe_input(root, value["adapter"], value["adapter_sha256"])
+    allowlist = value["environment_allowlist"]
+    if (not isinstance(allowlist, list) or len(allowlist) > 32
+            or any(not isinstance(name, str)
+                   or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) is None
+                   for name in allowlist)
+            or len(set(allowlist)) != len(allowlist)
+            or set(allowlist) & _RUNNER_RESERVED_ENV):
+        raise BenchmarkSuiteError("Benchmark runner environment allowlist is malformed")
+    return {"adapter": adapter, "adapter_sha256": value["adapter_sha256"],
+            "environment_allowlist": allowlist}
+
+
 def _safe_input(root: Path, relative: object, digest: object) -> str:
     if (not isinstance(relative, str) or not relative or "\\" in relative
             or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None):
@@ -77,7 +103,8 @@ def _safe_input(root: Path, relative: object, digest: object) -> str:
 
 
 def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
-    if set(plan) != {"schema_version", "min_repeats", "budget", "cases"}:
+    required = {"schema_version", "min_repeats", "budget", "cases"}
+    if not required <= set(plan) or set(plan) - (required | {"runner"}):
         raise BenchmarkSuiteError("Benchmark plan fields are malformed")
     if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
         raise BenchmarkSuiteError("Unsupported benchmark plan schema")
@@ -122,8 +149,28 @@ def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
         "minimum_repeats": minimum,
         "case_count": len(normalized),
     }
-    return {"schema_version": 1, "min_repeats": minimum,
-            "budget": budget, "cases": normalized}, coverage
+    document = {"schema_version": 1, "min_repeats": minimum,
+                "budget": budget, "cases": normalized}
+    if "runner" in plan:
+        document["runner"] = _validate_runner(root, plan["runner"])
+    return document, coverage
+
+
+def _suite_report(plan: dict, coverage: dict, plan_sha256: str,
+                  private_gold_sha256: str) -> dict:
+    report = {
+        "schema_version": 1,
+        "checker": "arc-benchmark-suite/v1",
+        "status": "ready",
+        "scope": _SCOPE,
+        "plan": plan,
+        "plan_sha256": plan_sha256,
+        "private_gold_sha256": private_gold_sha256,
+        "coverage": coverage,
+        "limitations": list(_LIMITATIONS),
+    }
+    report["version"] = content_hash(report)
+    return report
 
 
 def _validate_gold(gold: dict, case_ids: set[str]) -> dict:
@@ -161,24 +208,9 @@ def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
     plan, coverage = _validate_plan(root, _load(plan_path, "Benchmark plan"))
     gold = _validate_gold(_load(gold_path, "Private gold"),
                           {case["case_id"] for case in plan["cases"]})
-    report = {
-        "schema_version": 1,
-        "checker": "arc-benchmark-suite/v1",
-        "status": "ready",
-        "scope": _SCOPE,
-        "plan": plan,
-        "plan_sha256": file_hash(plan_path),
-        "private_gold_sha256": file_hash(gold_path),
-        "coverage": coverage,
-        "limitations": [
-            "Private-gold separation is a filesystem layout contract, not access-control proof.",
-            "Ready means coverage-complete inputs; it does not mean any model was evaluated.",
-            "Finite benchmark results cannot guarantee arbitrary-paper quality.",
-        ],
-    }
+    report = _suite_report(plan, coverage, file_hash(plan_path), file_hash(gold_path))
     # The validated gold is intentionally not copied into this public artifact.
     _ = gold
-    report["version"] = content_hash(report)
     if output is not None:
         destination = Path(output).resolve()
         if not destination.is_relative_to(root):
@@ -186,9 +218,28 @@ def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
         protected = {plan_path}
         protected.update((root / case["input_bundle"]).resolve()
                          for case in plan["cases"])
+        if "runner" in plan:
+            protected.add((root / plan["runner"]["adapter"]).resolve())
         if destination in protected:
             raise BenchmarkSuiteError("Public suite report cannot overwrite a frozen input")
         _write(destination, report)
+    return report
+
+
+def verify_public_benchmark_suite(report: dict, public_root: Path,
+                                  plan_path: Path) -> dict:
+    """Verify every public field without reading or locating private gold."""
+    root, plan_path = Path(public_root).resolve(), Path(plan_path).resolve()
+    if (not isinstance(report, dict) or not root.is_dir()
+            or not plan_path.is_relative_to(root)
+            or not isinstance(report.get("private_gold_sha256"), str)
+            or _SHA256.fullmatch(report["private_gold_sha256"]) is None):
+        raise BenchmarkSuiteError("Public benchmark suite report is malformed")
+    plan, coverage = _validate_plan(root, _load(plan_path, "Benchmark plan"))
+    expected = _suite_report(
+        plan, coverage, file_hash(plan_path), report["private_gold_sha256"])
+    if report != expected:
+        raise BenchmarkSuiteError("Public benchmark suite differs from frozen inputs")
     return report
 
 

@@ -100,14 +100,20 @@ def _visible_usage(ledger: dict) -> tuple[int, int]:
 
 
 def _validate_receipt(path: Path, digest: object, *, suite: dict,
-                      case: dict, visible_calls: int, visible_tokens: int) -> dict:
+                      case: dict, run: Path,
+                      visible_calls: int, visible_tokens: int) -> dict:
     if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
         raise BenchmarkEvaluationError("Runner receipt digest is malformed")
     receipt = _load(path, "Runner receipt")
-    fields = {"schema_version", "recorder", "suite_version", "case_id",
+    legacy_fields = {"schema_version", "recorder", "suite_version", "case_id",
               "input_sha256", "budget", "started_at", "finished_at",
               "wall_seconds", "model_calls", "total_tokens"}
-    if (set(receipt) != fields or file_hash(path) != digest
+    extended_fields = legacy_fields | {
+        "adapter_sha256", "status", "returncode", "timed_out", "usage_scope",
+        "environment_names", "stdout_sha256", "stderr_sha256"}
+    runner = suite["plan"].get("runner")
+    expected_fields = extended_fields if runner is not None else legacy_fields
+    if (set(receipt) != expected_fields or file_hash(path) != digest
             or type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1
             or receipt["recorder"] != "arc-benchmark-runner/v1"
             or receipt["suite_version"] != suite["version"]
@@ -121,19 +127,60 @@ def _validate_receipt(path: Path, digest: object, *, suite: dict,
             for value in (started, finished, wall))
             or started < 0 or finished < started or wall < 0
             or not math.isclose(wall, finished - started, rel_tol=0, abs_tol=1e-6)
-            or type(receipt["model_calls"]) is not int or receipt["model_calls"] < visible_calls
-            or type(receipt["total_tokens"]) is not int or receipt["total_tokens"] < visible_tokens):
+            or type(receipt["model_calls"]) is not int or receipt["model_calls"] < 0
+            or type(receipt["total_tokens"]) is not int or receipt["total_tokens"] < 0):
+        raise BenchmarkEvaluationError("Runner receipt usage is malformed or undercounts evidence")
+    if runner is None:
+        if (receipt["model_calls"] < visible_calls
+                or receipt["total_tokens"] < visible_tokens):
+            raise BenchmarkEvaluationError("Runner receipt usage is malformed or undercounts evidence")
+        receipt["usage_scope"] = "runner_enforced"
+        return receipt
+    statuses = {"succeeded", "failed", "timed_out"}
+    internal_environment = {"PYTHONIOENCODING", "ARC_BENCHMARK_CASE",
+                            "ARC_BENCHMARK_INPUT", "ARC_BENCHMARK_RUN_DIR",
+                            "ARC_BENCHMARK_BUDGET"}
+    allowed_environment = (set(runner["environment_allowlist"]) | internal_environment
+                           | {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"})
+    names = receipt["environment_names"]
+    status, returncode, timed_out = (
+        receipt["status"], receipt["returncode"], receipt["timed_out"])
+    stdout, stderr = run / "stdout.txt", run / "stderr.txt"
+    if (receipt["adapter_sha256"] != runner["adapter_sha256"]
+            or status not in statuses or type(returncode) is not int
+            or type(timed_out) is not bool
+            or (status == "succeeded") != (returncode == 0 and not timed_out)
+            or (status == "timed_out") != timed_out
+            or receipt["usage_scope"] != "audited_lower_bound"
+            or not isinstance(names, list) or names != sorted(set(names))
+            or any(not isinstance(name, str) or name not in allowed_environment
+                   for name in names)
+            or not stdout.is_file() or not stderr.is_file()
+            or any(not isinstance(receipt[name], str)
+                   or _SHA256.fullmatch(receipt[name]) is None
+                   for name in ("stdout_sha256", "stderr_sha256"))
+            or file_hash(stdout) != receipt["stdout_sha256"]
+            or file_hash(stderr) != receipt["stderr_sha256"]):
+        raise BenchmarkEvaluationError("Extended runner receipt is malformed or changed")
+    valid_usage = (receipt["model_calls"] == visible_calls
+                   and receipt["total_tokens"] == visible_tokens)
+    if not valid_usage:
         raise BenchmarkEvaluationError("Runner receipt usage is malformed or undercounts evidence")
     return receipt
 
 
 def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[str, dict]:
-    if (set(manifest) != {"schema_version", "suite_version", "cases"}
+    fields = {"schema_version", "suite_version", "cases"}
+    if (frozenset(manifest) not in {frozenset(fields), frozenset(fields | {"version"})}
             or type(manifest.get("schema_version")) is not int
             or manifest["schema_version"] != 1
             or manifest.get("suite_version") != suite["version"]
             or not isinstance(manifest.get("cases"), list)):
         raise BenchmarkEvaluationError("Benchmark result manifest is malformed")
+    if ("version" in manifest
+            and manifest["version"] != content_hash(
+                {key: value for key, value in manifest.items() if key != "version"})):
+        raise BenchmarkEvaluationError("Benchmark result manifest version is malformed")
     declared = {case["case_id"]: case for case in suite["plan"]["cases"]}
     results = {}
     seen_runs: set[Path] = set()
@@ -164,7 +211,7 @@ def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[s
             run / "final_acceptance.json", item["acceptance_sha256"])
         receipt = _validate_receipt(
             run / "benchmark_case_receipt.json", item["receipt_sha256"],
-            suite=suite, case=declared[item["case_id"]],
+            suite=suite, case=declared[item["case_id"]], run=run,
             visible_calls=visible_calls, visible_tokens=visible_tokens)
         results[item["case_id"]] = {
             "manifest": item, "acceptance": acceptance, "receipt": receipt,
@@ -233,6 +280,7 @@ def _aggregate(rows: list[dict]) -> dict:
         "mean_revision_edits": (sum(row["revision_edits"] for row in rows) / count
                                 if count else None),
         "budget_exceeded": sum(row["budget_status"] == "exceeded" for row in rows),
+        "budget_unverified": sum(row["budget_status"] == "unverified" for row in rows),
     }
 
 
@@ -277,6 +325,9 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
         exceeded = (receipt["wall_seconds"] > budget["wall_seconds"]
                     or receipt["model_calls"] > budget["model_calls"]
                     or receipt["total_tokens"] > budget["total_tokens"])
+        budget_status = ("exceeded" if exceeded else "within"
+                         if receipt["usage_scope"] == "runner_enforced"
+                         else "unverified")
         rows.append({
             "case_id": case_id, "task_family": case["task_family"],
             "scenario": case["scenario"], "repeat_index": case["repeat_index"],
@@ -292,7 +343,8 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
             "model_calls": receipt["model_calls"], "total_tokens": receipt["total_tokens"],
             "visible_ledger_calls": result["visible_calls"],
             "visible_ledger_tokens": result["visible_tokens"],
-            "budget_status": "exceeded" if exceeded else "within",
+            "usage_scope": receipt["usage_scope"],
+            "budget_status": budget_status,
             "assessment_rationale": assessment["rationale"],
             "receipt_sha256": result["manifest"]["receipt_sha256"],
             "acceptance_sha256": result["manifest"]["acceptance_sha256"],
@@ -317,9 +369,12 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
                                for name, group in sorted(by_scenario.items())},
         "limitations": [
             "Runner and assessor identities are self-declared; no remote attestation is provided.",
-            "Resource-ledger counts are an audited lower bound; runner receipt supplies enforced totals.",
-            "Final acceptance is schema- and digest-bound here; its source bundle must retain normal portable verification.",
-            "Revision minutes and edits are blinded assessor records, not independently timed UI events.",
+            "Audited-lower-bound receipts cannot prove model-call or token-budget "
+            "compliance; only observed excess is conclusive.",
+            "Final acceptance is schema- and digest-bound here; its source bundle "
+            "must retain normal portable verification.",
+            "Revision minutes and edits are blinded assessor records, not "
+            "independently timed UI events.",
             "Finite-suite rates do not guarantee arbitrary-paper quality.",
         ],
     }

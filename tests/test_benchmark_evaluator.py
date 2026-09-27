@@ -12,7 +12,9 @@ from researchclaw.pipeline.benchmark_evaluator import (
 from researchclaw.pipeline.benchmark_suite import freeze_benchmark_suite
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 from researchclaw.pipeline.resource_ledger import build_resource_ledger
+from researchclaw.pipeline.benchmark_runner import run_benchmark_suite
 from tests.test_benchmark_suite import suite_fixture, write_json
+from tests.test_benchmark_runner import runner_fixture
 
 
 def evaluation_fixture(tmp_path):
@@ -86,6 +88,7 @@ def test_complete_blind_evaluation_reports_grouped_rates_and_revision_burden(tmp
         "honest_negative_accuracy": 1.0,
         "critical_errors": 0, "mean_revision_minutes": 5.0,
         "mean_revision_edits": 2.0, "budget_exceeded": 0,
+        "budget_unverified": 0,
     }
     assert set(report["by_task_family"]) == {
         "tabular_classification", "tabular_regression", "temporal", "image"}
@@ -178,3 +181,61 @@ def test_evaluation_rejects_tamper_even_after_report_rehash(tmp_path):
                                        if key != "version"})
     with pytest.raises(BenchmarkEvaluationError, match="differs"):
         verify_benchmark_evaluation(changed, **args)
+
+
+def test_host_runner_lower_bound_is_unverified_and_logs_are_bound(
+        tmp_path, monkeypatch):
+    public, plan_path, gold_path, suite = runner_fixture(tmp_path, monkeypatch)
+    results_root = tmp_path / "results"
+    manifest = run_benchmark_suite(
+        suite_report=suite, public_root=public, plan_path=plan_path,
+        results_root=results_root)
+    gold = json.loads(gold_path.read_text(encoding="utf-8"))
+    expected = {row["case_id"]: row["expected_disposition"]
+                for row in gold["cases"]}
+    assessments = []
+    for item in manifest["cases"]:
+        assessments.append({
+            "case_id": item["case_id"],
+            "acceptance_sha256": item["acceptance_sha256"],
+            "observed_disposition": expected[item["case_id"]],
+            "critical_errors": 0, "revision_minutes": 0.0,
+            "revision_edits": 0, "rationale": "Blind fixture assessment.",
+        })
+    assessment_path = tmp_path / "private" / "assessment.json"
+    write_json(assessment_path, {
+        "schema_version": 1, "suite_version": suite["version"],
+        "assessor_id": "assessor-1", "blinded": True, "cases": assessments})
+    args = {
+        "suite_report": suite, "public_root": public, "plan_path": plan_path,
+        "gold_path": gold_path, "results_root": results_root,
+        "result_manifest_path": results_root / "benchmark_result_manifest.json",
+        "assessment_path": assessment_path,
+    }
+    report = build_benchmark_evaluation(**args)
+    assert report["overall"]["budget_exceeded"] == 0
+    assert report["overall"]["budget_unverified"] == 16
+    assert {row["usage_scope"] for row in report["cases"]} == {
+        "audited_lower_bound"}
+    receipt_path = results_root / "case-00" / "benchmark_case_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["usage_scope"] = "runner_enforced"
+    write_json(receipt_path, receipt)
+    changed_manifest = copy.deepcopy(manifest)
+    changed_manifest["cases"][0]["receipt_sha256"] = file_hash(receipt_path)
+    changed_manifest["version"] = content_hash(
+        {key: value for key, value in changed_manifest.items()
+         if key != "version"})
+    write_json(args["result_manifest_path"], changed_manifest)
+    with pytest.raises(BenchmarkEvaluationError, match="receipt"):
+        build_benchmark_evaluation(**args)
+    receipt["usage_scope"] = "audited_lower_bound"
+    write_json(receipt_path, receipt)
+    manifest["cases"][0]["receipt_sha256"] = file_hash(receipt_path)
+    manifest["version"] = content_hash(
+        {key: value for key, value in manifest.items() if key != "version"})
+    write_json(args["result_manifest_path"], manifest)
+    (results_root / "case-00" / "stdout.txt").write_text(
+        "tampered", encoding="utf-8")
+    with pytest.raises(BenchmarkEvaluationError, match="receipt"):
+        build_benchmark_evaluation(**args)
