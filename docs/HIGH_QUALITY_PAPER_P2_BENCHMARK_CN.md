@@ -95,6 +95,20 @@
 
 若计划同时声明 confidentiality，冻结命令还会在计划指定位置创建 sealed gold；目标必须是公开根内安全的新文件，不能覆盖 plan、case 输入、adapter 或 suite report。runner 只验证密文 envelope、文件摘要和 curator 签名，不拥有解密私钥。冻结成功后，应把原始明文 gold 与评估私钥移出 runner 账户可见范围；仅仅额外生成一份密文而继续把明文留在同一账户并不增加隔离。
 
+## 最小权限 runner bundle
+
+curator 签名且启用 sealed gold 的 suite 可生成显式文件集合 ZIP：
+
+```powershell
+& .venv/Scripts/python.exe -m researchclaw.pipeline.benchmark_distribution build --suite-report <public>/benchmark_suite.json --public-root <public> --plan <public>/benchmark_plan.json --output <handoff>/runner.zip
+& .venv/Scripts/python.exe -m researchclaw.pipeline.benchmark_distribution verify <handoff>/runner.zip
+& .venv/Scripts/python.exe -m researchclaw.pipeline.benchmark_distribution extract <handoff>/runner.zip <runner-workspace>
+```
+
+构建器只加入签名 suite report、原始公开 plan、plan 明确引用的 case 输入、runner adapter 与 sealed gold；不会遍历公开目录，因此旁置私钥、明文 gold、缓存和无关文件不会因目录打包被带入。bundle manifest 冻结 suite version、入口、每个文件的角色/大小/SHA-256 和内容版本。ZIP 使用固定时间戳和排序文件名；构建完成前会自验证，源文件在摘要与复制之间变化会使构建失败。
+
+验证器拒绝绝对/回退/反斜线路径、重复项、目录项、符号链接、加密 ZIP、未声明额外文件、缺文件、超限条目/总量和摘要变化；同时验证 curator suite 签名，并从签名 suite 重新推导唯一允许的路径、角色和摘要，防止攻击者只重写未签名 bundle manifest 后夹带文件。解包只写入新建或空目录并再次限制目标必须留在该目录内。runner 私钥不在 bundle 中，须由执行环境的秘密存储另行提供。bundle 本身没有整体保密性：公开输入、adapter 和 sealed-gold 密文可读；它的目的在于最小权限交接与完整性，不是隐藏公开任务。
+
 ## 结论边界
 
 `status: ready` 只表示用例覆盖、重复次数、预算、公开输入、可选适配器和私有 gold 形态满足契约。它不表示已经运行普通模型，不提供端到端成功率、错误接受率、成本或人工修订量，也不证明 gold 没有通过其他渠道泄漏。有限基准上的结果不能外推为任意论文质量保证。
