@@ -10,7 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from researchclaw.pipeline.benchmark_suite import (
-    BenchmarkSuiteError, verify_benchmark_suite,
+    BenchmarkSuiteError, open_sealed_benchmark_gold, verify_benchmark_suite,
 )
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 from researchclaw.pipeline.evidence_signature import (
@@ -313,13 +313,14 @@ def _aggregate(rows: list[dict]) -> dict:
 
 
 def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
-                               plan_path: Path, gold_path: Path,
+                               plan_path: Path, gold_path: Path | None,
                                results_root: Path, result_manifest_path: Path,
-                               assessment_path: Path) -> dict:
+                               assessment_path: Path,
+                               sealed_gold_path: Path | None = None,
+                               gold_decryption_key_path: Path | None = None) -> dict:
     """Build a scored report from complete runs and a bound private assessment."""
     public_root = Path(public_root).resolve()
     plan_path = Path(plan_path).resolve()
-    gold_path = Path(gold_path).resolve()
     results_root = Path(results_root).resolve()
     result_manifest_path = Path(result_manifest_path).resolve()
     assessment_path = Path(assessment_path).resolve()
@@ -327,13 +328,30 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
         raise BenchmarkEvaluationError("Result manifest must be inside the results root")
     if assessment_path.is_relative_to(public_root):
         raise BenchmarkEvaluationError("Private assessment must be outside the public root")
+    confidentiality = suite_report.get("plan", {}).get("confidentiality")
     try:
-        verify_benchmark_suite(suite_report, public_root, plan_path, gold_path)
+        if confidentiality is not None:
+            if (gold_path is not None or sealed_gold_path is None
+                    or gold_decryption_key_path is None):
+                raise BenchmarkEvaluationError(
+                    "Sealed suite requires only sealed gold and its decryption key")
+            gold_document = open_sealed_benchmark_gold(
+                suite_report, public_root, plan_path, sealed_gold_path,
+                gold_decryption_key_path)
+            gold_sha256 = suite_report["private_gold_sha256"]
+        else:
+            if (gold_path is None or sealed_gold_path is not None
+                    or gold_decryption_key_path is not None):
+                raise BenchmarkEvaluationError(
+                    "Plaintext suite requires only the private gold path")
+            gold_path = Path(gold_path).resolve()
+            verify_benchmark_suite(suite_report, public_root, plan_path, gold_path)
+            gold_document, gold_sha256 = _load_stable(gold_path, "Private gold")
+            if gold_sha256 != suite_report["private_gold_sha256"]:
+                raise BenchmarkEvaluationError(
+                    "Private gold differs from the frozen suite")
     except BenchmarkSuiteError as exc:
         raise BenchmarkEvaluationError(str(exc)) from exc
-    gold_document, gold_sha256 = _load_stable(gold_path, "Private gold")
-    if gold_sha256 != suite_report["private_gold_sha256"]:
-        raise BenchmarkEvaluationError("Private gold differs from the frozen suite")
     gold = {row["case_id"]: row for row in gold_document["cases"]}
     manifest_document, manifest_sha256 = _load_stable(
         result_manifest_path, "Result manifest")
@@ -390,6 +408,12 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
         if attestation else
         "Runner and assessor identities are self-declared; no signatures or "
         "remote attestation are provided.")
+    gold_limitation = (
+        "Authenticated gold decryption proves ciphertext integrity and key "
+        "possession, not organizational access control or memory erasure."
+        if confidentiality else
+        "Plaintext private-gold separation remains a filesystem layout contract, "
+        "not proof of access control.")
     report = {
         "schema_version": 1, "checker": "arc-benchmark-evaluation/v1",
         "suite_version": suite_report["version"],
@@ -410,6 +434,12 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
         },
         "result_manifest_sha256": manifest_sha256,
         "private_gold_sha256": gold_sha256,
+        "gold_confidentiality": {
+            "sealed": confidentiality is not None,
+            "recipient_key_id": (confidentiality["key_id"]
+                                 if confidentiality else None),
+            "authenticated_decryption": confidentiality is not None,
+        },
         "cases": rows,
         "overall": _aggregate(rows),
         "by_task_family": {name: _aggregate(group) for name, group in sorted(by_family.items())},
@@ -423,6 +453,7 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
             "must retain normal portable verification.",
             "Revision minutes and edits are blinded assessor records, not "
             "independently timed UI events.",
+            gold_limitation,
             "Finite-suite rates do not guarantee arbitrary-paper quality.",
         ],
     }
@@ -442,7 +473,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--suite-report", type=Path, required=True)
     parser.add_argument("--public-root", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--private-gold", type=Path, required=True)
+    parser.add_argument("--private-gold", type=Path)
+    parser.add_argument("--sealed-gold", type=Path)
+    parser.add_argument("--gold-decryption-key", type=Path)
     parser.add_argument("--results-root", type=Path, required=True)
     parser.add_argument("--result-manifest", type=Path, required=True)
     parser.add_argument("--private-assessment", type=Path, required=True)
@@ -453,11 +486,14 @@ def main(argv: list[str] | None = None) -> int:
         suite_report=suite, public_root=args.public_root, plan_path=args.plan,
         gold_path=args.private_gold, results_root=args.results_root,
         result_manifest_path=args.result_manifest,
-        assessment_path=args.private_assessment)
+        assessment_path=args.private_assessment,
+        sealed_gold_path=args.sealed_gold,
+        gold_decryption_key_path=args.gold_decryption_key)
     output = args.output.resolve()
     protected = {path.resolve() for path in (
-        args.suite_report, args.plan, args.private_gold,
-        args.result_manifest, args.private_assessment)}
+        args.suite_report, args.plan, args.private_gold, args.sealed_gold,
+        args.gold_decryption_key, args.result_manifest, args.private_assessment)
+                 if path is not None}
     if output in protected:
         raise BenchmarkEvaluationError("Evaluation output cannot overwrite frozen input evidence")
     _write(output, report)

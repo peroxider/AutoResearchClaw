@@ -8,6 +8,10 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
+from researchclaw.pipeline.evidence_encryption import (
+    EvidenceEncryptionError, open_document, seal_document, validate_envelope,
+    validate_recipient,
+)
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 from researchclaw.pipeline.evidence_signature import (
     EvidenceSignatureError, sign_document, validate_signer, verify_document,
@@ -50,10 +54,10 @@ def _write(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def _load(path: Path, name: str) -> dict:
+def _load(path: Path, name: str, maximum: int = 10_000_000) -> dict:
     try:
-        if path.stat().st_size > 10_000_000:
-            raise BenchmarkSuiteError(f"{name} exceeds 10 MB")
+        if path.stat().st_size > maximum:
+            raise BenchmarkSuiteError(f"{name} exceeds its size limit")
         value = json.loads(path.read_text(encoding="utf-8"))
     except BenchmarkSuiteError:
         raise
@@ -117,6 +121,59 @@ def _validate_attestation(value: object) -> dict:
     return result
 
 
+def _safe_public_path(root: Path, relative: object) -> tuple[str, Path]:
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise BenchmarkSuiteError("Public evidence path is malformed")
+    candidate = root / relative
+    path = candidate.resolve()
+    if not path.is_relative_to(root) or candidate.is_symlink():
+        raise BenchmarkSuiteError("Public evidence path is unsafe")
+    return path.relative_to(root).as_posix(), path
+
+
+def _validate_confidentiality(root: Path, value: object) -> dict:
+    fields = {"algorithm", "key_id", "public_key", "sealed_gold"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise BenchmarkSuiteError("Benchmark confidentiality fields are malformed")
+    try:
+        recipient = validate_recipient({
+            key: value[key] for key in ("algorithm", "key_id", "public_key")})
+    except EvidenceEncryptionError as exc:
+        raise BenchmarkSuiteError(str(exc)) from exc
+    sealed_gold, _ = _safe_public_path(root, value["sealed_gold"])
+    return {**recipient, "sealed_gold": sealed_gold}
+
+
+def _read_sealed_reference(
+        root: Path, confidentiality: dict) -> tuple[dict, dict, Path]:
+    _, sealed_path = _safe_public_path(root, confidentiality["sealed_gold"])
+    try:
+        if (not sealed_path.is_file() or sealed_path.stat().st_size > 15_000_000
+                or sealed_path.is_symlink()):
+            raise BenchmarkSuiteError("Sealed gold is missing, unsafe or oversized")
+        before = file_hash(sealed_path)
+        envelope = _load(sealed_path, "Sealed gold", 15_000_000)
+        after = file_hash(sealed_path)
+    except BenchmarkSuiteError:
+        raise
+    except OSError as exc:
+        raise BenchmarkSuiteError(
+            f"Sealed gold is unreadable: {type(exc).__name__}") from exc
+    if before != after:
+        raise BenchmarkSuiteError("Sealed gold changed while it was being verified")
+    recipient = {key: confidentiality[key]
+                 for key in ("algorithm", "key_id", "public_key")}
+    try:
+        validate_envelope(envelope, recipient=recipient)
+    except EvidenceEncryptionError as exc:
+        raise BenchmarkSuiteError(str(exc)) from exc
+    reference = {
+        "path": confidentiality["sealed_gold"], "sha256": before,
+        "plaintext_content_sha256": envelope["plaintext_sha256"],
+    }
+    return reference, envelope, sealed_path
+
+
 def _safe_input(root: Path, relative: object, digest: object) -> str:
     if (not isinstance(relative, str) or not relative or "\\" in relative
             or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None):
@@ -131,7 +188,7 @@ def _safe_input(root: Path, relative: object, digest: object) -> str:
 
 def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
     required = {"schema_version", "min_repeats", "budget", "cases"}
-    optional = {"runner", "attestation"}
+    optional = {"runner", "attestation", "confidentiality"}
     if not required <= set(plan) or set(plan) - (required | optional):
         raise BenchmarkSuiteError("Benchmark plan fields are malformed")
     if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
@@ -185,11 +242,18 @@ def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
         if "runner" not in plan:
             raise BenchmarkSuiteError("Attested benchmark requires a runner adapter")
         document["attestation"] = _validate_attestation(plan["attestation"])
+    if "confidentiality" in plan:
+        if "curator" not in document.get("attestation", {}):
+            raise BenchmarkSuiteError(
+                "Sealed gold requires a curator-signed attestation")
+        document["confidentiality"] = _validate_confidentiality(
+            root, plan["confidentiality"])
     return document, coverage
 
 
 def _suite_report(plan: dict, coverage: dict, plan_sha256: str,
-                  private_gold_sha256: str) -> dict:
+                  private_gold_sha256: str,
+                  sealed_gold: dict | None = None) -> dict:
     report = {
         "schema_version": 1,
         "checker": "arc-benchmark-suite/v1",
@@ -201,6 +265,11 @@ def _suite_report(plan: dict, coverage: dict, plan_sha256: str,
         "coverage": coverage,
         "limitations": list(_LIMITATIONS),
     }
+    if sealed_gold is not None:
+        report["sealed_gold"] = sealed_gold
+        report["limitations"].append(
+            "Sealing protects gold confidentiality only while the X25519 private "
+            "key and original plaintext remain outside the runner environment.")
     report["version"] = content_hash(report)
     return report
 
@@ -231,7 +300,7 @@ def _validate_gold(gold: dict, case_ids: set[str]) -> dict:
 def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
                            output: Path | None = None,
                            signing_key_path: Path | None = None) -> dict:
-    """Validate public cases and private gold, freezing only a gold digest."""
+    """Validate public cases and private gold, optionally sealing the gold."""
     root = Path(public_root).resolve()
     plan_path, gold_path = Path(plan_path).resolve(), Path(gold_path).resolve()
     if not root.is_dir() or not plan_path.is_relative_to(root):
@@ -241,11 +310,51 @@ def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
     plan, coverage = _validate_plan(root, _load(plan_path, "Benchmark plan"))
     gold = _validate_gold(_load(gold_path, "Private gold"),
                           {case["case_id"] for case in plan["cases"]})
-    report = _suite_report(plan, coverage, file_hash(plan_path), file_hash(gold_path))
     curator = plan.get("attestation", {}).get("curator")
     if (curator is None) != (signing_key_path is None):
         raise BenchmarkSuiteError(
             "Curator signing key must match the frozen attestation policy")
+    if curator is not None:
+        try:
+            sign_document(
+                {}, signer=curator, private_key_path=Path(signing_key_path),
+                purpose="benchmark_suite_report/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkSuiteError(str(exc)) from exc
+    destination = Path(output).resolve() if output is not None else None
+    if destination is not None and not destination.is_relative_to(root):
+        raise BenchmarkSuiteError("Public suite report must stay inside the public root")
+    protected = {plan_path}
+    protected.update((root / case["input_bundle"]).resolve()
+                     for case in plan["cases"])
+    if "runner" in plan:
+        protected.add((root / plan["runner"]["adapter"]).resolve())
+    if destination is not None and destination in protected:
+        raise BenchmarkSuiteError("Public suite report cannot overwrite a frozen input")
+    sealed_reference = None
+    if "confidentiality" in plan:
+        confidentiality = plan["confidentiality"]
+        _, sealed_path = _safe_public_path(root, confidentiality["sealed_gold"])
+        if (sealed_path.exists() or sealed_path in protected
+                or destination == sealed_path):
+            raise BenchmarkSuiteError(
+                "Sealed gold output exists or would overwrite frozen evidence")
+        recipient = {key: confidentiality[key]
+                     for key in ("algorithm", "key_id", "public_key")}
+        try:
+            envelope = seal_document(gold, recipient=recipient)
+        except EvidenceEncryptionError as exc:
+            raise BenchmarkSuiteError(str(exc)) from exc
+        _write(sealed_path, envelope)
+        sealed_reference = {
+            "path": confidentiality["sealed_gold"],
+            "sha256": file_hash(sealed_path),
+            "plaintext_content_sha256": content_hash(gold),
+        }
+        protected.add(sealed_path)
+    report = _suite_report(
+        plan, coverage, file_hash(plan_path), file_hash(gold_path),
+        sealed_reference)
     if curator is not None:
         try:
             report["signature"] = sign_document(
@@ -255,17 +364,7 @@ def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
             raise BenchmarkSuiteError(str(exc)) from exc
     # The validated gold is intentionally not copied into this public artifact.
     _ = gold
-    if output is not None:
-        destination = Path(output).resolve()
-        if not destination.is_relative_to(root):
-            raise BenchmarkSuiteError("Public suite report must stay inside the public root")
-        protected = {plan_path}
-        protected.update((root / case["input_bundle"]).resolve()
-                         for case in plan["cases"])
-        if "runner" in plan:
-            protected.add((root / plan["runner"]["adapter"]).resolve())
-        if destination in protected:
-            raise BenchmarkSuiteError("Public suite report cannot overwrite a frozen input")
+    if destination is not None:
         _write(destination, report)
     return report
 
@@ -280,8 +379,13 @@ def verify_public_benchmark_suite(report: dict, public_root: Path,
             or _SHA256.fullmatch(report["private_gold_sha256"]) is None):
         raise BenchmarkSuiteError("Public benchmark suite report is malformed")
     plan, coverage = _validate_plan(root, _load(plan_path, "Benchmark plan"))
+    sealed_reference = None
+    if "confidentiality" in plan:
+        confidentiality = plan["confidentiality"]
+        sealed_reference, _, _ = _read_sealed_reference(root, confidentiality)
     expected = _suite_report(
-        plan, coverage, file_hash(plan_path), report["private_gold_sha256"])
+        plan, coverage, file_hash(plan_path), report["private_gold_sha256"],
+        sealed_reference)
     curator = plan.get("attestation", {}).get("curator")
     payload = {key: value for key, value in report.items() if key != "signature"}
     if payload != expected or (curator is None) != ("signature" not in report):
@@ -302,11 +406,45 @@ def verify_benchmark_suite(report: dict, public_root: Path,
     if gold_path.is_relative_to(root):
         raise BenchmarkSuiteError("Private gold must be outside the public suite root")
     verified = verify_public_benchmark_suite(report, root, plan_path)
-    _validate_gold(_load(gold_path, "Private gold"),
-                   {case["case_id"] for case in report["plan"]["cases"]})
+    gold = _validate_gold(_load(gold_path, "Private gold"),
+                          {case["case_id"] for case in report["plan"]["cases"]})
     if file_hash(gold_path) != report["private_gold_sha256"]:
         raise BenchmarkSuiteError("Benchmark suite report differs from frozen inputs")
+    if ("sealed_gold" in report
+            and content_hash(gold) != report["sealed_gold"]["plaintext_content_sha256"]):
+        raise BenchmarkSuiteError("Sealed gold differs from private gold")
     return verified
+
+
+def open_sealed_benchmark_gold(report: dict, public_root: Path,
+                               plan_path: Path, sealed_gold_path: Path,
+                               decryption_key_path: Path) -> dict:
+    """Verify the public suite and decrypt its curator-bound gold in memory."""
+    root = Path(public_root).resolve()
+    verified = verify_public_benchmark_suite(report, root, plan_path)
+    confidentiality = verified["plan"].get("confidentiality")
+    if confidentiality is None or "sealed_gold" not in verified:
+        raise BenchmarkSuiteError("Benchmark suite does not declare sealed gold")
+    expected = (root / confidentiality["sealed_gold"]).resolve()
+    supplied = Path(sealed_gold_path).resolve()
+    if supplied != expected or not supplied.is_relative_to(root):
+        raise BenchmarkSuiteError("Sealed gold path differs from the frozen suite")
+    reference, envelope, _ = _read_sealed_reference(root, confidentiality)
+    if reference["sha256"] != verified["sealed_gold"]["sha256"]:
+        raise BenchmarkSuiteError("Sealed gold changed or differs from the suite")
+    recipient = {key: confidentiality[key]
+                 for key in ("algorithm", "key_id", "public_key")}
+    try:
+        gold = open_document(
+            envelope, recipient=recipient,
+            private_key_path=Path(decryption_key_path))
+    except EvidenceEncryptionError as exc:
+        raise BenchmarkSuiteError(str(exc)) from exc
+    gold = _validate_gold(
+        gold, {case["case_id"] for case in verified["plan"]["cases"]})
+    if content_hash(gold) != verified["sealed_gold"]["plaintext_content_sha256"]:
+        raise BenchmarkSuiteError("Decrypted gold differs from the frozen suite")
+    return gold
 
 
 def main(argv: list[str] | None = None) -> int:

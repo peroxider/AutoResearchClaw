@@ -10,6 +10,9 @@ from researchclaw.pipeline.benchmark_runner import (
 )
 from researchclaw.pipeline.benchmark_suite import freeze_benchmark_suite
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_encryption import (
+    generate_private_key as generate_encryption_key,
+)
 from researchclaw.pipeline.evidence_signature import (
     generate_private_key, verify_document,
 )
@@ -74,6 +77,30 @@ def attested_runner_fixture(tmp_path, monkeypatch):
         public, plan_path, gold_path, signing_key_path=curator_key)
     return (public, plan_path, gold_path, suite, curator_key,
             runner_key, assessor_key)
+
+
+def sealed_runner_fixture(tmp_path, monkeypatch):
+    public, plan_path, gold_path, _ = runner_fixture(tmp_path, monkeypatch)
+    key_root = tmp_path / "keys"
+    curator_key = key_root / "curator.pem"
+    runner_key = key_root / "runner.pem"
+    assessor_key = key_root / "assessor.pem"
+    evaluator_key = key_root / "evaluator.pem"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["attestation"] = {
+        "curator": generate_private_key(curator_key, key_id="curator-1"),
+        "runner": generate_private_key(runner_key, key_id="runner-1"),
+        "assessor": generate_private_key(assessor_key, key_id="assessor-1"),
+    }
+    plan["confidentiality"] = {
+        **generate_encryption_key(evaluator_key, key_id="evaluator-1"),
+        "sealed_gold": "sealed/private_gold.json",
+    }
+    write_json(plan_path, plan)
+    suite = freeze_benchmark_suite(
+        public, plan_path, gold_path, signing_key_path=curator_key)
+    return (public, plan_path, gold_path, suite, curator_key, runner_key,
+            assessor_key, evaluator_key)
 
 
 def test_public_runner_executes_every_case_once_and_preserves_failure(

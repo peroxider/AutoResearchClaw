@@ -37,6 +37,12 @@
       "public_key": "<different base64 raw Ed25519 public key>"
     }
   },
+  "confidentiality": {
+    "algorithm": "x25519-aes256-gcm",
+    "key_id": "evaluator-1",
+    "public_key": "<base64 raw X25519 public key>",
+    "sealed_gold": "sealed/private_gold.json"
+  },
   "cases": [
     {
       "case_id": "classification-leak-00",
@@ -55,6 +61,8 @@
 所有公开输入与可选 runner adapter 必须是公开根目录内、非符号链接、最大 10 MB 的现有文件，并与声明 SHA-256 一致。环境白名单最多 32 个、名称限大写标识符，不得占用 runner 控制的变量；它只决定额外继承哪些宿主变量。全部用例共享同一预算；墙钟、模型调用和 token 上限均为正整数并有硬上界。冻结器不根据运行结果删除困难用例或改变预算。
 
 `attestation` 可选，用于冻结 curator、runner 与 assessor 的 Ed25519 公钥。算法、最长 64 字符的 key ID 与 32 字节原始公钥均严格校验；任何角色不能复用 key ID 或公钥。为兼容第八十轮的双角色 suite，curator 可省略；新生产 suite 应声明 curator，使任务计划、gold 摘要和其余角色公钥也由独立密钥签名。旧套件可继续无签名运行；一旦声明 runner/assessor attestation，结果清单和 private assessment 都必须由对应私钥签名，不能局部降级成自报身份。
+
+`confidentiality` 可选，但只能与 curator 签名同时使用。它冻结评估方的 X25519 公钥和公开根内尚不存在的 sealed-gold 路径。冻结器以临时 X25519 密钥协商 AES-256-GCM 密钥，使用独立随机 salt/nonce 对规范 gold JSON 做认证加密；公开报告记录密文文件摘要与明文内容摘要并由 curator 签名。密文不包含 rubric、期望结局或 case 明文，但 case 数量和文件大小等侧信道没有隐藏。
 
 ## 私有 gold
 
@@ -85,6 +93,8 @@
 
 若计划声明 curator，冻结器要求匹配私钥并对完整 suite report 签名；`verify_public_benchmark_suite` 在无需读取 gold 的 runner 侧先重建全部公开字段，再验证 curator 签名。因此同时替换 plan、gold 摘要、runner/assessor 公钥和普通内容版本也不能通过。未声明 curator 的兼容套件没有这层来源认证。
 
+若计划同时声明 confidentiality，冻结命令还会在计划指定位置创建 sealed gold；目标必须是公开根内安全的新文件，不能覆盖 plan、case 输入、adapter 或 suite report。runner 只验证密文 envelope、文件摘要和 curator 签名，不拥有解密私钥。冻结成功后，应把原始明文 gold 与评估私钥移出 runner 账户可见范围；仅仅额外生成一份密文而继续把明文留在同一账户并不增加隔离。
+
 ## 结论边界
 
 `status: ready` 只表示用例覆盖、重复次数、预算、公开输入、可选适配器和私有 gold 形态满足契约。它不表示已经运行普通模型，不提供端到端成功率、错误接受率、成本或人工修订量，也不证明 gold 没有通过其他渠道泄漏。有限基准上的结果不能外推为任意论文质量保证。
@@ -109,9 +119,10 @@ runner 仅调用 `verify_public_benchmark_suite`，不接收、定位或读取�
 & .venv/Scripts/python.exe -m researchclaw.pipeline.evidence_signature generate --private-key <private>/runner.pem --key-id runner-1
 & .venv/Scripts/python.exe -m researchclaw.pipeline.evidence_signature generate --private-key <private>/assessor.pem --key-id assessor-1
 & .venv/Scripts/python.exe -m researchclaw.pipeline.evidence_signature generate --private-key <private>/curator.pem --key-id curator-1
+& .venv/Scripts/python.exe -m researchclaw.pipeline.evidence_encryption generate --private-key <private>/evaluator.pem --key-id evaluator-1
 ```
 
-把三份公开 signer JSON 写入 plan 的 `attestation` 后，由 curator 签名冻结 suite。私钥不得放入公开根、结果目录或版本库；工具拒绝覆盖已有密钥，POSIX 上以 0600 创建，Windows 上仍须由操作者设置账户 ACL。runner 在启动第一个 case 前先验证 suite curator 签名，再检查自己的私钥与冻结公钥一致，最终对包含所有 case 证据摘要和内容版本的结果 manifest 签名。
+把三份公开 signer JSON 写入 plan 的 `attestation`，把公开 recipient JSON 与 sealed 路径写入 `confidentiality`，再由 curator 签名冻结 suite。四份私钥不得放入公开根、结果目录或版本库；工具拒绝覆盖已有密钥，POSIX 上以 0600 创建，Windows 上仍须由操作者设置账户 ACL。runner 在启动第一个 case 前先验证 suite curator 签名和密文摘要，再检查自己的私钥与冻结公钥一致，最终对包含所有 case 证据摘要和内容版本的结果 manifest 签名。
 
 盲评者完成未签名 assessment 后，以冻结的 assessor signer JSON 签名到新文件：
 
@@ -132,8 +143,10 @@ runner 仅调用 `verify_public_benchmark_suite`，不接收、定位或读取�
 私有 assessment 同样位于公开根之外，声明唯一 assessor ID、`blinded: true`，并逐 case 绑定最终验收摘要，记录 `observed_disposition`、critical error 数、人工修订分钟数、编辑次数和理由。三种 disposition 与 gold 相同：`accept`、`reject`、`honest_negative`。这些人工字段是盲评者的结构化记录，不是 UI 自动计时。
 
 ```powershell
-& .venv/Scripts/python.exe -m researchclaw.pipeline.benchmark_evaluator --suite-report <public>/benchmark_suite.json --public-root <public> --plan <public>/benchmark_plan.json --private-gold <private>/gold.json --results-root <public>/results --result-manifest <public>/results/benchmark_result_manifest.json --private-assessment <private>/assessment.json --output <evaluation>/benchmark_evaluation.json
+& .venv/Scripts/python.exe -m researchclaw.pipeline.benchmark_evaluator --suite-report <public>/benchmark_suite.json --public-root <public> --plan <public>/benchmark_plan.json --sealed-gold <public>/sealed/private_gold.json --gold-decryption-key <private>/evaluator.pem --results-root <public>/results --result-manifest <public>/results/benchmark_result_manifest.json --private-assessment <private>/assessment.json --output <evaluation>/benchmark_evaluation.json
 ```
+
+未启用 confidentiality 的兼容套件继续使用 `--private-gold <private>/gold.json`，且不能同时传 sealed 参数。启用后只能传密文与匹配私钥；评估器在内存中验证 AES-GCM tag、冻结 recipient、明文内容摘要和完整 gold schema，不把解密明文落盘。评估报告记录 recipient key ID 与 `authenticated_decryption: true`。Python 进程内存不会主动清零，主机管理员或同进程恶意代码仍可能读到解密内容，因此生产评估仍需独立账户/容器和最小权限。
 
 报告逐 case 保存期望/观察结局、错误接受、误拒、诚实负结果、critical errors、修订负担、runner 用量范围、资源账本可见下界、预算状态及三类证据摘要。总体、任务族和压力场景分别聚合 disposition accuracy；错误接受率只以 gold 中应拒绝用例为分母，误拒率只以应接受用例为分母，诚实负结果单独报告命中率，并分别统计 `budget_exceeded` 与 `budget_unverified`。缺类或错误用例不能通过缩小分母隐藏，因为 suite、结果和 assessment 都要求精确全覆盖。
 

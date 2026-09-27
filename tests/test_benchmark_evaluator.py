@@ -15,7 +15,7 @@ from researchclaw.pipeline.evidence_signature import sign_document
 from researchclaw.pipeline.resource_ledger import build_resource_ledger
 from researchclaw.pipeline.benchmark_runner import run_benchmark_suite
 from tests.test_benchmark_suite import suite_fixture, write_json
-from tests.test_benchmark_runner import attested_runner_fixture, runner_fixture
+from tests.test_benchmark_runner import sealed_runner_fixture, runner_fixture
 
 
 def evaluation_fixture(tmp_path):
@@ -245,12 +245,14 @@ def test_host_runner_lower_bound_is_unverified_and_logs_are_bound(
 def test_attested_result_and_private_assessment_are_verified(
         tmp_path, monkeypatch):
     (public, plan_path, gold_path, suite, _, runner_key,
-     assessor_key) = attested_runner_fixture(tmp_path, monkeypatch)
+     assessor_key, evaluator_key) = sealed_runner_fixture(tmp_path, monkeypatch)
     results_root = tmp_path / "signed-results"
     manifest = run_benchmark_suite(
         suite_report=suite, public_root=public, plan_path=plan_path,
         results_root=results_root, signing_key_path=runner_key)
     gold = json.loads(gold_path.read_text(encoding="utf-8"))
+    assert "Private gold rubric" not in (
+        public / "sealed" / "private_gold.json").read_text(encoding="utf-8")
     expected = {row["case_id"]: row["expected_disposition"]
                 for row in gold["cases"]}
     assessment = {
@@ -272,10 +274,13 @@ def test_attested_result_and_private_assessment_are_verified(
     write_json(assessment_path, assessment)
     args = {
         "suite_report": suite, "public_root": public, "plan_path": plan_path,
-        "gold_path": gold_path, "results_root": results_root,
+        "gold_path": None, "results_root": results_root,
         "result_manifest_path": results_root / "benchmark_result_manifest.json",
         "assessment_path": assessment_path,
+        "sealed_gold_path": public / "sealed" / "private_gold.json",
+        "gold_decryption_key_path": evaluator_key,
     }
+    gold_path.unlink()
     report = build_benchmark_evaluation(**args)
     assert report["overall"]["cases"] == 16
     assert report["attestation"] == {
@@ -283,6 +288,9 @@ def test_attested_result_and_private_assessment_are_verified(
         "runner_key_id": "runner-1", "assessor_key_id": "assessor-1",
         "suite_signature_verified": True,
         "result_and_assessment_signatures_verified": True}
+    assert report["gold_confidentiality"] == {
+        "sealed": True, "recipient_key_id": "evaluator-1",
+        "authenticated_decryption": True}
     assessment["cases"][0]["rationale"] = "Changed after signing."
     write_json(assessment_path, assessment)
     with pytest.raises(BenchmarkEvaluationError, match="signature"):
