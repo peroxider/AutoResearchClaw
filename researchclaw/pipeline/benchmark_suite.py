@@ -10,7 +10,7 @@ from pathlib import Path
 
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
 from researchclaw.pipeline.evidence_signature import (
-    EvidenceSignatureError, validate_signer,
+    EvidenceSignatureError, sign_document, validate_signer, verify_document,
 )
 
 
@@ -94,17 +94,27 @@ def _validate_runner(root: Path, value: object) -> dict:
 
 
 def _validate_attestation(value: object) -> dict:
-    if not isinstance(value, dict) or set(value) != {"runner", "assessor"}:
+    allowed_fields = ({"runner", "assessor"},
+                      {"curator", "runner", "assessor"})
+    if (not isinstance(value, dict)
+            or frozenset(value) not in {frozenset(fields)
+                                        for fields in allowed_fields}):
         raise BenchmarkSuiteError("Benchmark attestation fields are malformed")
     try:
         runner = validate_signer(value["runner"])
         assessor = validate_signer(value["assessor"])
+        curator = (validate_signer(value["curator"])
+                   if "curator" in value else None)
     except EvidenceSignatureError as exc:
         raise BenchmarkSuiteError(str(exc)) from exc
-    if (runner["key_id"] == assessor["key_id"]
-            or runner["public_key"] == assessor["public_key"]):
-        raise BenchmarkSuiteError("Runner and assessor signing keys must be distinct")
-    return {"runner": runner, "assessor": assessor}
+    signers = [runner, assessor] + ([curator] if curator else [])
+    if (len({signer["key_id"] for signer in signers}) != len(signers)
+            or len({signer["public_key"] for signer in signers}) != len(signers)):
+        raise BenchmarkSuiteError("Benchmark signing keys must be distinct")
+    result = {"runner": runner, "assessor": assessor}
+    if curator:
+        result["curator"] = curator
+    return result
 
 
 def _safe_input(root: Path, relative: object, digest: object) -> str:
@@ -219,7 +229,8 @@ def _validate_gold(gold: dict, case_ids: set[str]) -> dict:
 
 
 def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
-                           output: Path | None = None) -> dict:
+                           output: Path | None = None,
+                           signing_key_path: Path | None = None) -> dict:
     """Validate public cases and private gold, freezing only a gold digest."""
     root = Path(public_root).resolve()
     plan_path, gold_path = Path(plan_path).resolve(), Path(gold_path).resolve()
@@ -231,6 +242,17 @@ def freeze_benchmark_suite(public_root: Path, plan_path: Path, gold_path: Path,
     gold = _validate_gold(_load(gold_path, "Private gold"),
                           {case["case_id"] for case in plan["cases"]})
     report = _suite_report(plan, coverage, file_hash(plan_path), file_hash(gold_path))
+    curator = plan.get("attestation", {}).get("curator")
+    if (curator is None) != (signing_key_path is None):
+        raise BenchmarkSuiteError(
+            "Curator signing key must match the frozen attestation policy")
+    if curator is not None:
+        try:
+            report["signature"] = sign_document(
+                report, signer=curator, private_key_path=Path(signing_key_path),
+                purpose="benchmark_suite_report/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkSuiteError(str(exc)) from exc
     # The validated gold is intentionally not copied into this public artifact.
     _ = gold
     if output is not None:
@@ -260,18 +282,31 @@ def verify_public_benchmark_suite(report: dict, public_root: Path,
     plan, coverage = _validate_plan(root, _load(plan_path, "Benchmark plan"))
     expected = _suite_report(
         plan, coverage, file_hash(plan_path), report["private_gold_sha256"])
-    if report != expected:
+    curator = plan.get("attestation", {}).get("curator")
+    payload = {key: value for key, value in report.items() if key != "signature"}
+    if payload != expected or (curator is None) != ("signature" not in report):
         raise BenchmarkSuiteError("Public benchmark suite differs from frozen inputs")
+    if curator is not None:
+        try:
+            verify_document(
+                report, signer=curator, purpose="benchmark_suite_report/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkSuiteError(str(exc)) from exc
     return report
 
 
 def verify_benchmark_suite(report: dict, public_root: Path,
                            plan_path: Path, gold_path: Path) -> dict:
     """Rebuild the public suite report from current public and private inputs."""
-    expected = freeze_benchmark_suite(public_root, plan_path, gold_path)
-    if not isinstance(report, dict) or report != expected:
+    root, gold_path = Path(public_root).resolve(), Path(gold_path).resolve()
+    if gold_path.is_relative_to(root):
+        raise BenchmarkSuiteError("Private gold must be outside the public suite root")
+    verified = verify_public_benchmark_suite(report, root, plan_path)
+    _validate_gold(_load(gold_path, "Private gold"),
+                   {case["case_id"] for case in report["plan"]["cases"]})
+    if file_hash(gold_path) != report["private_gold_sha256"]:
         raise BenchmarkSuiteError("Benchmark suite report differs from frozen inputs")
-    return report
+    return verified
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,9 +315,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--private-gold", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--signing-key", type=Path)
     args = parser.parse_args(argv)
     report = freeze_benchmark_suite(
-        args.public_root, args.plan, args.private_gold, args.output)
+        args.public_root, args.plan, args.private_gold, args.output,
+        signing_key_path=args.signing_key)
     print(json.dumps({"status": report["status"],
                       "case_count": report["coverage"]["case_count"]}, sort_keys=True))
     return 0

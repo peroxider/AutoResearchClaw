@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
@@ -60,14 +61,19 @@ def attested_runner_fixture(tmp_path, monkeypatch):
     public, plan_path, gold_path, _ = runner_fixture(tmp_path, monkeypatch)
     runner_key = tmp_path / "keys" / "runner.pem"
     assessor_key = tmp_path / "keys" / "assessor.pem"
+    curator_key = tmp_path / "keys" / "curator.pem"
     runner_signer = generate_private_key(runner_key, key_id="runner-1")
     assessor_signer = generate_private_key(assessor_key, key_id="assessor-1")
+    curator_signer = generate_private_key(curator_key, key_id="curator-1")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     plan["attestation"] = {
-        "runner": runner_signer, "assessor": assessor_signer}
+        "curator": curator_signer, "runner": runner_signer,
+        "assessor": assessor_signer}
     write_json(plan_path, plan)
-    suite = freeze_benchmark_suite(public, plan_path, gold_path)
-    return (public, plan_path, gold_path, suite, runner_key, assessor_key)
+    suite = freeze_benchmark_suite(
+        public, plan_path, gold_path, signing_key_path=curator_key)
+    return (public, plan_path, gold_path, suite, curator_key,
+            runner_key, assessor_key)
 
 
 def test_public_runner_executes_every_case_once_and_preserves_failure(
@@ -147,7 +153,7 @@ def test_changed_frozen_adapter_is_rejected(tmp_path, monkeypatch):
 
 def test_attested_runner_requires_matching_private_key_and_signs_manifest(
         tmp_path, monkeypatch):
-    public, plan_path, _, suite, runner_key, assessor_key = (
+    public, plan_path, _, suite, _, runner_key, assessor_key = (
         attested_runner_fixture(tmp_path, monkeypatch))
     with pytest.raises(BenchmarkRunnerError, match="must match"):
         run_benchmark_suite(
@@ -166,3 +172,14 @@ def test_attested_runner_requires_matching_private_key_and_signs_manifest(
     assert verify_document(
         manifest, signer=suite["plan"]["attestation"]["runner"],
         purpose="benchmark_result_manifest/v1") == manifest
+    changed_suite = copy.deepcopy(suite)
+    changed_suite["private_gold_sha256"] = "0" * 64
+    changed_suite["version"] = content_hash({
+        key: value for key, value in changed_suite.items()
+        if key not in {"version", "signature"}})
+    with pytest.raises(BenchmarkRunnerError, match="signature"):
+        run_benchmark_suite(
+            suite_report=changed_suite, public_root=public, plan_path=plan_path,
+            results_root=tmp_path / "tampered-suite",
+            signing_key_path=runner_key)
+    assert not (tmp_path / "tampered-suite").exists()

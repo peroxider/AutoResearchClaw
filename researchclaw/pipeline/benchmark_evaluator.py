@@ -398,11 +398,15 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
                      "signature_verified": attestation is not None},
         "attestation": {
             "required": attestation is not None,
+            "curator_key_id": (attestation.get("curator", {}).get("key_id")
+                               if attestation else None),
             "runner_key_id": (attestation["runner"]["key_id"]
                               if attestation else None),
             "assessor_key_id": (attestation["assessor"]["key_id"]
                                 if attestation else None),
-            "signatures_verified": attestation is not None,
+            "suite_signature_verified": bool(
+                attestation and "curator" in attestation),
+            "result_and_assessment_signatures_verified": attestation is not None,
         },
         "result_manifest_sha256": manifest_sha256,
         "private_gold_sha256": gold_sha256,

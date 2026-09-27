@@ -20,6 +20,7 @@ from researchclaw.pipeline.evidence_store import content_hash
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _PURPOSES = {
+    "benchmark_suite_report/v1",
     "benchmark_result_manifest/v1",
     "benchmark_private_assessment/v1",
 }

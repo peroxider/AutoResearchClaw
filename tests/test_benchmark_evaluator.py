@@ -244,7 +244,7 @@ def test_host_runner_lower_bound_is_unverified_and_logs_are_bound(
 
 def test_attested_result_and_private_assessment_are_verified(
         tmp_path, monkeypatch):
-    (public, plan_path, gold_path, suite, runner_key,
+    (public, plan_path, gold_path, suite, _, runner_key,
      assessor_key) = attested_runner_fixture(tmp_path, monkeypatch)
     results_root = tmp_path / "signed-results"
     manifest = run_benchmark_suite(
@@ -279,8 +279,10 @@ def test_attested_result_and_private_assessment_are_verified(
     report = build_benchmark_evaluation(**args)
     assert report["overall"]["cases"] == 16
     assert report["attestation"] == {
-        "required": True, "runner_key_id": "runner-1",
-        "assessor_key_id": "assessor-1", "signatures_verified": True}
+        "required": True, "curator_key_id": "curator-1",
+        "runner_key_id": "runner-1", "assessor_key_id": "assessor-1",
+        "suite_signature_verified": True,
+        "result_and_assessment_signatures_verified": True}
     assessment["cases"][0]["rationale"] = "Changed after signing."
     write_json(assessment_path, assessment)
     with pytest.raises(BenchmarkEvaluationError, match="signature"):
