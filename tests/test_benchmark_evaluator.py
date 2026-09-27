@@ -11,10 +11,11 @@ from researchclaw.pipeline.benchmark_evaluator import (
 )
 from researchclaw.pipeline.benchmark_suite import freeze_benchmark_suite
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_signature import sign_document
 from researchclaw.pipeline.resource_ledger import build_resource_ledger
 from researchclaw.pipeline.benchmark_runner import run_benchmark_suite
 from tests.test_benchmark_suite import suite_fixture, write_json
-from tests.test_benchmark_runner import runner_fixture
+from tests.test_benchmark_runner import attested_runner_fixture, runner_fixture
 
 
 def evaluation_fixture(tmp_path):
@@ -238,4 +239,49 @@ def test_host_runner_lower_bound_is_unverified_and_logs_are_bound(
     (results_root / "case-00" / "stdout.txt").write_text(
         "tampered", encoding="utf-8")
     with pytest.raises(BenchmarkEvaluationError, match="receipt"):
+        build_benchmark_evaluation(**args)
+
+
+def test_attested_result_and_private_assessment_are_verified(
+        tmp_path, monkeypatch):
+    (public, plan_path, gold_path, suite, runner_key,
+     assessor_key) = attested_runner_fixture(tmp_path, monkeypatch)
+    results_root = tmp_path / "signed-results"
+    manifest = run_benchmark_suite(
+        suite_report=suite, public_root=public, plan_path=plan_path,
+        results_root=results_root, signing_key_path=runner_key)
+    gold = json.loads(gold_path.read_text(encoding="utf-8"))
+    expected = {row["case_id"]: row["expected_disposition"]
+                for row in gold["cases"]}
+    assessment = {
+        "schema_version": 1, "suite_version": suite["version"],
+        "assessor_id": "assessor-1", "blinded": True,
+        "cases": [{
+            "case_id": item["case_id"],
+            "acceptance_sha256": item["acceptance_sha256"],
+            "observed_disposition": expected[item["case_id"]],
+            "critical_errors": 0, "revision_minutes": 0.0,
+            "revision_edits": 0, "rationale": "Blind signed assessment.",
+        } for item in manifest["cases"]],
+    }
+    assessment["signature"] = sign_document(
+        assessment, signer=suite["plan"]["attestation"]["assessor"],
+        private_key_path=assessor_key,
+        purpose="benchmark_private_assessment/v1")
+    assessment_path = tmp_path / "private" / "signed-assessment.json"
+    write_json(assessment_path, assessment)
+    args = {
+        "suite_report": suite, "public_root": public, "plan_path": plan_path,
+        "gold_path": gold_path, "results_root": results_root,
+        "result_manifest_path": results_root / "benchmark_result_manifest.json",
+        "assessment_path": assessment_path,
+    }
+    report = build_benchmark_evaluation(**args)
+    assert report["overall"]["cases"] == 16
+    assert report["attestation"] == {
+        "required": True, "runner_key_id": "runner-1",
+        "assessor_key_id": "assessor-1", "signatures_verified": True}
+    assessment["cases"][0]["rationale"] = "Changed after signing."
+    write_json(assessment_path, assessment)
+    with pytest.raises(BenchmarkEvaluationError, match="signature"):
         build_benchmark_evaluation(**args)

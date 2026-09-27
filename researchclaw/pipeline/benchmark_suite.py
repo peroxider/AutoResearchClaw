@@ -9,6 +9,9 @@ from collections import Counter
 from pathlib import Path
 
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_signature import (
+    EvidenceSignatureError, validate_signer,
+)
 
 
 TASK_FAMILIES = (
@@ -90,6 +93,20 @@ def _validate_runner(root: Path, value: object) -> dict:
             "environment_allowlist": allowlist}
 
 
+def _validate_attestation(value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != {"runner", "assessor"}:
+        raise BenchmarkSuiteError("Benchmark attestation fields are malformed")
+    try:
+        runner = validate_signer(value["runner"])
+        assessor = validate_signer(value["assessor"])
+    except EvidenceSignatureError as exc:
+        raise BenchmarkSuiteError(str(exc)) from exc
+    if (runner["key_id"] == assessor["key_id"]
+            or runner["public_key"] == assessor["public_key"]):
+        raise BenchmarkSuiteError("Runner and assessor signing keys must be distinct")
+    return {"runner": runner, "assessor": assessor}
+
+
 def _safe_input(root: Path, relative: object, digest: object) -> str:
     if (not isinstance(relative, str) or not relative or "\\" in relative
             or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None):
@@ -104,7 +121,8 @@ def _safe_input(root: Path, relative: object, digest: object) -> str:
 
 def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
     required = {"schema_version", "min_repeats", "budget", "cases"}
-    if not required <= set(plan) or set(plan) - (required | {"runner"}):
+    optional = {"runner", "attestation"}
+    if not required <= set(plan) or set(plan) - (required | optional):
         raise BenchmarkSuiteError("Benchmark plan fields are malformed")
     if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
         raise BenchmarkSuiteError("Unsupported benchmark plan schema")
@@ -153,6 +171,10 @@ def _validate_plan(root: Path, plan: dict) -> tuple[dict, dict]:
                 "budget": budget, "cases": normalized}
     if "runner" in plan:
         document["runner"] = _validate_runner(root, plan["runner"])
+    if "attestation" in plan:
+        if "runner" not in plan:
+            raise BenchmarkSuiteError("Attested benchmark requires a runner adapter")
+        document["attestation"] = _validate_attestation(plan["attestation"])
     return document, coverage
 
 

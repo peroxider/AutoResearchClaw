@@ -13,6 +13,9 @@ from researchclaw.pipeline.benchmark_suite import (
     BenchmarkSuiteError, verify_benchmark_suite,
 )
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_signature import (
+    EvidenceSignatureError, verify_document,
+)
 from researchclaw.pipeline.resource_ledger import (
     ResourceLedgerError, validate_resource_ledger,
 )
@@ -171,7 +174,11 @@ def _validate_receipt(path: Path, digest: object, *, suite: dict,
 
 def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[str, dict]:
     fields = {"schema_version", "suite_version", "cases"}
-    if (frozenset(manifest) not in {frozenset(fields), frozenset(fields | {"version"})}
+    attestation = suite["plan"].get("attestation")
+    expected_fields = fields | {"version", "signature"} if attestation else fields
+    allowed_fields = ({frozenset(expected_fields)} if attestation else
+                      {frozenset(fields), frozenset(fields | {"version"})})
+    if (frozenset(manifest) not in allowed_fields
             or type(manifest.get("schema_version")) is not int
             or manifest["schema_version"] != 1
             or manifest.get("suite_version") != suite["version"]
@@ -179,8 +186,16 @@ def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[s
         raise BenchmarkEvaluationError("Benchmark result manifest is malformed")
     if ("version" in manifest
             and manifest["version"] != content_hash(
-                {key: value for key, value in manifest.items() if key != "version"})):
+                {key: value for key, value in manifest.items()
+                 if key not in {"version", "signature"}})):
         raise BenchmarkEvaluationError("Benchmark result manifest version is malformed")
+    if attestation:
+        try:
+            verify_document(
+                manifest, signer=attestation["runner"],
+                purpose="benchmark_result_manifest/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkEvaluationError(str(exc)) from exc
     declared = {case["case_id"]: case for case in suite["plan"]["cases"]}
     results = {}
     seen_runs: set[Path] = set()
@@ -223,13 +238,26 @@ def _validate_results(suite: dict, results_root: Path, manifest: dict) -> dict[s
 
 
 def _validate_assessment(value: dict, suite: dict, results: dict[str, dict]) -> dict[str, dict]:
-    if (set(value) != {"schema_version", "suite_version", "assessor_id", "blinded", "cases"}
+    fields = {"schema_version", "suite_version", "assessor_id", "blinded", "cases"}
+    attestation = suite["plan"].get("attestation")
+    if attestation:
+        fields.add("signature")
+    if (set(value) != fields
             or type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or value.get("suite_version") != suite["version"]
             or not isinstance(value.get("assessor_id"), str)
             or _SAFE_ID.fullmatch(value["assessor_id"]) is None
             or value.get("blinded") is not True or not isinstance(value.get("cases"), list)):
         raise BenchmarkEvaluationError("Private assessment is malformed or not blinded")
+    if attestation:
+        if value["assessor_id"] != attestation["assessor"]["key_id"]:
+            raise BenchmarkEvaluationError("Private assessment signer identity differs")
+        try:
+            verify_document(
+                value, signer=attestation["assessor"],
+                purpose="benchmark_private_assessment/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkEvaluationError(str(exc)) from exc
     assessments = {}
     fields = {"case_id", "acceptance_sha256", "observed_disposition",
               "critical_errors", "revision_minutes", "revision_edits", "rationale"}
@@ -355,11 +383,27 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
     for row in rows:
         by_family[row["task_family"]].append(row)
         by_scenario[row["scenario"]].append(row)
+    attestation = suite_report["plan"].get("attestation")
+    identity_limitation = (
+        "Ed25519 signatures prove possession of frozen keys, not physical "
+        "identity, key custody, remote execution, or assessor blinding."
+        if attestation else
+        "Runner and assessor identities are self-declared; no signatures or "
+        "remote attestation are provided.")
     report = {
         "schema_version": 1, "checker": "arc-benchmark-evaluation/v1",
         "suite_version": suite_report["version"],
         "assessor": {"id": assessment_document["assessor_id"],
-                     "blinded": True, "assessment_sha256": assessment_sha256},
+                     "blinded": True, "assessment_sha256": assessment_sha256,
+                     "signature_verified": attestation is not None},
+        "attestation": {
+            "required": attestation is not None,
+            "runner_key_id": (attestation["runner"]["key_id"]
+                              if attestation else None),
+            "assessor_key_id": (attestation["assessor"]["key_id"]
+                                if attestation else None),
+            "signatures_verified": attestation is not None,
+        },
         "result_manifest_sha256": manifest_sha256,
         "private_gold_sha256": gold_sha256,
         "cases": rows,
@@ -368,7 +412,7 @@ def build_benchmark_evaluation(*, suite_report: dict, public_root: Path,
         "by_stress_scenario": {name: _aggregate(group)
                                for name, group in sorted(by_scenario.items())},
         "limitations": [
-            "Runner and assessor identities are self-declared; no remote attestation is provided.",
+            identity_limitation,
             "Audited-lower-bound receipts cannot prove model-call or token-budget "
             "compliance; only observed excess is conclusive.",
             "Final acceptance is schema- and digest-bound here; its source bundle "

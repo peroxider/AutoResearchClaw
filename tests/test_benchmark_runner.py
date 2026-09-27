@@ -9,6 +9,9 @@ from researchclaw.pipeline.benchmark_runner import (
 )
 from researchclaw.pipeline.benchmark_suite import freeze_benchmark_suite
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_signature import (
+    generate_private_key, verify_document,
+)
 from tests.test_benchmark_suite import suite_fixture, write_json
 
 
@@ -51,6 +54,20 @@ def runner_fixture(tmp_path, monkeypatch, *, wall_seconds=300):
     monkeypatch.setenv("RC_BENCHMARK_ALLOWED", "visible")
     monkeypatch.setenv("RC_BENCHMARK_BLOCKED", "secret")
     return public, plan_path, gold_path, suite
+
+
+def attested_runner_fixture(tmp_path, monkeypatch):
+    public, plan_path, gold_path, _ = runner_fixture(tmp_path, monkeypatch)
+    runner_key = tmp_path / "keys" / "runner.pem"
+    assessor_key = tmp_path / "keys" / "assessor.pem"
+    runner_signer = generate_private_key(runner_key, key_id="runner-1")
+    assessor_signer = generate_private_key(assessor_key, key_id="assessor-1")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["attestation"] = {
+        "runner": runner_signer, "assessor": assessor_signer}
+    write_json(plan_path, plan)
+    suite = freeze_benchmark_suite(public, plan_path, gold_path)
+    return (public, plan_path, gold_path, suite, runner_key, assessor_key)
 
 
 def test_public_runner_executes_every_case_once_and_preserves_failure(
@@ -126,3 +143,26 @@ def test_changed_frozen_adapter_is_rejected(tmp_path, monkeypatch):
         run_benchmark_suite(
             suite_report=suite, public_root=public, plan_path=plan_path,
             results_root=tmp_path / "results")
+
+
+def test_attested_runner_requires_matching_private_key_and_signs_manifest(
+        tmp_path, monkeypatch):
+    public, plan_path, _, suite, runner_key, assessor_key = (
+        attested_runner_fixture(tmp_path, monkeypatch))
+    with pytest.raises(BenchmarkRunnerError, match="must match"):
+        run_benchmark_suite(
+            suite_report=suite, public_root=public, plan_path=plan_path,
+            results_root=tmp_path / "missing-key")
+    with pytest.raises(BenchmarkRunnerError, match="does not match"):
+        run_benchmark_suite(
+            suite_report=suite, public_root=public, plan_path=plan_path,
+            results_root=tmp_path / "wrong-key",
+            signing_key_path=assessor_key)
+    assert not (tmp_path / "wrong-key").exists()
+    manifest = run_benchmark_suite(
+        suite_report=suite, public_root=public, plan_path=plan_path,
+        results_root=tmp_path / "signed-results",
+        signing_key_path=runner_key)
+    assert verify_document(
+        manifest, signer=suite["plan"]["attestation"]["runner"],
+        purpose="benchmark_result_manifest/v1") == manifest

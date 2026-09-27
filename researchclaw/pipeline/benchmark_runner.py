@@ -16,6 +16,9 @@ from researchclaw.pipeline.benchmark_suite import (
     BenchmarkSuiteError, verify_public_benchmark_suite,
 )
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.evidence_signature import (
+    EvidenceSignatureError, sign_document,
+)
 from researchclaw.pipeline.final_acceptance import assess_delivery
 from researchclaw.pipeline.resource_ledger import build_resource_ledger
 
@@ -79,7 +82,8 @@ def _environment(runner: dict, case: dict, suite: dict,
 
 def run_benchmark_suite(*, suite_report: dict, public_root: Path,
                         plan_path: Path, results_root: Path,
-                        python_executable: str | None = None) -> dict:
+                        python_executable: str | None = None,
+                        signing_key_path: Path | None = None) -> dict:
     """Run every public case once without reading private gold or assessments."""
     root = Path(public_root).resolve()
     try:
@@ -89,6 +93,18 @@ def run_benchmark_suite(*, suite_report: dict, public_root: Path,
     runner = suite_report["plan"].get("runner")
     if runner is None:
         raise BenchmarkRunnerError("Benchmark plan does not freeze a runner adapter")
+    attestation = suite_report["plan"].get("attestation")
+    if (attestation is None) != (signing_key_path is None):
+        raise BenchmarkRunnerError(
+            "Runner signing key must match the frozen attestation policy")
+    if attestation is not None:
+        try:
+            sign_document(
+                {}, signer=attestation["runner"],
+                private_key_path=Path(signing_key_path),
+                purpose="benchmark_result_manifest/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkRunnerError(str(exc)) from exc
     results_root = Path(results_root).resolve()
     if results_root.exists() and not results_root.is_dir():
         raise BenchmarkRunnerError("Benchmark results root is not a directory")
@@ -166,6 +182,14 @@ def run_benchmark_suite(*, suite_report: dict, public_root: Path,
     manifest = {"schema_version": 1, "suite_version": suite_report["version"],
                 "cases": manifest_cases}
     manifest["version"] = content_hash(manifest)
+    if attestation is not None:
+        try:
+            manifest["signature"] = sign_document(
+                manifest, signer=attestation["runner"],
+                private_key_path=Path(signing_key_path),
+                purpose="benchmark_result_manifest/v1")
+        except EvidenceSignatureError as exc:
+            raise BenchmarkRunnerError(str(exc)) from exc
     _write(results_root / "benchmark_result_manifest.json", manifest)
     return manifest
 
@@ -176,11 +200,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--public-root", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--results-root", type=Path, required=True)
+    parser.add_argument("--signing-key", type=Path)
     args = parser.parse_args(argv)
     suite = json.loads(args.suite_report.read_text(encoding="utf-8"))
     manifest = run_benchmark_suite(
         suite_report=suite, public_root=args.public_root,
-        plan_path=args.plan, results_root=args.results_root)
+        plan_path=args.plan, results_root=args.results_root,
+        signing_key_path=args.signing_key)
     statuses = Counter(
         json.loads((args.results_root / case["run_dir"] / "benchmark_case_receipt.json")
                    .read_text(encoding="utf-8"))["status"] for case in manifest["cases"])

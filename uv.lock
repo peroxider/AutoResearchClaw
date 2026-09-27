@@ -2888,6 +2888,7 @@ version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "arxiv" },
+    { name = "cryptography" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pyyaml" },
@@ -2936,6 +2937,7 @@ requires-dist = [
     { name = "arxiv", specifier = ">=2.1" },
     { name = "crawl4ai", marker = "extra == 'all'", specifier = ">=0.2" },
     { name = "crawl4ai", marker = "extra == 'web'", specifier = ">=0.2" },
+    { name = "cryptography", specifier = ">=44.0" },
     { name = "httpx", marker = "extra == 'all'", specifier = ">=0.24" },
     { name = "httpx", marker = "extra == 'anthropic'", specifier = ">=0.24" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.24" },

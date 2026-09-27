@@ -170,3 +170,27 @@ def test_runner_identity_and_environment_allowlist_fail_closed(tmp_path, runner)
     write_json(plan_path, plan)
     with pytest.raises(BenchmarkSuiteError):
         freeze_benchmark_suite(public, plan_path, gold_path)
+
+
+def test_attestation_requires_distinct_valid_runner_and_assessor_keys(tmp_path):
+    from researchclaw.pipeline.evidence_signature import generate_private_key
+
+    public, plan_path, gold_path, plan = suite_fixture(tmp_path)
+    adapter = public / "runner_adapter.py"
+    adapter.write_text("print('fixture')", encoding="utf-8")
+    signer = generate_private_key(tmp_path / "private.pem", key_id="same-key")
+    plan["runner"] = {
+        "adapter": "runner_adapter.py", "adapter_sha256": file_hash(adapter),
+        "environment_allowlist": []}
+    plan["attestation"] = {"runner": signer, "assessor": signer}
+    write_json(plan_path, plan)
+    with pytest.raises(BenchmarkSuiteError, match="distinct"):
+        freeze_benchmark_suite(public, plan_path, gold_path)
+    plan["attestation"]["assessor"] = dict(signer, key_id="assessor-1")
+    write_json(plan_path, plan)
+    with pytest.raises(BenchmarkSuiteError, match="distinct"):
+        freeze_benchmark_suite(public, plan_path, gold_path)
+    del plan["runner"]
+    write_json(plan_path, plan)
+    with pytest.raises(BenchmarkSuiteError, match="requires a runner"):
+        freeze_benchmark_suite(public, plan_path, gold_path)
