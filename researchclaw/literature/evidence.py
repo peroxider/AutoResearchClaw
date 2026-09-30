@@ -603,7 +603,7 @@ def build_citation_support(root: Path, *, reviewer=None, max_calls=128,
     for name, path in paths.items():
         if not path.is_file():
             continue
-        text = path.read_text(encoding="utf-8")
+        text = path.read_bytes().decode("utf-8")
         for citation in citation_occurrences(text):
             start, end = _claim_span(text, citation)
             claim = text[start:end]
@@ -634,7 +634,11 @@ def build_citation_support(root: Path, *, reviewer=None, max_calls=128,
 
 
 def citation_support_issues(root: Path, support: dict, manuscripts: dict[str, str]) -> list[str]:
-    """Require every occurrence, not merely one supported use of each cite key."""
+    """Require every occurrence, not merely one supported use of each cite key.
+
+    Manuscript text must preserve the exact exported line endings: binding
+    offsets are measured before any universal-newline translation.
+    """
     issues, accepted = [], set()
     cards, sources = {}, {}
     if support.get("schema_version") == 2:

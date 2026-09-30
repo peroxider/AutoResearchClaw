@@ -57,8 +57,9 @@ request schemas. A base URL ending in `/v1` is accepted and normalized.
 
 `strict_academic` deliberately prohibits gradients, shadows, glow, 3D,
 cinematic lighting, cartoons, decorative illustration, and marketing styling.
-Hybrid is the default render mode when the field is omitted. Set
-`render_mode: direct` only when a deliberately generative bitmap is required.
+Direct is the default render mode when the field is omitted. The example above
+explicitly selects `render_mode: hybrid` to keep the deterministic skeleton
+authoritative; use `render_mode: direct` for image-model-first generation.
 Direct mode preserves the returned bytes separately as
 `framework_diagram_model_original.png`; the final file and original are both
 hashed in the schema-v2 generation manifest. This provenance does not verify

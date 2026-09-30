@@ -60,6 +60,17 @@ def manuscripts(root, claim="The intervention reduces loss in setting A only."):
     return {name: (root / name).read_text(encoding="utf-8") for name in ("paper_final.md", "paper.tex")}
 
 
+def test_citation_support_preserves_imported_crlf_offsets(sources):
+    root, _ = sources
+    build(sources)
+    texts = manuscripts(root)
+    texts = {name: "Imported template\r\n\r\n" + text for name, text in texts.items()}
+    for name, text in texts.items():
+        (root / name).write_bytes(text.encode("utf-8"))
+    support = build_citation_support(root, reviewer=Reviewer())
+    assert citation_support_issues(root, support, texts) == []
+
+
 def test_cards_bind_source_identity_spans_scope_and_review(sources):
     root, _ = sources
     bundle = build(sources)

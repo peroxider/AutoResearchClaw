@@ -1,6 +1,6 @@
 # 高质量论文流水线开发状态
 
-依据：`HIGH_QUALITY_PAPER_GAP_ANALYSIS_CN.md`。这是持续开发的状态记录，不是“已经能保证产出可录用论文”的声明。用户要求继续开发直到完成；当前持续目标仍未完成。
+依据：`HIGH_QUALITY_PAPER_GAP_ANALYSIS_CN.md`。这是持续开发的状态记录，不是“已经能保证产出可录用论文”的声明。后续独立复核发现原完成判断仍有缺口；当前修复与剩余范围以 [独立审计后的修复](HIGH_QUALITY_PAPER_REMEDIATION_CN.md) 为准，下文保留逐轮历史证据。
 
 ## 已集成并验证
 

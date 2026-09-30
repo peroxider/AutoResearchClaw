@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -743,13 +744,25 @@ def test_package_deliverables_includes_style_files(
     run_dir: Path, rc_config: RCConfig
 ) -> None:
     """Style files (.sty, .bst) for the target conference are bundled."""
+    rc_config = replace(rc_config, export=replace(rc_config.export, target_conference="neurips_2025"))
     _setup_stage_artifacts(run_dir)
     dest = rc_runner._package_deliverables(run_dir, "run-styles", rc_config)
     assert dest is not None
-    # Default config uses neurips_2025 → should have neurips_2025.sty
+    # An explicitly selected conference still supplies its style bundle.
     assert (dest / "neurips_2025.sty").exists()
     manifest = json.loads((dest / "manifest.json").read_text())
     assert "neurips_2025.sty" in manifest["files"]
+
+
+@pytest.mark.parametrize("target", ["generic", "neurips_2025", "jhep"])
+def test_physics_domain_does_not_replace_configured_export_template(run_dir, rc_config, target):
+    rc_config = replace(rc_config,
+        research=replace(rc_config.research, topic="Higgs boson collider cross section in high energy physics"),
+        export=replace(rc_config.export, target_conference=target))
+    _setup_stage_artifacts(run_dir)
+    dest = rc_runner._package_deliverables(run_dir, "run-venue", rc_config)
+    manifest = json.loads((dest / "manifest.json").read_text())
+    assert manifest["target_conference"] == target
 
 
 # ── Atomic checkpoint write tests ──

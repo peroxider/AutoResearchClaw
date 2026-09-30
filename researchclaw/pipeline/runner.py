@@ -1090,31 +1090,9 @@ def _package_deliverables(
 
     packaged: list[str] = []
 
-    # --- 0. Resolve effective conference template ---
-    # Mirrors the stage-22 domain-aware override: when the topic belongs to a
-    # non-ML domain (hep_ph, etc.) and the user has left the default
-    # neurips_2025, swap in the domain's preferred physics template so the
-    # bundled .sty, regenerated .tex, and manifest are all consistent.
+    # The configured template is authoritative. The generic default no longer
+    # needs a domain-dependent replacement of an implicit ML venue.
     effective_conf = config.export.target_conference
-    try:
-        from researchclaw.domains.detector import detect_domain as _dd_detect
-        from researchclaw.domains.prompt_adapter import get_adapter as _dd_adapter
-
-        _dd_dom = _dd_detect(topic=config.research.topic)
-        _dd_blocks = _dd_adapter(_dd_dom).get_export_publish_blocks(
-            {"topic": config.research.topic}
-        )
-        _pref_tpl = (_dd_blocks.preferred_template or "").strip()
-        if _pref_tpl and effective_conf == "neurips_2025":
-            effective_conf = _pref_tpl
-            logger.info(
-                "Deliverables: domain=%s — overriding target_conference "
-                "'neurips_2025' → '%s'.",
-                getattr(_dd_dom, "domain_id", "?"),
-                effective_conf,
-            )
-    except Exception:  # noqa: BLE001
-        logger.debug("Deliverables: domain-aware template override skipped")
 
     # --- 1. Final paper (Markdown) ---
     # Prefer verified version (stage 23) over base version (stage 22)

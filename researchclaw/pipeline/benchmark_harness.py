@@ -37,14 +37,6 @@ def _append(run_dir: Path, name: str, text: str) -> None:
     path.write_text(path.read_text(encoding="utf-8") + text, encoding="utf-8")
 
 
-def _replace(run_dir: Path, name: str, old: str, new: str) -> None:
-    path = run_dir / name
-    if not path.is_file() or old not in path.read_text(encoding="utf-8"):
-        raise BenchmarkHarnessError(f"Defect seed expects {old!r} in {name}")
-    path.write_text(path.read_text(encoding="utf-8").replace(old, new),
-                    encoding="utf-8")
-
-
 def _seed_fabricated_citation(run_dir: Path) -> None:
     _append(run_dir, "paper.tex", " Ghost results~\\cite{ghost2026}.")
     _append(run_dir, "paper_final.md", " Ghost results [ghost2026].")
@@ -61,8 +53,27 @@ def _seed_unresolved_placeholder(run_dir: Path) -> None:
 def _seed_stale_manuscript(run_dir: Path) -> None:
     # Rewriting the reported value invalidates the frozen numeric claim
     # spans and manuscript bindings without touching the evidence store.
-    for name in ("paper.tex", "paper_final.md"):
-        _replace(run_dir, name, "81.00", "82.00")
+    # Select an actual bound result instead of assuming a fixture's 81.00.
+    try:
+        claims = json.loads((run_dir / "numeric_claims.json").read_text(encoding="utf-8"))
+        claim = claims["claims"][0]
+        old = claim["rendered"]
+        if not isinstance(old, str) or not re.fullmatch(r"-?\d+(?:\.\d+)?", old):
+            raise ValueError("Invalid numeric seed")
+        replacements = {}
+        for name in ("paper.tex", "paper_final.md"):
+            text = (run_dir / name).read_bytes().decode("utf-8")
+            span = claim["spans"][name]
+            start, end = span["start"], span["end"]
+            if (type(start) is not int or type(end) is not int
+                    or not 0 <= start < end <= len(text) or text[start:end] != old):
+                raise ValueError("Stale numeric seed")
+            new = "0" if float(old) != 0 else "1"
+            replacements[name] = text[:start] + new + text[end:]
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise BenchmarkHarnessError("Defect seed expects a bound numeric claim in both manuscripts") from exc
+    for name, text in replacements.items():
+        (run_dir / name).write_text(text, encoding="utf-8", newline="")
 
 
 def _seed_pipeline_blocker(run_dir: Path) -> None:

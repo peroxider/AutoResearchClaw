@@ -18,6 +18,7 @@ from researchclaw.pipeline.resource_ledger import build_resource_ledger, ledger_
 
 RESEARCH_DIMENSIONS = ("data", "experiments", "numeric", "citations", "theory")
 PRESENTATION_DIMENSIONS = ("quality", "consistency", "figures", "layout")
+FINAL_ACCEPTANCE_CHECKER = "final_acceptance/v2"
 _GENERATED = {"manifest.json", "final_acceptance.json", "final_reviews.json", "resource_ledger.json"}
 
 
@@ -53,6 +54,20 @@ def _citations(text: str) -> set[str]:
     # Legacy Markdown citations use [author2024key].
     keys.update(re.findall(r"\[([A-Za-z]+\d{4}[A-Za-z0-9_-]*)\]", text))
     return keys
+
+
+def _has_placeholder(text: str) -> bool:
+    if re.search(r"\b(?:TODO|TBD|PLACEHOLDER)\b|\[CITATION NEEDED\]", text):
+        return True
+    for line in text.splitlines():
+        # Markdown table delimiter rows contain dashes by definition. A dash
+        # cell in a data row (or a TeX row) still represents missing evidence.
+        cells = line.strip().strip("|").split("|")
+        if len(cells) > 1 and all(re.fullmatch(r"\s*:?-{3,}:?\s*", cell) for cell in cells):
+            continue
+        if re.search(r"[&|]\s*---\s*[&|]", line):
+            return True
+    return False
 
 
 def _image_ledger_problem(root: Path, manifest_path: Path) -> tuple[str, str] | None:
@@ -167,14 +182,21 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                 issue("data", "missing_failed_or_stale_data_preflight", "data_preflight.json")
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             issue("data", "invalid_or_changed_data_contract", "research_contract.json")
+    else:
+        # Status is earned independently of target_status. Legacy bundles remain
+        # exportable, but an expert's positive review cannot substitute for the
+        # frozen data/protocol and exhaustive shared-source manuscript checks.
+        issue("data", "structured_data_contract_required", "research_contract.json")
 
     text = {}
     for name in ("paper.tex", "paper_final.md"):
         path = root / name
-        text[name] = path.read_text(encoding="utf-8") if path.is_file() else ""
+        # Spans are offsets in the exact export, including any CRLF inherited
+        # from an imported template. Universal-newline translation shifts them.
+        text[name] = path.read_bytes().decode("utf-8") if path.is_file() else ""
         if not text[name].strip():
             issue("consistency", "missing_manuscript", name)
-        if re.search(r"\b(?:TODO|TBD|PLACEHOLDER)\b|\[CITATION NEEDED\]|(?m:^\s*[^\n]*[&|]\s*---\s*[&|])", text[name]):
+        if _has_placeholder(text[name]):
             issue("consistency", "unresolved_placeholder", name)
     bib = (root / "references.bib")
     bib_text = bib.read_text(encoding="utf-8") if bib.is_file() else ""
@@ -206,6 +228,18 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
         issue("layout", "missing_failed_or_stale_compilation", "compilation.json")
     elif not pdf.read_bytes().startswith(b"%PDF-"):
         issue("layout", "invalid_pdf", "paper.pdf")
+    else:
+        try:
+            import fitz
+            with fitz.open(pdf) as document:
+                if not document.is_pdf or document.needs_pass or document.page_count < 1:
+                    raise ValueError("Unreadable PDF")
+                for page in document:
+                    page.get_text()
+        except ImportError:
+            issue("layout", "pdf_parser_unavailable", "paper.pdf")
+        except (RuntimeError, ValueError, OSError):
+            issue("layout", "invalid_pdf", "paper.pdf")
 
     gate = _read(root / "quality_report.json")
     if (root / "analysis_spec.json").is_file() or ((root / "manuscript_ir.json").is_file()
@@ -253,6 +287,7 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
             if gate != quality_report(root, quality_threshold):
                 issue("quality", "stale_section_contract_reviews", "quality_report.json")
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            issue("numeric", "unverified_manuscript_claim_coverage", "manuscript_ir.json")
             issue("consistency", "invalid_or_stale_manuscript_ir", "manuscript_ir.json")
         peer_path, revision_path = root / "manuscript_peer_review.json", root / "manuscript_revision.json"
         try:
@@ -283,6 +318,8 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                                    "artifact": "submission.zip", "repair_owner": "export"})
         except (OSError, ValueError, KeyError, TypeError):
             issue("anonymity", "invalid_anonymous_template_contract", "publication_template.json")
+    else:
+        issue("numeric", "structured_manuscript_required", "manuscript_ir.json")
     score = gate.get("score_1_to_10", gate.get("score", gate.get("overall_score")))
     if (type(score) not in (int, float) or not math.isfinite(score)
             or score < quality_threshold):
@@ -394,7 +431,9 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
         try:
             from researchclaw.pipeline.experiment_protocol import load_protocol, audit_coverage
             frozen_protocol = load_protocol(root, input_contract)
-            if frozen_protocol is not None:
+            if frozen_protocol is None:
+                issue("experiments", "frozen_experiment_protocol_required", "experiment_protocol.json")
+            else:
                 coverage = audit_coverage(root, frozen_protocol, store)
                 if coverage["status"] != "complete":
                     issue("experiments", "frozen_experiment_matrix_incomplete", "experiment_protocol.json")
@@ -464,7 +503,7 @@ def _assess_delivery(root: Path, *, target_status: str = "exploratory",
                      and dimensions.get("anonymity", "passed") == "passed")
     status = "submission_candidate" if submission_ok else "research_complete" if research_ok else "exploratory"
     rank = {"exploratory": 0, "research_complete": 1, "submission_candidate": 2}
-    return {"schema_version": 1, "checker": "final_acceptance/v1", "input_version": version,
+    return {"schema_version": 1, "checker": FINAL_ACCEPTANCE_CHECKER, "input_version": version,
             "evidence_version": evidence_version, "review_version": content_hash(reviews),
             "artifact_status": status, "target_status": target_status,
             "target_met": rank[status] >= rank[target_status], "dimensions": dimensions,
@@ -482,7 +521,7 @@ def assess_delivery(root: Path, *, target_status: str = "exploratory",
         return _assess_delivery(root, target_status=target_status, quality_threshold=quality_threshold)
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
         # Malformed evidence is a failed check, never a reason to retain an old PASS.
-        return {"schema_version": 1, "checker": "final_acceptance/v1", "input_version": None,
+        return {"schema_version": 1, "checker": FINAL_ACCEPTANCE_CHECKER, "input_version": None,
                 "evidence_version": None, "review_version": None,
                 "artifact_status": "exploratory", "target_status": target_status,
                 "target_met": False, "dimensions": {d: "unknown" for d in

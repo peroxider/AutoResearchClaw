@@ -1757,7 +1757,6 @@ def _execute_export_publish(
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
 
     # --- Detect domain once for export-stage formatting decisions ---
-    _export_preferred_template = ""
     _export_guidance = ""
     _export_is_hep = False
     try:
@@ -1766,7 +1765,6 @@ def _execute_export_publish(
         _ex_domain = _detect_domain_adv(topic=config.research.topic)
         _ex_adapter = _get_prompt_adapter(_ex_domain)
         _ex_blocks = _ex_adapter.get_export_publish_blocks({"topic": config.research.topic})
-        _export_preferred_template = _ex_blocks.preferred_template or ""
         _export_guidance = _ex_blocks.export_publish_guidance or ""
         _export_is_hep = getattr(_ex_domain, "domain_id", "").startswith("hep_ph")
     except Exception:  # noqa: BLE001
@@ -2373,21 +2371,9 @@ def _execute_export_publish(
             markdown_to_latex,
         )
 
-        # Auto-select a physics template for hep_ph papers IFF the user has
-        # left target_conference at the ML default (neurips_2025). Explicit
-        # user choices are always respected.
-        _requested_conf = config.export.target_conference
-        _conf_name = _requested_conf
-        if (
-            _export_preferred_template
-            and _requested_conf == "neurips_2025"
-        ):
-            _conf_name = _export_preferred_template
-            logger.info(
-                "Stage 22: domain=hep_ph detected — overriding default "
-                "target_conference='neurips_2025' with '%s' (physics template).",
-                _conf_name,
-            )
+        # Defaults are generic; explicit venue choices must survive domain
+        # detection unchanged in both this stage and final packaging.
+        _conf_name = config.export.target_conference
         tpl = get_template(_conf_name)
         # Use the latex-citation-processed version if available
         tex_source = final_paper_latex

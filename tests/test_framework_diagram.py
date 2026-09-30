@@ -1439,7 +1439,7 @@ def test_legacy_yaml_without_framework_diagram_loads() -> None:
     assert cfg.experiment.framework_diagram.provider == "auto"
     assert cfg.experiment.framework_diagram.model == "dall-e-3"
     assert cfg.experiment.framework_diagram.grsai_model == "gpt-image-2"
-    assert cfg.experiment.framework_diagram.render_mode == "hybrid"
+    assert cfg.experiment.framework_diagram.render_mode == "direct"
     # Existing figure_agent fields preserved
     assert cfg.experiment.figure_agent.nano_banana_enabled is True
 

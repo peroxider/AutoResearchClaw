@@ -13,6 +13,7 @@ from researchclaw.pipeline.benchmark_suite import (
     BenchmarkSuiteError, open_sealed_benchmark_gold, verify_benchmark_suite,
 )
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.final_acceptance import FINAL_ACCEPTANCE_CHECKER
 from researchclaw.pipeline.evidence_signature import (
     EvidenceSignatureError, verify_document,
 )
@@ -80,7 +81,7 @@ def _validate_acceptance(path: Path, digest: object) -> dict:
     ranks = {"exploratory": 0, "research_complete": 1, "submission_candidate": 2}
     if (file_hash(path) != digest or type(value.get("schema_version")) is not int
             or value["schema_version"] != 1
-            or value.get("checker") != "final_acceptance/v1"
+            or value.get("checker") != FINAL_ACCEPTANCE_CHECKER
             or value.get("artifact_status") not in ranks
             or value.get("target_status") not in ranks
             or type(value.get("target_met")) is not bool

@@ -1,5 +1,7 @@
 # 高质量论文流水线工程完成审计
 
+> 后续独立复核已发现最终验收兼容路径和支持范围缺口。本文是原完成判断的历史记录，不能继续作为“原规划全部完成”的依据；当前修复与未完成项见 [独立审计后的修复](HIGH_QUALITY_PAPER_REMEDIATION_CN.md)。
+
 审计日期：2026-09-27。原始缺口基线：`docs/HIGH_QUALITY_PAPER_GAP_ANALYSIS_CN.md`（2026-09-22，代码基线 `f7fe93c`）。逐轮实现与测试证据见 `docs/HIGH_QUALITY_PAPER_DEVELOPMENT_STATUS_CN.md`。
 
 ## 完成判据

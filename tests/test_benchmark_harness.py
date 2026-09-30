@@ -1,6 +1,5 @@
 """Offline fault-injection harness: seeded defects meet the real acceptance."""
 import json
-from dataclasses import asdict
 
 import pytest
 
@@ -14,13 +13,12 @@ from researchclaw.pipeline.benchmark_report import (
     validate_benchmark_report,
     write_benchmark_report,
 )
-from researchclaw.pipeline.evidence_store import (
-    EvidenceKey, EvidenceRecord, EvidenceStore, content_hash, file_hash,
-)
+from researchclaw.pipeline.evidence_store import content_hash
 from researchclaw.pipeline.final_acceptance import (
-    PRESENTATION_DIMENSIONS, RESEARCH_DIMENSIONS, compilation_inputs, inventory,
+    PRESENTATION_DIMENSIONS, RESEARCH_DIMENSIONS, inventory,
 )
 from researchclaw.llm.call_ledger import build_call_ledger
+from tests.test_formal_acceptance import formal_delivery, submission, study, inputs, spec
 
 
 def write_json(root, name, value):
@@ -28,57 +26,16 @@ def write_json(root, name, value):
 
 
 @pytest.fixture
-def template(tmp_path):
-    """A reviewed, research_complete-passing bundle (real fixture shape)."""
-    root = tmp_path / "template"
-    root.mkdir()
-    (root / "paper.tex").write_text(
-        r"\section{Results} Baseline achieves 81.00. \cite{smith2024}", encoding="utf-8")
-    (root / "paper_final.md").write_text(
-        "# Results\nBaseline achieves 81.00. [smith2024]", encoding="utf-8")
-    (root / "references.bib").write_text("@article{smith2024,title={A paper}}", encoding="utf-8")
-    (root / "paper.pdf").write_bytes(b"%PDF-1.4\nfixture")
-    (root / "raw.csv").write_text("label,prediction\n1,1\n", encoding="utf-8")
-    (root / "source.txt").write_text("Baseline reference evidence.", encoding="utf-8")
-    (root / "llm_call_ledger.json").write_text(json.dumps(
-        build_call_ledger([{"status": "succeeded", "fallback_failures": [],
-                            "prompt_tokens": 4, "completion_tokens": 1,
-                            "total_tokens": 5}])), encoding="utf-8")
-    key = EvidenceKey("data", "v1", "test", "Baseline", "config", "42", "accuracy", "mean")
-    store = EvidenceStore()
-    result_id = store.add(EvidenceRecord(key, 81.0, "percent", "success", "commit", "env",
-                                         "run", "evaluator", True,
-                                         (("raw.csv", file_hash(root / "raw.csv")),)))
-    write_json(root, "evidence_store.json", store.to_dict())
-    write_json(root, "experiment_protocol.json", {"required_keys": [asdict(key)]})
-    papers = {name: file_hash(root / name) for name in ("paper.tex", "paper_final.md")}
-    spans = {}
-    for name in papers:
-        start = (root / name).read_text(encoding="utf-8").index("81.00")
-        spans[name] = {"start": start, "end": start + 5}
-    write_json(root, "numeric_claims.json", {
-        "evidence_version": store.version, "manuscript_hashes": papers,
-        "claims": [{"result_id": result_id, "key": asdict(key), "value": 81.0,
-                    "unit": "percent", "decimals": 2, "rendered": "81.00",
-                    "spans": spans}]})
-    write_json(root, "citation_support.json", {"manuscript_hashes": papers, "citations": [{
-        "cite_key": "smith2024", "status": "verified", "checker": "fixture-expert",
-        "source": "source.txt", "source_sha256": file_hash(root / "source.txt"),
-        "locator": "p.1", "excerpt": "Baseline reference evidence.",
-        "claim": "Baseline achieves 81.00."}]})
-    write_json(root, "quality_report.json", {"score_1_to_10": 8})
-    write_json(root, "verification_report.json", {"status": "verified"})
-    write_json(root, "compilation.json", {"success": True,
-                                          "inputs": compilation_inputs(root),
-                                          "pdf_sha256": file_hash(root / "paper.pdf")})
-    write_json(root, "final_reviews.json", {
-        "input_version": content_hash(inventory(root)),
-        # The text-only bundle has no figures: not_applicable keeps it a
-        # research_complete bundle rather than a submission_candidate.
-        "dimensions": {d: {"status": "not_applicable" if d in ("theory", "figures")
-                           else "passed", "checker": "fixture-expert",
-                           "evidence": "fixture-log"}
-                       for d in (*RESEARCH_DIMENSIONS, *PRESENTATION_DIMENSIONS)}})
+def template(formal_delivery):
+    """A structured research_complete bundle, with unavailable figure review."""
+    root = formal_delivery
+    write_json(root, "llm_call_ledger.json", build_call_ledger([
+        {"status": "succeeded", "fallback_failures": [],
+         "prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}]))
+    reviews = json.loads((root / "final_reviews.json").read_text())
+    reviews["input_version"] = content_hash(inventory(root))
+    reviews["dimensions"]["figures"]["status"] = "unknown"
+    write_json(root, "final_reviews.json", reviews)
     return root
 
 

@@ -11,11 +11,23 @@ from researchclaw.pipeline.benchmark_evaluator import (
 )
 from researchclaw.pipeline.benchmark_suite import freeze_benchmark_suite
 from researchclaw.pipeline.evidence_store import content_hash, file_hash
+from researchclaw.pipeline.final_acceptance import FINAL_ACCEPTANCE_CHECKER
 from researchclaw.pipeline.evidence_signature import sign_document
 from researchclaw.pipeline.resource_ledger import build_resource_ledger
 from researchclaw.pipeline.benchmark_runner import run_benchmark_suite
 from tests.test_benchmark_suite import suite_fixture, write_json
 from tests.test_benchmark_runner import sealed_runner_fixture, runner_fixture
+
+
+def test_legacy_acceptance_cannot_be_reused_in_new_benchmark(tmp_path):
+    from researchclaw.pipeline.benchmark_evaluator import _validate_acceptance
+
+    path = tmp_path / "final_acceptance.json"
+    write_json(path, {"schema_version": 1, "checker": "final_acceptance/v1",
+                     "artifact_status": "submission_candidate", "target_status": "research_complete",
+                     "target_met": True})
+    with pytest.raises(BenchmarkEvaluationError, match="Final acceptance"):
+        _validate_acceptance(path, file_hash(path))
 
 
 def evaluation_fixture(tmp_path):
@@ -32,7 +44,7 @@ def evaluation_fixture(tmp_path):
         run.mkdir(parents=True)
         target_met = expected[case_id] != "reject"
         acceptance = {
-            "schema_version": 1, "checker": "final_acceptance/v1",
+            "schema_version": 1, "checker": FINAL_ACCEPTANCE_CHECKER,
             "artifact_status": "research_complete" if target_met else "exploratory",
             "target_status": "research_complete", "target_met": target_met,
             "issues": [], "dimensions": {},

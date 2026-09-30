@@ -264,7 +264,7 @@ experiment:
     grsai_model: "gpt-image-2"
     grsai_api_style: "openai"  # openai or unified
     grsai_quality: "auto"  # use high only with gpt-image-2-vip
-    render_mode: "hybrid"  # hybrid (recommended) or direct
+    render_mode: "direct"  # Image model first; hybrid keeps a deterministic semantic skeleton.
     professional_style: "strict_academic"
     visual_influence: 0.06  # safety range: 0.0–0.15
     size: "1536x1024"

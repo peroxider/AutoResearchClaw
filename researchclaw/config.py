@@ -585,7 +585,7 @@ class FrameworkDiagramConfig:
     # "direct" preserves the original bitmap-only path. "hybrid" makes a
     # deterministic SVG/PNG semantic skeleton authoritative and permits the
     # image model to influence only a heavily whitened background layer.
-    render_mode: str = "hybrid"
+    render_mode: str = "direct"
     professional_style: str = "strict_academic"
     visual_influence: float = 0.06
     # Image output hints — providers map these to their native schema.
@@ -722,7 +722,7 @@ class WebSearchConfig:
 class ExportConfig:
     """Configuration for paper export and LaTeX generation."""
 
-    target_conference: str = "neurips_2025"
+    target_conference: str = "generic"
     authors: str = "Anonymous"
     bib_file: str = "references"
     max_citations: int | None = None  # Only impose a cap when the venue requires it.
@@ -1069,7 +1069,7 @@ class RCConfig:
             ),
             experiment=_parse_experiment_config(experiment),
             export=ExportConfig(
-                target_conference=export.get("target_conference", "neurips_2025"),
+                target_conference=export.get("target_conference", "generic"),
                 authors=export.get("authors", "Anonymous"),
                 bib_file=export.get("bib_file", "references"),
                 max_citations=export.get("max_citations"),
@@ -1760,7 +1760,7 @@ def _parse_framework_diagram_config(data: dict[str, Any]) -> FrameworkDiagramCon
         grsai_model=str(data.get("grsai_model", "gpt-image-2")),
         grsai_api_style=str(data.get("grsai_api_style", "openai")).lower(),
         grsai_quality=str(data.get("grsai_quality", "auto")).lower(),
-        render_mode=str(data.get("render_mode", "hybrid")).lower(),
+        render_mode=str(data.get("render_mode", "direct")).lower(),
         professional_style=str(
             data.get("professional_style", "strict_academic")
         ).lower(),

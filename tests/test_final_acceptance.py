@@ -59,10 +59,61 @@ def delivery(tmp_path):
     return root
 
 
-def test_valid_bound_bundle_can_pass_and_seal(delivery):
+def test_legacy_bound_bundle_can_seal_but_cannot_earn_formal_status(delivery):
     report = seal_delivery(delivery, target_status="submission_candidate")
-    assert report["artifact_status"] == "submission_candidate", report["issues"]
-    assert report["target_met"] and validate_seal(delivery)
+    assert report["artifact_status"] == "exploratory", report["issues"]
+    assert not report["target_met"] and validate_seal(delivery)
+    assert {i["reason"] for i in report["issues"]} >= {
+        "structured_data_contract_required", "structured_manuscript_required",
+        "frozen_experiment_protocol_required", "invalid_pdf",
+    }
+
+
+@pytest.mark.parametrize("target", ["exploratory", "research_complete", "submission_candidate"])
+def test_unbound_numeric_claim_cannot_be_promoted_by_fresh_positive_reviews(delivery, target):
+    for name in ("paper.tex", "paper_final.md"):
+        with (delivery / name).open("a", encoding="utf-8") as stream:
+            stream.write("\nProposed achieves 99.99 accuracy on an unseen dataset.\n")
+    hashes = {name: file_hash(delivery / name) for name in ("paper.tex", "paper_final.md")}
+    for name in ("numeric_claims.json", "citation_support.json"):
+        document = json.loads((delivery / name).read_text())
+        document["manuscript_hashes"] = hashes
+        write_json(delivery, name, document)
+    compilation = json.loads((delivery / "compilation.json").read_text())
+    compilation["inputs"] = compilation_inputs(delivery)
+    write_json(delivery, "compilation.json", compilation)
+    review(delivery)
+    report = assess_delivery(delivery, target_status=target)
+    assert report["artifact_status"] == "exploratory"
+    assert report["target_met"] is (target == "exploratory")
+    assert report["dimensions"]["numeric"] == "failed"
+
+
+@pytest.mark.parametrize("row,failed", [
+    ("| --- | :--- | ---: | :---: |", False),
+    ("--- | ---", False),
+    ("| Baseline | --- | accuracy |", True),
+    (r"Baseline & --- & accuracy \\", True),
+])
+def test_markdown_table_separator_is_not_missing_evidence(delivery, row, failed):
+    with (delivery / "paper_final.md").open("a", encoding="utf-8") as stream:
+        stream.write("\n" + row + "\n")
+    report = assess_delivery(delivery)
+    assert any(i["reason"] == "unresolved_placeholder" for i in report["issues"]) is failed
+
+
+def test_exact_numeric_spans_preserve_crlf(delivery):
+    claims = json.loads((delivery / "numeric_claims.json").read_text())
+    for name in ("paper.tex", "paper_final.md"):
+        body = (delivery / name).read_text(encoding="utf-8")
+        body = "Imported template\r\n" + body.replace("\n", "\r\n")
+        (delivery / name).write_bytes(body.encode("utf-8"))
+        start = body.index("81.00")
+        claims["claims"][0]["spans"][name] = {"start": start, "end": start + 5}
+        claims["manuscript_hashes"][name] = file_hash(delivery / name)
+    write_json(delivery, "numeric_claims.json", claims)
+    report = assess_delivery(delivery)
+    assert not any(i["reason"] == "missing_or_changed_numeric_span" for i in report["issues"])
 
 
 @pytest.mark.parametrize("name", ["paper.tex", "paper_final.md", "references.bib", "raw.csv", "paper.pdf"])

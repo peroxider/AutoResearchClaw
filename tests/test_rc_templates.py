@@ -554,7 +554,7 @@ class TestExportConfig:
         from researchclaw.config import ExportConfig
 
         ec = ExportConfig()
-        assert ec.target_conference == "neurips_2025"
+        assert ec.target_conference == "generic"
         assert ec.authors == "Anonymous"
         assert ec.bib_file == "references"
 
@@ -570,7 +570,7 @@ class TestExportConfig:
 
         cfg = RCConfig.load("config.researchclaw.example.yaml", check_paths=False)
         assert hasattr(cfg, "export")
-        assert cfg.export.target_conference == "neurips_2025"
+        assert cfg.export.target_conference == "generic"
 
     def test_rcconfig_export_from_dict(self) -> None:
         from researchclaw.config import RCConfig
